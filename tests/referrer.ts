@@ -12,33 +12,29 @@ import {
 	EventSubscriber,
 	Wallet,
 	PRICE_PRECISION,
+	ReferrerStatus,
 } from '../sdk/src';
 
 import {
-	mockOracle,
+	mockOracleNoProgram,
 	mockUSDCMint,
 	mockUserUSDCAccount,
 	initializeQuoteSpotMarket,
 	createFundedKeyPair,
 	createUserWithUSDCAccount,
-	printTxLogs,
 } from './testHelpers';
 import {
 	BASE_PRECISION,
-	BulkAccountLoader,
 	getMarketOrderParams,
 	PEG_PRECISION,
 	PositionDirection,
-} from '../sdk';
-import { decodeName } from '../sdk/lib/userName';
+} from '../sdk/src';
+import { decodeName } from '../sdk/src/userName';
+import { startAnchor } from 'solana-bankrun';
+import { TestBulkAccountLoader } from '../sdk/src/accounts/testBulkAccountLoader';
+import { BankrunContextWrapper } from '../sdk/src/bankrun/bankrunConnection';
 
 describe('referrer', () => {
-	const provider = anchor.AnchorProvider.local(undefined, {
-		preflightCommitment: 'confirmed',
-		commitment: 'confirmed',
-	});
-	const connection = provider.connection;
-	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
 	let referrerDriftClient: TestClient;
@@ -49,12 +45,11 @@ describe('referrer', () => {
 
 	let fillerDriftClient: TestClient;
 
-	const eventSubscriber = new EventSubscriber(connection, chProgram, {
-		commitment: 'recent',
-	});
-	eventSubscriber.subscribe();
+	let eventSubscriber: EventSubscriber;
 
-	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
+	let bulkAccountLoader: TestBulkAccountLoader;
+
+	let bankrunContextWrapper: BankrunContextWrapper;
 
 	let usdcMint;
 	let referrerUSDCAccount;
@@ -73,14 +68,31 @@ describe('referrer', () => {
 	const usdcAmount = new BN(100 * 10 ** 6);
 
 	before(async () => {
-		usdcMint = await mockUSDCMint(provider);
+		const context = await startAnchor('', [], []);
+
+		bankrunContextWrapper = new BankrunContextWrapper(context);
+
+		bulkAccountLoader = new TestBulkAccountLoader(
+			bankrunContextWrapper.connection,
+			'processed',
+			1
+		);
+
+		eventSubscriber = new EventSubscriber(
+			bankrunContextWrapper.connection.toConnection(),
+			chProgram
+		);
+
+		await eventSubscriber.subscribe();
+
+		usdcMint = await mockUSDCMint(bankrunContextWrapper);
 		referrerUSDCAccount = await mockUserUSDCAccount(
 			usdcMint,
 			usdcAmount,
-			provider
+			bankrunContextWrapper
 		);
 
-		solOracle = await mockOracle(100);
+		solOracle = await mockOracleNoProgram(bankrunContextWrapper, 100);
 
 		const marketIndexes = [0];
 		const spotMarketIndexes = [0];
@@ -91,8 +103,8 @@ describe('referrer', () => {
 			},
 		];
 		referrerDriftClient = new TestClient({
-			connection,
-			wallet: provider.wallet,
+			connection: bankrunContextWrapper.connection.toConnection(),
+			wallet: bankrunContextWrapper.provider.wallet,
 			programID: chProgram.programId,
 			opts: {
 				commitment: 'confirmed',
@@ -100,6 +112,7 @@ describe('referrer', () => {
 			activeSubAccountId: 0,
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: spotMarketIndexes,
+			subAccountIds: [],
 			oracleInfos,
 			userStats: true,
 			accountSubscription: {
@@ -130,16 +143,16 @@ describe('referrer', () => {
 			referrerUSDCAccount.publicKey
 		);
 
-		refereeKeyPair = await createFundedKeyPair(connection);
+		refereeKeyPair = await createFundedKeyPair(bankrunContextWrapper);
 		refereeUSDCAccount = await mockUserUSDCAccount(
 			usdcMint,
 			usdcAmount,
-			provider,
+			bankrunContextWrapper,
 			refereeKeyPair.publicKey
 		);
 
 		refereeDriftClient = new TestClient({
-			connection,
+			connection: bankrunContextWrapper.connection.toConnection(),
 			wallet: new Wallet(refereeKeyPair),
 			programID: chProgram.programId,
 			opts: {
@@ -148,6 +161,7 @@ describe('referrer', () => {
 			activeSubAccountId: 0,
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: spotMarketIndexes,
+			subAccountIds: [],
 			oracleInfos,
 			userStats: true,
 			accountSubscription: {
@@ -158,7 +172,7 @@ describe('referrer', () => {
 		await refereeDriftClient.subscribe();
 
 		[fillerDriftClient] = await createUserWithUSDCAccount(
-			provider,
+			bankrunContextWrapper,
 			usdcMint,
 			chProgram,
 			usdcAmount,
@@ -207,14 +221,23 @@ describe('referrer', () => {
 		await eventSubscriber.awaitTx(txSig);
 
 		const newUserRecord = eventSubscriber.getEventsArray('NewUserRecord')[0];
-		assert(newUserRecord.referrer.equals(provider.wallet.publicKey));
+		assert(
+			newUserRecord.referrer.equals(
+				bankrunContextWrapper.provider.wallet.publicKey
+			)
+		);
 
 		await refereeDriftClient.fetchAccounts();
 		const refereeStats = refereeDriftClient.getUserStats().getAccount();
-		assert(refereeStats.referrer.equals(provider.wallet.publicKey));
+		assert(
+			refereeStats.referrer.equals(
+				bankrunContextWrapper.provider.wallet.publicKey
+			)
+		);
+		assert((refereeStats.referrerStatus & ReferrerStatus.IsReferred) > 0);
 
 		const referrerStats = referrerDriftClient.getUserStats().getAccount();
-		assert(referrerStats.isReferrer == true);
+		assert((referrerStats.referrerStatus & ReferrerStatus.IsReferrer) > 0);
 	});
 
 	it('fill order', async () => {
@@ -255,7 +278,7 @@ describe('referrer', () => {
 			refereeDriftClient.getUserStats().getReferrerInfo()
 		);
 
-		await printTxLogs(connection, txSig2);
+		bankrunContextWrapper.printTxLogs(txSig2);
 	});
 
 	it('withdraw', async () => {

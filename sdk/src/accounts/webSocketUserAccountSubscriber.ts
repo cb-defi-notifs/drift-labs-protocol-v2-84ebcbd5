@@ -4,27 +4,37 @@ import {
 	NotSubscribedError,
 	UserAccountEvents,
 	UserAccountSubscriber,
+	ResubOpts,
 } from './types';
 import { Program } from '@coral-xyz/anchor';
 import StrictEventEmitter from 'strict-event-emitter-types';
 import { EventEmitter } from 'events';
-import { PublicKey } from '@solana/web3.js';
+import { Commitment, PublicKey } from '@solana/web3.js';
 import { WebSocketAccountSubscriber } from './webSocketAccountSubscriber';
 import { UserAccount } from '../types';
 
 export class WebSocketUserAccountSubscriber implements UserAccountSubscriber {
 	isSubscribed: boolean;
+	resubOpts?: ResubOpts;
+	commitment?: Commitment;
 	program: Program;
 	eventEmitter: StrictEventEmitter<EventEmitter, UserAccountEvents>;
 	userAccountPublicKey: PublicKey;
 
 	userDataAccountSubscriber: AccountSubscriber<UserAccount>;
 
-	public constructor(program: Program, userAccountPublicKey: PublicKey) {
+	public constructor(
+		program: Program,
+		userAccountPublicKey: PublicKey,
+		resubOpts?: ResubOpts,
+		commitment?: Commitment
+	) {
 		this.isSubscribed = false;
 		this.program = program;
+		this.resubOpts = resubOpts;
 		this.userAccountPublicKey = userAccountPublicKey;
 		this.eventEmitter = new EventEmitter();
+		this.commitment = commitment;
 	}
 
 	async subscribe(userAccount?: UserAccount): Promise<boolean> {
@@ -35,7 +45,10 @@ export class WebSocketUserAccountSubscriber implements UserAccountSubscriber {
 		this.userDataAccountSubscriber = new WebSocketAccountSubscriber(
 			'user',
 			this.program,
-			this.userAccountPublicKey
+			this.userAccountPublicKey,
+			undefined,
+			this.resubOpts,
+			this.commitment
 		);
 
 		if (userAccount) {
@@ -82,7 +95,7 @@ export class WebSocketUserAccountSubscriber implements UserAccountSubscriber {
 	public updateData(userAccount: UserAccount, slot: number) {
 		const currentDataSlot =
 			this.userDataAccountSubscriber.dataAndSlot?.slot || 0;
-		if (currentDataSlot < slot) {
+		if (currentDataSlot <= slot) {
 			this.userDataAccountSubscriber.setData(userAccount, slot);
 			this.eventEmitter.emit('userAccountUpdate', userAccount);
 			this.eventEmitter.emit('update');

@@ -29,10 +29,11 @@ use solana_program::account_info::AccountInfo;
 use solana_program::instruction::Instruction;
 use solana_program::msg;
 use std::cell::Ref;
+use std::convert::TryFrom;
 use std::num::NonZeroU64;
 use std::ops::{Deref, DerefMut};
 
-#[account(zero_copy)]
+#[account(zero_copy(unsafe))]
 #[derive(Default, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct SerumV3FulfillmentConfig {
@@ -116,7 +117,7 @@ impl<'a, 'b> SerumContext<'a, 'b> {
             self.serum_open_orders.clone(),
             authority.clone(),
             self.serum_market.clone(),
-            rent.to_account_info().clone(),
+            rent.to_account_info(),
         ];
         solana_program::program::invoke_signed(&instruction, &account_infos, signers_seeds).map_err(
             |e| {
@@ -211,7 +212,7 @@ impl<'a, 'b> Deref for SerumFulfillmentParams<'a, 'b> {
 /// Constructor for SerumFulfillmentParams
 impl<'a, 'b> SerumFulfillmentParams<'a, 'b> {
     #[allow(clippy::type_complexity)]
-    pub fn new<'c>(
+    pub fn new<'c: 'b>(
         account_info_iter: &'a mut std::iter::Peekable<std::slice::Iter<'c, AccountInfo<'b>>>,
         state: &State,
         base_market: &SpotMarket,
@@ -284,7 +285,7 @@ impl<'a, 'b> SerumFulfillmentParams<'a, 'b> {
                 ErrorCode::InvalidFulfillmentConfig
             })?);
 
-        let token_program: Program<Token> = Program::try_from(token_program).map_err(|e| {
+        let token_program: Program<Token> = Program::try_from(*token_program).map_err(|e| {
             msg!("{:?}", e);
             ErrorCode::InvalidFulfillmentConfig
         })?;
@@ -689,6 +690,26 @@ impl<'a, 'b> SpotFulfillmentParams for SerumFulfillmentParams<'a, 'b> {
     ) -> DriftResult {
         validate_spot_market_vault_amount(base_market, self.base_market_vault.amount)?;
         validate_spot_market_vault_amount(quote_market, self.quote_market_vault.amount)?;
+        Ok(())
+    }
+
+    fn validate_markets(
+        &self,
+        base_market: &SpotMarket,
+        quote_market: &SpotMarket,
+    ) -> DriftResult<()> {
+        validate!(
+            self.base_market_vault.mint == base_market.mint,
+            ErrorCode::DefaultError,
+            "base mints dont match"
+        )?;
+
+        validate!(
+            self.quote_market_vault.mint == quote_market.mint,
+            ErrorCode::DefaultError,
+            "base mints dont match"
+        )?;
+
         Ok(())
     }
 }

@@ -1,22 +1,30 @@
 use crate::error::{DriftResult, ErrorCode};
+use std::cell::RefMut;
+use std::convert::TryFrom;
 
+use crate::error::ErrorCode::UnableToLoadOracle;
 use crate::math::safe_unwrap::SafeUnwrap;
+use crate::state::load_ref::load_ref_mut;
+use crate::state::oracle::PrelaunchOracle;
 use crate::state::oracle_map::OracleMap;
+use crate::state::perp_market::PerpMarket;
 use crate::state::perp_market_map::{MarketSet, PerpMarketMap};
 use crate::state::spot_market_map::SpotMarketMap;
 use crate::state::state::OracleGuardRails;
 use crate::state::traits::Size;
 use crate::state::user::{User, UserStats};
-use crate::validate;
+use crate::{validate, OracleSource};
 use anchor_lang::accounts::account::Account;
-use anchor_lang::prelude::AccountInfo;
-use anchor_lang::prelude::AccountLoader;
+use anchor_lang::prelude::{AccountInfo, Interface};
+use anchor_lang::prelude::{AccountLoader, InterfaceAccount};
 use anchor_lang::Discriminator;
 use anchor_spl::token::TokenAccount;
+use anchor_spl::token_interface::{Mint, TokenInterface};
 use arrayref::array_ref;
 use solana_program::account_info::next_account_info;
 use solana_program::msg;
 use std::iter::Peekable;
+use std::ops::Deref;
 use std::slice::Iter;
 
 pub struct AccountMaps<'a> {
@@ -26,7 +34,7 @@ pub struct AccountMaps<'a> {
 }
 
 pub fn load_maps<'a, 'b>(
-    account_info_iter: &mut Peekable<Iter<AccountInfo<'a>>>,
+    account_info_iter: &mut Peekable<Iter<'a, AccountInfo<'a>>>,
     writable_perp_markets: &'b MarketSet,
     writable_spot_markets: &'b MarketSet,
     slot: u64,
@@ -36,6 +44,14 @@ pub fn load_maps<'a, 'b>(
     let spot_market_map = SpotMarketMap::load(writable_spot_markets, account_info_iter)?;
     let perp_market_map = PerpMarketMap::load(writable_perp_markets, account_info_iter)?;
 
+    for perp_market_index in writable_perp_markets.iter() {
+        update_prelaunch_oracle(
+            perp_market_map.get_ref(perp_market_index)?.deref(),
+            &oracle_map,
+            slot,
+        )?;
+    }
+
     Ok(AccountMaps {
         perp_market_map,
         spot_market_map,
@@ -43,8 +59,27 @@ pub fn load_maps<'a, 'b>(
     })
 }
 
+pub fn update_prelaunch_oracle(
+    perp_market: &PerpMarket,
+    oracle_map: &OracleMap,
+    slot: u64,
+) -> DriftResult {
+    if perp_market.amm.oracle_source != OracleSource::Prelaunch {
+        return Ok(());
+    }
+
+    let oracle_account_info = oracle_map.get_account_info(&perp_market.amm.oracle)?;
+
+    let mut oracle: RefMut<PrelaunchOracle> =
+        load_ref_mut(&oracle_account_info).or(Err(UnableToLoadOracle))?;
+
+    oracle.update(perp_market, slot)?;
+
+    Ok(())
+}
+
 pub fn get_maker_and_maker_stats<'a>(
-    account_info_iter: &mut Peekable<Iter<AccountInfo<'a>>>,
+    account_info_iter: &mut Peekable<Iter<'a, AccountInfo<'a>>>,
 ) -> DriftResult<(AccountLoader<'a, User>, AccountLoader<'a, UserStats>)> {
     let maker_account_info =
         next_account_info(account_info_iter).or(Err(ErrorCode::MakerNotFound))?;
@@ -74,7 +109,7 @@ pub fn get_maker_and_maker_stats<'a>(
 
 #[allow(clippy::type_complexity)]
 pub fn get_referrer_and_referrer_stats<'a>(
-    account_info_iter: &mut Peekable<Iter<AccountInfo<'a>>>,
+    account_info_iter: &mut Peekable<Iter<'a, AccountInfo<'a>>>,
 ) -> DriftResult<(
     Option<AccountLoader<'a, User>>,
     Option<AccountLoader<'a, UserStats>>,
@@ -147,7 +182,7 @@ pub fn get_referrer_and_referrer_stats<'a>(
 }
 
 pub fn get_whitelist_token<'a>(
-    account_info_iter: &mut Peekable<Iter<AccountInfo<'a>>>,
+    account_info_iter: &mut Peekable<Iter<'a, AccountInfo<'a>>>,
 ) -> DriftResult<Account<'a, TokenAccount>> {
     let token_account_info = account_info_iter.peek();
     if token_account_info.is_none() {
@@ -164,4 +199,39 @@ pub fn get_whitelist_token<'a>(
         })?;
 
     Ok(whitelist_token)
+}
+
+pub fn get_token_interface<'a>(
+    account_info_iter: &mut Peekable<Iter<'a, AccountInfo<'a>>>,
+) -> DriftResult<Option<Interface<'a, TokenInterface>>> {
+    let token_interface_account_info = account_info_iter.peek();
+    if token_interface_account_info.is_none() {
+        return Ok(None);
+    }
+
+    let token_interface_account_info = account_info_iter.next().safe_unwrap()?;
+    let token_interface: Interface<TokenInterface> =
+        Interface::try_from(token_interface_account_info).map_err(|e| {
+            msg!("Unable to deserialize token interface");
+            msg!("{:?}", e);
+            ErrorCode::DefaultError
+        })?;
+
+    Ok(Some(token_interface))
+}
+
+pub fn get_token_mint<'a>(
+    account_info_iter: &mut Peekable<Iter<'a, AccountInfo<'a>>>,
+) -> DriftResult<Option<InterfaceAccount<'a, Mint>>> {
+    let mint_account_info = account_info_iter.peek();
+    if mint_account_info.is_none() {
+        return Ok(None);
+    }
+
+    let mint_account_info = account_info_iter.next().safe_unwrap()?;
+
+    match InterfaceAccount::try_from(mint_account_info) {
+        Ok(mint) => Ok(Some(mint)),
+        Err(_) => Ok(None),
+    }
 }

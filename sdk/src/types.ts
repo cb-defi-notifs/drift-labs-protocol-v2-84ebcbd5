@@ -1,5 +1,15 @@
-import { PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
+import {
+	Keypair,
+	PublicKey,
+	Transaction,
+	VersionedTransaction,
+} from '@solana/web3.js';
 import { BN, ZERO } from '.';
+
+// Utility type which lets you denote record with values of type A mapped to a record with the same keys but values of type B
+export type MappedRecord<A extends Record<string, unknown>, B> = {
+	[K in keyof A]: B;
+};
 
 // # Utility Types / Enums / Constants
 
@@ -12,7 +22,8 @@ export enum ExchangeStatus {
 	LIQ_PAUSED = 16,
 	FUNDING_PAUSED = 32,
 	SETTLE_PNL_PAUSED = 64,
-	PAUSED = 127,
+	AMM_IMMEDIATE_FILL_PAUSED = 128,
+	PAUSED = 255,
 }
 
 export class MarketStatus {
@@ -27,15 +38,46 @@ export class MarketStatus {
 	static readonly DELISTED = { delisted: {} };
 }
 
-export class UserStatus {
-	static readonly ACTIVE = { active: {} };
-	static readonly BEING_LIQUIDATED = { beingLiquidated: {} };
-	static readonly BANKRUPT = { bankrupt: {} };
+export enum PerpOperation {
+	UPDATE_FUNDING = 1,
+	AMM_FILL = 2,
+	FILL = 4,
+	SETTLE_PNL = 8,
+	SETTLE_PNL_WITH_POSITION = 16,
+	LIQUIDATION = 32,
+}
+
+export enum SpotOperation {
+	UPDATE_CUMULATIVE_INTEREST = 1,
+	FILL = 2,
+	DEPOSIT = 4,
+	WITHDRAW = 8,
+	LIQUIDATION = 16,
+}
+
+export enum InsuranceFundOperation {
+	INIT = 1,
+	ADD = 2,
+	REQUEST_REMOVE = 4,
+	REMOVE = 8,
+}
+
+export enum UserStatus {
+	BEING_LIQUIDATED = 1,
+	BANKRUPT = 2,
+	REDUCE_ONLY = 4,
+	ADVANCED_LP = 8,
+}
+
+export class MarginMode {
+	static readonly DEFAULT = { default: {} };
+	static readonly HIGH_LEVERAGE = { highLeverage: {} };
 }
 
 export class ContractType {
 	static readonly PERPETUAL = { perpetual: {} };
 	static readonly FUTURE = { future: {} };
+	static readonly PREDICTION = { prediction: {} };
 }
 
 export class ContractTier {
@@ -43,6 +85,7 @@ export class ContractTier {
 	static readonly B = { b: {} };
 	static readonly C = { c: {} };
 	static readonly SPECULATIVE = { speculative: {} };
+	static readonly HIGHLY_SPECULATIVE = { highlySpeculative: {} };
 	static readonly ISOLATED = { isolated: {} };
 }
 
@@ -78,9 +121,15 @@ export class OracleSource {
 	static readonly PYTH = { pyth: {} };
 	static readonly PYTH_1K = { pyth1K: {} };
 	static readonly PYTH_1M = { pyth1M: {} };
-	// static readonly SWITCHBOARD = { switchboard: {} };
+	static readonly PYTH_PULL = { pythPull: {} };
+	static readonly PYTH_1K_PULL = { pyth1KPull: {} };
+	static readonly PYTH_1M_PULL = { pyth1MPull: {} };
+	static readonly SWITCHBOARD = { switchboard: {} };
 	static readonly QUOTE_ASSET = { quoteAsset: {} };
 	static readonly PYTH_STABLE_COIN = { pythStableCoin: {} };
+	static readonly PYTH_STABLE_COIN_PULL = { pythStableCoinPull: {} };
+	static readonly Prelaunch = { prelaunch: {} };
+	static readonly SWITCHBOARD_ON_DEMAND = { switchboardOnDemand: {} };
 }
 
 export class OrderType {
@@ -154,8 +203,17 @@ export class OrderActionExplanation {
 	static readonly ORDER_FILLED_WITH_SERUM = {
 		orderFillWithSerum: {},
 	};
+	static readonly ORDER_FILLED_WITH_OPENBOOK_V2 = {
+		orderFilledWithOpenbookV2: {},
+	};
+	static readonly ORDER_FILLED_WITH_PHOENIX = {
+		orderFillWithPhoenix: {},
+	};
 	static readonly REDUCE_ONLY_ORDER_INCREASED_POSITION = {
 		reduceOnlyOrderIncreasedPosition: {},
+	};
+	static readonly DERISK_LP = {
+		deriskLp: {},
 	};
 }
 
@@ -179,6 +237,8 @@ export class SpotFulfillmentStatus {
 export class DepositExplanation {
 	static readonly NONE = { none: {} };
 	static readonly TRANSFER = { transfer: {} };
+	static readonly BORROW = { borrow: {} };
+	static readonly REPAY_BORROW = { repayBorrow: {} };
 }
 
 export class SettlePnlExplanation {
@@ -196,6 +256,13 @@ export class StakeAction {
 	static readonly UNSTAKE_REQUEST = { unstakeRequest: {} };
 	static readonly UNSTAKE_CANCEL_REQUEST = { unstakeCancelRequest: {} };
 	static readonly UNSTAKE = { unstake: {} };
+	static readonly UNSTAKE_TRANSFER = { unstakeTransfer: {} };
+	static readonly STAKE_TRANSFER = { stakeTransfer: {} };
+}
+
+export class SettlePnlMode {
+	static readonly TRY_SETTLE = { trySettle: {} };
+	static readonly MUST_SETTLE = { mustSettle: {} };
 }
 
 export function isVariant(object: unknown, type: string) {
@@ -337,6 +404,7 @@ export class LPAction {
 	static readonly ADD_LIQUIDITY = { addLiquidity: {} };
 	static readonly REMOVE_LIQUIDITY = { removeLiquidity: {} };
 	static readonly SETTLE_LIQUIDITY = { settleLiquidity: {} };
+	static readonly REMOVE_LIQUIDITY_DERISK = { removeLiquidityDerisk: {} };
 }
 
 export type FundingRateRecord = {
@@ -474,6 +542,16 @@ export type SettlePnlRecord = {
 	explanation: SettlePnlExplanation;
 };
 
+export type SwiftOrderRecord = {
+	ts: BN;
+	user: PublicKey;
+	hash: string;
+	matchingOrderParams: OrderParams;
+	swiftOrderMaxSlot: BN;
+	swiftOrderUuid: Uint8Array;
+	userOrderId: number;
+};
+
 export type OrderRecord = {
 	ts: BN;
 	user: PublicKey;
@@ -523,6 +601,16 @@ export type SwapRecord = {
 	fee: BN;
 };
 
+export type SpotMarketVaultDepositRecord = {
+	ts: BN;
+	marketIndex: number;
+	depositBalance: BN;
+	cumulativeDepositInterestBefore: BN;
+	cumulativeDepositInterestAfter: BN;
+	depositTokenAmountBefore: BN;
+	amount: BN;
+};
+
 export type StateAccount = {
 	admin: PublicKey;
 	exchangeStatus: number;
@@ -538,6 +626,7 @@ export type StateAccount = {
 	defaultSpotAuctionDuration: number;
 	liquidationMarginBufferRatio: number;
 	settlementDuration: number;
+	maxNumberOfSubAccounts: number;
 	signer: PublicKey;
 	signerNonce: number;
 	srmVault: PublicKey;
@@ -546,6 +635,7 @@ export type StateAccount = {
 	lpCooldownTime: BN;
 	initialPctToLiquidate: number;
 	liquidationDuration: number;
+	maxInitializeUserFee: number;
 };
 
 export type PerpMarketAccount = {
@@ -581,6 +671,15 @@ export type PerpMarketAccount = {
 		quoteMaxInsurance: BN;
 	};
 	quoteSpotMarketIndex: number;
+	feeAdjustment: number;
+	pausedOperations: number;
+
+	fuelBoostTaker: number;
+	fuelBoostMaker: number;
+	fuelBoostPosition: number;
+
+	highLeverageMarginRatioInitial: number;
+	highLeverageMarginRatioMaintenance: number;
 };
 
 export type HistoricalOracleData = {
@@ -651,6 +750,7 @@ export type SpotMarketAccount = {
 	maintenanceLiabilityWeight: number;
 	liquidatorFee: number;
 	imfFactor: number;
+	scaleInitialAssetWeightStart: BN;
 
 	withdrawGuardThreshold: BN;
 	depositTokenTwap: BN;
@@ -671,6 +771,21 @@ export type SpotMarketAccount = {
 	flashLoanInitialTokenAmount: BN;
 
 	ordersEnabled: boolean;
+
+	pausedOperations: number;
+
+	ifPausedOperations: number;
+
+	maxTokenBorrowsFraction: number;
+	minBorrowRate: number;
+
+	fuelBoostDeposits: number;
+	fuelBoostBorrows: number;
+	fuelBoostTaker: number;
+	fuelBoostMaker: number;
+	fuelBoostInsurance: number;
+
+	tokenProgram: number;
 };
 
 export type PoolBalance = {
@@ -701,7 +816,7 @@ export type AMM = {
 	pegMultiplier: BN;
 	cumulativeFundingRateLong: BN;
 	cumulativeFundingRateShort: BN;
-	last24hAvgFundingRate: BN;
+	last24HAvgFundingRate: BN;
 	lastFundingRateShort: BN;
 	lastFundingRateLong: BN;
 
@@ -709,6 +824,7 @@ export type AMM = {
 	totalFeeMinusDistributions: BN;
 	totalFeeWithdrawn: BN;
 	totalFee: BN;
+	totalFeeEarnedPerLp: BN;
 	userLpShares: BN;
 	baseAssetAmountWithUnsettledLp: BN;
 	orderStepSize: BN;
@@ -765,6 +881,11 @@ export type AMM = {
 	bidQuoteAssetReserve: BN;
 	askBaseAssetReserve: BN;
 	askQuoteAssetReserve: BN;
+
+	perLpBase: number; // i8
+	netUnsettledFundingPnl: BN;
+	quoteAssetAmountWithUnsettledLp: BN;
+	referencePriceOffset: number;
 };
 
 // # User Account Types
@@ -783,6 +904,7 @@ export type PerpPosition = {
 	remainderBaseAssetAmount: number;
 	lastBaseAssetAmountPerLp: BN;
 	lastQuoteAssetAmountPerLp: BN;
+	perLpBase: number;
 };
 
 export type UserStatsAccount = {
@@ -803,9 +925,20 @@ export type UserStatsAccount = {
 		current_epoch_referrer_reward: BN;
 	};
 	referrer: PublicKey;
-	isReferrer: boolean;
+	referrerStatus: number;
 	authority: PublicKey;
 	ifStakedQuoteAssetAmount: BN;
+
+	lastFuelIfBonusUpdateTs: number; // u32 onchain
+
+	fuelInsurance: number;
+	fuelDeposits: number;
+	fuelBorrows: number;
+	fuelPositions: number;
+	fuelTaker: number;
+	fuelMaker: number;
+
+	ifStakedGovTokenAmount: BN;
 };
 
 export type UserAccount = {
@@ -816,7 +949,7 @@ export type UserAccount = {
 	spotPositions: SpotPosition[];
 	perpPositions: PerpPosition[];
 	orders: Order[];
-	status: UserStatus;
+	status: number;
 	nextLiquidationId: number;
 	nextOrderId: number;
 	maxMarginRatio: number;
@@ -835,6 +968,8 @@ export type UserAccount = {
 	hasOpenOrder: boolean;
 	openAuctions: number;
 	hasOpenAuction: boolean;
+	lastFuelBonusUpdateTs: number;
+	marginMode: MarginMode;
 };
 
 export type SpotPosition = {
@@ -857,8 +992,8 @@ export type Order = {
 	marketIndex: number;
 	price: BN;
 	baseAssetAmount: BN;
-	baseAssetAmountFilled: BN;
 	quoteAssetAmount: BN;
+	baseAssetAmountFilled: BN;
 	quoteAssetAmountFilled: BN;
 	direction: PositionDirection;
 	reduceOnly: boolean;
@@ -898,6 +1033,7 @@ export class PostOnlyParams {
 	static readonly NONE = { none: {} };
 	static readonly MUST_POST_ONLY = { mustPostOnly: {} }; // Tx fails if order can't be post only
 	static readonly TRY_POST_ONLY = { tryPostOnly: {} }; // Tx succeeds and order not placed if can't be post only
+	static readonly SLIDE = { slide: {} }; // Modify price to be post only if can't be post only
 }
 
 export type NecessaryOrderParams = {
@@ -940,6 +1076,47 @@ export const DefaultOrderParams: OrderParams = {
 	auctionEndPrice: null,
 };
 
+export type SwiftServerMessage = {
+	slot: BN;
+	swiftOrderSignature: Uint8Array;
+	uuid: Uint8Array; // From buffer of standard UUID string
+};
+
+export type SwiftOrderParamsMessage = {
+	swiftOrderParams: OptionalOrderParams;
+	subAccountId: number;
+	takeProfitOrderParams: SwiftTriggerOrderParams | null;
+	stopLossOrderParams: SwiftTriggerOrderParams | null;
+};
+
+export type SwiftTriggerOrderParams = {
+	triggerPrice: BN;
+	baseAssetAmount: BN;
+};
+
+export type RFQMakerOrderParams = {
+	uuid: Uint8Array; // From buffer of standard UUID string
+	authority: PublicKey;
+	subAccountId: number;
+	marketIndex: number;
+	marketType: MarketType;
+	baseAssetAmount: BN;
+	price: BN;
+	direction: PositionDirection;
+	maxTs: BN;
+};
+
+export type RFQMakerMessage = {
+	orderParams: RFQMakerOrderParams;
+	signature: Uint8Array;
+};
+
+export type RFQMatch = {
+	baseAssetAmount: BN;
+	makerOrderParams: RFQMakerOrderParams;
+	makerSignature: Uint8Array;
+};
+
 export type MakerInfo = {
 	maker: PublicKey;
 	makerStats: PublicKey;
@@ -959,10 +1136,32 @@ export type ReferrerInfo = {
 	referrerStats: PublicKey;
 };
 
-export type TxParams = {
+export enum ReferrerStatus {
+	IsReferrer = 1,
+	IsReferred = 2,
+}
+
+export enum PlaceAndTakeOrderSuccessCondition {
+	PartialFill = 1,
+	FullFill = 2,
+}
+
+type ExactType<T> = Pick<T, keyof T>;
+
+export type BaseTxParams = ExactType<{
 	computeUnits?: number;
 	computeUnitsPrice?: number;
+}>;
+
+export type ProcessingTxParams = {
+	useSimulatedComputeUnits?: boolean;
+	computeUnitsBufferMultiplier?: number;
+	useSimulatedComputeUnitsForCUPriceCalculation?: boolean;
+	getCUPriceFromComputeUnits?: (computeUnits: number) => number;
+	lowerBoundCu?: number;
 };
+
+export type TxParams = BaseTxParams & ProcessingTxParams;
 
 export class SwapReduceOnly {
 	static readonly In = { in: {} };
@@ -974,6 +1173,7 @@ export interface IWallet {
 	signTransaction(tx: Transaction): Promise<Transaction>;
 	signAllTransactions(txs: Transaction[]): Promise<Transaction[]>;
 	publicKey: PublicKey;
+	payer?: Keypair;
 }
 export interface IVersionedWallet {
 	signVersionedTransaction(
@@ -983,12 +1183,11 @@ export interface IVersionedWallet {
 		txs: VersionedTransaction[]
 	): Promise<VersionedTransaction[]>;
 	publicKey: PublicKey;
+	payer?: Keypair;
 }
 
 export type FeeStructure = {
 	feeTiers: FeeTier[];
-	makerRebateNumerator: BN;
-	makerRebateDenominator: BN;
 	fillerRewardStructure: OrderFillerRewardStructure;
 	flatFillerFee: BN;
 	referrerRewardEpochUpperBound: BN;
@@ -1022,6 +1221,15 @@ export type OracleGuardRails = {
 		confidenceIntervalMaxSize: BN;
 		tooVolatileRatio: BN;
 	};
+};
+
+export type PrelaunchOracle = {
+	price: BN;
+	maxPrice: BN;
+	confidence: BN;
+	ammLastUpdateSlot: BN;
+	lastUpdateSlot: BN;
+	perpMarketIndex: number;
 };
 
 export type MarginCategory = 'Initial' | 'Maintenance';
@@ -1069,6 +1277,23 @@ export type PhoenixV1FulfillmentConfigAccount = {
 	status: SpotFulfillmentStatus;
 };
 
+export type OpenbookV2FulfillmentConfigAccount = {
+	pubkey: PublicKey;
+	openbookV2ProgramId: PublicKey;
+	openbookV2Market: PublicKey;
+	openbookV2MarketAuthority: PublicKey;
+	openbookV2EventHeap: PublicKey;
+	openbookV2Bids: PublicKey;
+	openbookV2Asks: PublicKey;
+	openbookV2BaseVault: PublicKey;
+	openbookV2QuoteVault: PublicKey;
+	marketIndex: number;
+	fulfillmentType: SpotFulfillmentType;
+	status: SpotFulfillmentStatus;
+	// not actually on the account, just used to pass around remaining accounts in ts
+	remainingAccounts?: PublicKey[];
+};
+
 export type ReferrerNameAccount = {
 	name: number[];
 	user: PublicKey;
@@ -1096,4 +1321,37 @@ export type PerpMarketExtendedInfo = {
 	 */
 	pnlPoolValue: BN;
 	contractTier: ContractTier;
+};
+
+export type HealthComponents = {
+	deposits: HealthComponent[];
+	borrows: HealthComponent[];
+	perpPositions: HealthComponent[];
+	perpPnl: HealthComponent[];
+};
+
+export type HealthComponent = {
+	marketIndex: number;
+	size: BN;
+	value: BN;
+	weight: BN;
+	weightedValue: BN;
+};
+
+export interface DriftClientMetricsEvents {
+	txSigned: SignedTxData[];
+	preTxSigned: void;
+}
+
+export type SignedTxData = {
+	txSig: string;
+	signedTx: Transaction | VersionedTransaction;
+	lastValidBlockHeight?: number;
+	blockHash: string;
+};
+
+export type HighLeverageModeConfig = {
+	maxUsers: number;
+	currentUsers: number;
+	reduceOnly: boolean;
 };

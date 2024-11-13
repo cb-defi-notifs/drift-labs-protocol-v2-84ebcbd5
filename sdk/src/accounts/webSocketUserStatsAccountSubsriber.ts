@@ -4,11 +4,12 @@ import {
 	NotSubscribedError,
 	UserStatsAccountSubscriber,
 	UserStatsAccountEvents,
+	ResubOpts,
 } from './types';
 import { Program } from '@coral-xyz/anchor';
 import StrictEventEmitter from 'strict-event-emitter-types';
 import { EventEmitter } from 'events';
-import { PublicKey } from '@solana/web3.js';
+import { Commitment, PublicKey } from '@solana/web3.js';
 import { WebSocketAccountSubscriber } from './webSocketAccountSubscriber';
 import { UserStatsAccount } from '../types';
 
@@ -16,17 +17,26 @@ export class WebSocketUserStatsAccountSubscriber
 	implements UserStatsAccountSubscriber
 {
 	isSubscribed: boolean;
+	resubOpts?: ResubOpts;
+	commitment?: Commitment;
 	program: Program;
 	eventEmitter: StrictEventEmitter<EventEmitter, UserStatsAccountEvents>;
 	userStatsAccountPublicKey: PublicKey;
 
 	userStatsAccountSubscriber: AccountSubscriber<UserStatsAccount>;
 
-	public constructor(program: Program, userStatsAccountPublicKey: PublicKey) {
+	public constructor(
+		program: Program,
+		userStatsAccountPublicKey: PublicKey,
+		resubOpts?: ResubOpts,
+		commitment?: Commitment
+	) {
 		this.isSubscribed = false;
 		this.program = program;
 		this.userStatsAccountPublicKey = userStatsAccountPublicKey;
 		this.eventEmitter = new EventEmitter();
+		this.resubOpts = resubOpts;
+		this.commitment = commitment;
 	}
 
 	async subscribe(userStatsAccount?: UserStatsAccount): Promise<boolean> {
@@ -37,7 +47,10 @@ export class WebSocketUserStatsAccountSubscriber
 		this.userStatsAccountSubscriber = new WebSocketAccountSubscriber(
 			'userStats',
 			this.program,
-			this.userStatsAccountPublicKey
+			this.userStatsAccountPublicKey,
+			undefined,
+			this.resubOpts,
+			this.commitment
 		);
 
 		if (userStatsAccount) {

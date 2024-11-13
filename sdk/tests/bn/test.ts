@@ -1,8 +1,9 @@
-import { BN } from '../../src/index';
+import { BN, numberToSafeBN } from '../../src/index';
 import { expect } from 'chai';
 import { BigNum } from '../../src/factory/bigNum';
 import {
 	AMM_RESERVE_PRECISION_EXP,
+	BASE_PRECISION,
 	BASE_PRECISION_EXP,
 	TEN_THOUSAND,
 } from '../../src/constants/numericConstants';
@@ -147,6 +148,33 @@ describe('BigNum Tests', () => {
 			'-1.0000000000000'
 		);
 		expect(BigNum.from('-100', 6).print()).to.equal('-0.000100');
+
+		// Case 7: really large numbers + switching between scientific/financial
+		expect(BigNum.fromPrint('123000000000').toMillified(3)).to.equal('123B');
+		expect(
+			BigNum.fromPrint('123000000000').toMillified(3, undefined, 'scientific')
+		).to.equal('123G'); // (G = Giga)
+		expect(BigNum.fromPrint('123000000000000').toMillified(3)).to.equal('123T');
+		expect(
+			BigNum.fromPrint('123000000000000').toMillified(
+				3,
+				undefined,
+				'scientific'
+			)
+		).to.equal('123T'); // (T = Tera)
+		expect(BigNum.fromPrint('123000000000000000').toMillified(3)).to.equal(
+			'123Q'
+		);
+		expect(
+			BigNum.fromPrint('123000000000000000').toMillified(
+				3,
+				undefined,
+				'scientific'
+			)
+		).to.equal('123P'); // (P = Peta)
+
+		// TODO : Need to make the appropriate changes for the next line to pass
+		// expect(BigNum.fromPrint('123000000000000000000').toMillified(3)).to.equal('123000Q');
 	});
 
 	it('can initialise from string values correctly', () => {
@@ -296,5 +324,18 @@ describe('BigNum Tests', () => {
 
 		const val6 = BigNum.from('0', 5);
 		expect(val6.toRounded(3).print()).to.equal('0.00000');
+	});
+
+	it('test numberToSafeBN', async () => {
+		expect(
+			numberToSafeBN(32445073.479281776, BASE_PRECISION).toString()
+		).to.equal(new BN('32445073000000000').toString());
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-loss-of-precision
+			numberToSafeBN(9999999999111111111, BASE_PRECISION).toString()
+		).to.equal(new BN('9999999999111110000000000000').toString());
+		expect(numberToSafeBN(123, BASE_PRECISION).toString()).to.equal(
+			new BN('123000000000').toString()
+		);
 	});
 });

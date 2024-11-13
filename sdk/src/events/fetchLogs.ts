@@ -8,6 +8,8 @@ import {
 	VersionedTransactionResponse,
 } from '@solana/web3.js';
 import { WrappedEvents } from './types';
+import { promiseTimeout } from '../util/promiseTimeout';
+import { parseLogs } from './parse';
 
 type Log = { txSig: TransactionSignature; slot: number; logs: string[] };
 type FetchLogsResponse = {
@@ -35,7 +37,8 @@ export async function fetchLogs(
 	finality: Finality,
 	beforeTx?: TransactionSignature,
 	untilTx?: TransactionSignature,
-	limit?: number
+	limit?: number,
+	batchSize = 25
 ): Promise<FetchLogsResponse> {
 	const signatures = await connection.getSignaturesForAddress(
 		address,
@@ -59,25 +62,16 @@ export async function fetchLogs(
 		return undefined;
 	}
 
-	const chunkedSignatures = chunk(filteredSignatures, 100);
-
-	const config = { commitment: finality, maxSupportedTransactionVersion: 0 };
+	const chunkedSignatures = chunk(filteredSignatures, batchSize);
 
 	const transactionLogs = (
 		await Promise.all(
 			chunkedSignatures.map(async (chunk) => {
-				const transactions = await connection.getTransactions(
+				return await fetchTransactionLogs(
+					connection,
 					chunk.map((confirmedSignature) => confirmedSignature.signature),
-					//@ts-ignore
-					config
+					finality
 				);
-
-				return transactions.reduce((logs, transaction) => {
-					if (transaction) {
-						logs.push(mapTransactionResponseToLog(transaction));
-					}
-					return logs;
-				}, new Array<Log>());
 			})
 		)
 	).flat();
@@ -93,6 +87,44 @@ export async function fetchLogs(
 		mostRecentSlot: mostRecent.slot,
 		mostRecentBlockTime: mostRecent.blockTime,
 	};
+}
+
+export async function fetchTransactionLogs(
+	connection: Connection,
+	signatures: TransactionSignature[],
+	finality: Finality
+): Promise<Log[]> {
+	const requests = new Array<{ methodName: string; args: any }>();
+	for (const signature of signatures) {
+		const args = [
+			signature,
+			{ commitment: finality, maxSupportedTransactionVersion: 0 },
+		];
+
+		requests.push({
+			methodName: 'getTransaction',
+			args,
+		});
+	}
+
+	const rpcResponses: any | null = await promiseTimeout(
+		// @ts-ignore
+		connection._rpcBatchRequest(requests),
+		10 * 1000 // 10 second timeout
+	);
+
+	if (rpcResponses === null) {
+		return Promise.reject('RPC request timed out fetching transactions');
+	}
+
+	const logs = new Array<Log>();
+	for (const rpcResponse of rpcResponses) {
+		if (rpcResponse.result) {
+			logs.push(mapTransactionResponseToLog(rpcResponse.result));
+		}
+	}
+
+	return logs;
 }
 
 function chunk<T>(array: readonly T[], size: number): T[][] {
@@ -119,16 +151,18 @@ export class LogParser {
 
 	public parseEventsFromLogs(event: Log): WrappedEvents {
 		const records: WrappedEvents = [];
-		// @ts-ignore
-		const eventGenerator = this.program._events._eventParser.parseLogs(
-			event.logs,
-			false
-		);
-		for (const eventLog of eventGenerator) {
+
+		if (!event.logs) return records;
+
+		let runningEventIndex = 0;
+		for (const eventLog of parseLogs(this.program, event.logs)) {
 			eventLog.data.txSig = event.txSig;
 			eventLog.data.slot = event.slot;
 			eventLog.data.eventType = eventLog.name;
+			eventLog.data.txSigIndex = runningEventIndex;
+			// @ts-ignore
 			records.push(eventLog.data);
+			runningEventIndex++;
 		}
 		return records;
 	}

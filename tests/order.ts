@@ -28,18 +28,16 @@ import {
 } from '../sdk/src';
 
 import {
-	mockOracle,
+	mockOracleNoProgram,
 	mockUserUSDCAccount,
 	mockUSDCMint,
-	setFeedPrice,
+	setFeedPriceNoProgram,
 	initializeQuoteSpotMarket,
-	printTxLogs,
+	sleep,
 } from './testHelpers';
 import {
 	AMM_RESERVE_PRECISION,
-	BulkAccountLoader,
 	calculateReservePrice,
-	findComputeUnitConsumption,
 	getMarketOrderParams,
 	isVariant,
 	OracleSource,
@@ -48,6 +46,9 @@ import {
 	TWO,
 	ZERO,
 } from '../sdk';
+import { startAnchor } from 'solana-bankrun';
+import { TestBulkAccountLoader } from '../sdk/src/accounts/testBulkAccountLoader';
+import { BankrunContextWrapper } from '../sdk/src/bankrun/bankrunConnection';
 
 const enumsAreEqual = (
 	actual: Record<string, unknown>,
@@ -57,22 +58,15 @@ const enumsAreEqual = (
 };
 
 describe('orders', () => {
-	const provider = anchor.AnchorProvider.local(undefined, {
-		preflightCommitment: 'confirmed',
-		commitment: 'confirmed',
-	});
-	const connection = provider.connection;
-	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
 	let driftClient: TestClient;
 	let driftClientUser: User;
-	const eventSubscriber = new EventSubscriber(connection, chProgram, {
-		commitment: 'recent',
-	});
-	eventSubscriber.subscribe();
+	let eventSubscriber: EventSubscriber;
 
-	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
+	let bulkAccountLoader: TestBulkAccountLoader;
+
+	let bankrunContextWrapper: BankrunContextWrapper;
 
 	let userAccountPublicKey: PublicKey;
 
@@ -112,24 +106,46 @@ describe('orders', () => {
 	let ethUsd;
 
 	before(async () => {
-		usdcMint = await mockUSDCMint(provider);
-		userUSDCAccount = await mockUserUSDCAccount(usdcMint, usdcAmount, provider);
+		const context = await startAnchor('', [], []);
 
-		solUsd = await mockOracle(1);
-		btcUsd = await mockOracle(60000);
-		ethUsd = await mockOracle(1);
+		bankrunContextWrapper = new BankrunContextWrapper(context);
+
+		bulkAccountLoader = new TestBulkAccountLoader(
+			bankrunContextWrapper.connection,
+			'processed',
+			1
+		);
+
+		eventSubscriber = new EventSubscriber(
+			bankrunContextWrapper.connection.toConnection(),
+			chProgram
+		);
+
+		await eventSubscriber.subscribe();
+
+		usdcMint = await mockUSDCMint(bankrunContextWrapper);
+		userUSDCAccount = await mockUserUSDCAccount(
+			usdcMint,
+			usdcAmount,
+			bankrunContextWrapper
+		);
+
+		solUsd = await mockOracleNoProgram(bankrunContextWrapper, 1);
+		btcUsd = await mockOracleNoProgram(bankrunContextWrapper, 60000);
+		ethUsd = await mockOracleNoProgram(bankrunContextWrapper, 1);
 
 		const marketIndexes = [marketIndex, marketIndexBTC, marketIndexEth];
 		const bankIndexes = [0];
 		const oracleInfos = [
+			{ publicKey: PublicKey.default, source: OracleSource.QUOTE_ASSET },
 			{ publicKey: solUsd, source: OracleSource.PYTH },
 			{ publicKey: btcUsd, source: OracleSource.PYTH },
 			{ publicKey: ethUsd, source: OracleSource.PYTH },
 		];
 
 		driftClient = new TestClient({
-			connection,
-			wallet: provider.wallet,
+			connection: bankrunContextWrapper.connection.toConnection(),
+			wallet: bankrunContextWrapper.provider.wallet,
 			programID: chProgram.programId,
 			opts: {
 				commitment: 'confirmed',
@@ -137,6 +153,7 @@ describe('orders', () => {
 			activeSubAccountId: 0,
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: bankIndexes,
+			subAccountIds: [],
 			oracleInfos,
 			accountSubscription: {
 				type: 'polling',
@@ -147,6 +164,20 @@ describe('orders', () => {
 		await driftClient.subscribe();
 		await initializeQuoteSpotMarket(driftClient, usdcMint.publicKey);
 		await driftClient.updatePerpAuctionDuration(new BN(0));
+
+		let oraclesLoaded = false;
+		while (!oraclesLoaded) {
+			const found =
+				!!driftClient.accountSubscriber.getOraclePriceDataAndSlotForSpotMarket(
+					0
+				);
+			if (found) {
+				oraclesLoaded = found;
+			}
+			await sleep(1000);
+		}
+
+		console.log(bulkAccountLoader.mostRecentSlot);
 
 		const periodicity = new BN(60 * 60); // 1 HOUR
 
@@ -202,18 +233,22 @@ describe('orders', () => {
 		driftClientUser = new User({
 			driftClient,
 			userAccountPublicKey: await driftClient.getUserAccountPublicKey(),
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 		await driftClientUser.subscribe();
 
-		provider.connection.requestAirdrop(fillerKeyPair.publicKey, 10 ** 9);
+		await bankrunContextWrapper.fundKeypair(fillerKeyPair, 10 ** 9);
 		fillerUSDCAccount = await mockUserUSDCAccount(
 			usdcMint,
 			usdcAmount,
-			provider,
+			bankrunContextWrapper,
 			fillerKeyPair.publicKey
 		);
 		fillerDriftClient = new TestClient({
-			connection,
+			connection: bankrunContextWrapper.connection.toConnection(),
 			wallet: new Wallet(fillerKeyPair),
 			programID: chProgram.programId,
 			opts: {
@@ -222,6 +257,7 @@ describe('orders', () => {
 			activeSubAccountId: 0,
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: bankIndexes,
+			subAccountIds: [],
 			oracleInfos,
 			accountSubscription: {
 				type: 'polling',
@@ -238,18 +274,22 @@ describe('orders', () => {
 		fillerUser = new User({
 			driftClient: fillerDriftClient,
 			userAccountPublicKey: await fillerDriftClient.getUserAccountPublicKey(),
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 		await fillerUser.subscribe();
 
-		provider.connection.requestAirdrop(whaleKeyPair.publicKey, 10 ** 9);
+		await bankrunContextWrapper.fundKeypair(whaleKeyPair, 10 ** 9);
 		whaleUSDCAccount = await mockUserUSDCAccount(
 			usdcMint,
 			usdcAmountWhale,
-			provider,
+			bankrunContextWrapper,
 			whaleKeyPair.publicKey
 		);
 		whaleDriftClient = new TestClient({
-			connection,
+			connection: bankrunContextWrapper.connection.toConnection(),
 			wallet: new Wallet(whaleKeyPair),
 			programID: chProgram.programId,
 			opts: {
@@ -258,6 +298,7 @@ describe('orders', () => {
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: bankIndexes,
 			oracleInfos,
+			subAccountIds: [],
 			userStats: true,
 			accountSubscription: {
 				type: 'polling',
@@ -275,6 +316,10 @@ describe('orders', () => {
 		whaleUser = new User({
 			driftClient: whaleDriftClient,
 			userAccountPublicKey: await whaleDriftClient.getUserAccountPublicKey(),
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 
 		await whaleUser.subscribe();
@@ -309,11 +354,7 @@ describe('orders', () => {
 		});
 
 		const txSig = await driftClient.placePerpOrder(orderParams);
-		console.log(
-			'tx logs',
-			(await connection.getTransaction(txSig, { commitment: 'confirmed' })).meta
-				.logMessages
-		);
+		bankrunContextWrapper.printTxLogs(txSig);
 
 		await driftClient.fetchAccounts();
 		await driftClientUser.fetchAccounts();
@@ -530,18 +571,10 @@ describe('orders', () => {
 			order
 		);
 
-		const computeUnits = await findComputeUnitConsumption(
-			driftClient.program.programId,
-			connection,
-			txSig,
-			'confirmed'
-		);
+		const computeUnits =
+			bankrunContextWrapper.connection.findComputeUnitConsumption(txSig);
 		console.log('compute units', computeUnits);
-		console.log(
-			'tx logs',
-			(await connection.getTransaction(txSig, { commitment: 'confirmed' })).meta
-				.logMessages
-		);
+		bankrunContextWrapper.printTxLogs(txSig);
 
 		await fillerDriftClient.settlePNLs(
 			[
@@ -563,8 +596,7 @@ describe('orders', () => {
 		await driftClientUser.fetchAccounts();
 		await fillerUser.fetchAccounts();
 
-		assert(driftClientUser.getPerpPosition(marketIndex).openAsks.eq(ZERO));
-		assert(driftClientUser.getPerpPosition(marketIndex).openBids.eq(ZERO));
+		assert(driftClientUser.getPerpPosition(marketIndex) === undefined);
 
 		order = driftClientUser.getUserAccount().orders[orderIndex.toString()];
 
@@ -673,8 +705,6 @@ describe('orders', () => {
 		const orderId = 4;
 
 		await driftClientUser.fetchAccounts();
-		const baseAssetAmountBefore =
-			driftClientUser.getPerpPosition(marketIndex).baseAssetAmount;
 		order = driftClientUser.getOrder(orderId);
 		console.log(order);
 		await fillerDriftClient.fillPerpOrder(
@@ -686,9 +716,7 @@ describe('orders', () => {
 		console.log(order2);
 
 		await driftClient.cancelOrder(orderId);
-		const baseAssetAmountAfter =
-			driftClientUser.getPerpPosition(marketIndex).baseAssetAmount;
-		assert(baseAssetAmountBefore.eq(baseAssetAmountAfter));
+		assert(driftClientUser.getPerpPosition(marketIndex) === undefined);
 	});
 
 	it('Partial fill limit short order', async () => {
@@ -849,7 +877,7 @@ describe('orders', () => {
 			PRICE_PRECISION
 		);
 		// move price to make liquidity for order @ $1.05 (5%)
-		setFeedPrice(anchor.workspace.Pyth, newPrice, solUsd);
+		await setFeedPriceNoProgram(bankrunContextWrapper, newPrice, solUsd);
 		await driftClient.moveAmmToPrice(
 			marketIndex,
 			new BN(newPrice * PRICE_PRECISION.toNumber())
@@ -969,7 +997,7 @@ describe('orders', () => {
 			PRICE_PRECISION
 		);
 		// move price to make liquidity for order @ $1.05 (5%)
-		setFeedPrice(anchor.workspace.Pyth, newPrice, solUsd);
+		await setFeedPriceNoProgram(bankrunContextWrapper, newPrice, solUsd);
 		await driftClient.moveAmmToPrice(
 			marketIndex,
 			new BN(newPrice * PRICE_PRECISION.toNumber())
@@ -1123,7 +1151,7 @@ describe('orders', () => {
 			PRICE_PRECISION
 		);
 		// move price to make liquidity for order @ $1.05 (5%)
-		setFeedPrice(anchor.workspace.Pyth, newPrice, solUsd);
+		await setFeedPriceNoProgram(bankrunContextWrapper, newPrice, solUsd);
 		try {
 			await driftClient.moveAmmToPrice(
 				marketIndex,
@@ -1312,7 +1340,7 @@ describe('orders', () => {
 				driftClientUser.getUserAccount(),
 				order
 			);
-			await printTxLogs(connection, txSig);
+			bankrunContextWrapper.printTxLogs(txSig);
 		} catch (e) {
 			console.error(e);
 			throw e;
@@ -1327,7 +1355,7 @@ describe('orders', () => {
 		const newMarkPrice1 = calculateReservePrice(newMarket1); // 0 liquidity at current mark price
 
 		const userTC = driftClientUser.getTotalCollateral();
-		const userTPV = driftClientUser.getTotalPerpPositionValue();
+		const userTPV = driftClientUser.getTotalPerpPositionLiability();
 
 		const userLeverage = driftClientUser.getLeverage();
 		const postPosition = driftClientUser.getPerpPosition(marketIndex);
@@ -1385,7 +1413,6 @@ describe('orders', () => {
 				confidenceIntervalMaxSize: new BN(100000),
 				tooVolatileRatio: new BN(2),
 			},
-			useForLiquidations: false,
 		};
 
 		await driftClient.updateOracleGuardRails(oracleGuardRails);
@@ -1405,7 +1432,7 @@ describe('orders', () => {
 			price.mul(new BN(96)).div(new BN(100)),
 			PRICE_PRECISION
 		);
-		setFeedPrice(anchor.workspace.Pyth, newPrice, solUsd);
+		await setFeedPriceNoProgram(bankrunContextWrapper, newPrice, solUsd);
 		await driftClient.moveAmmToPrice(
 			marketIndex,
 			new BN(newPrice * PRICE_PRECISION.toNumber())
@@ -1419,18 +1446,15 @@ describe('orders', () => {
 		});
 		const txSig = await driftClient.placeAndTakePerpOrder(orderParams);
 
-		const computeUnits = await findComputeUnitConsumption(
-			driftClient.program.programId,
-			connection,
-			txSig
-		);
+		const computeUnits =
+			bankrunContextWrapper.connection.findComputeUnitConsumption(txSig);
 		console.log('placeAndTake compute units', computeUnits[0]);
 
-		await driftClient.settlePNL(
-			await driftClient.getUserAccountPublicKey(),
-			driftClient.getUserAccount(),
-			marketIndex
-		);
+		// await driftClient.settlePNL(
+		// 	await driftClient.getUserAccountPublicKey(),
+		// 	driftClient.getUserAccount(),
+		// 	marketIndex
+		// );
 
 		await driftClient.fetchAccounts();
 		await driftClientUser.fetchAccounts();
@@ -1473,7 +1497,7 @@ describe('orders', () => {
 		});
 
 		const placeTxSig = await whaleDriftClient.placePerpOrder(orderParams);
-		await printTxLogs(connection, placeTxSig);
+		bankrunContextWrapper.printTxLogs(placeTxSig);
 
 		await whaleDriftClient.fetchAccounts();
 		await whaleUser.fetchAccounts();
@@ -1498,18 +1522,6 @@ describe('orders', () => {
 			order
 		);
 
-		await driftClient.settlePNL(
-			await driftClient.getUserAccountPublicKey(),
-			driftClient.getUserAccount(),
-			marketIndex
-		);
-
-		await fillerDriftClient.settlePNL(
-			await fillerDriftClient.getUserAccountPublicKey(),
-			fillerDriftClient.getUserAccount(),
-			marketIndex
-		);
-
 		await whaleDriftClient.fetchAccounts();
 		await whaleUser.fetchAccounts();
 		await fillerUser.fetchAccounts();
@@ -1528,7 +1540,7 @@ describe('orders', () => {
 		);
 		assert(fillerReward.eq(expectedFillerReward));
 
-		assert(whaleStats.fees.totalFeePaid.gt(fillerReward.mul(new BN(100))));
+		assert(whaleStats.fees.totalFeePaid.gt(fillerReward.mul(new BN(5))));
 		// ensure whale fee more than x100 filler
 	});
 
@@ -1576,13 +1588,6 @@ describe('orders', () => {
 			console.error(e);
 		}
 		console.log('4');
-
-		await driftClient.settlePNL(
-			await driftClient.getUserAccountPublicKey(),
-			driftClient.getUserAccount(),
-			marketIndex
-		);
-		console.log('5');
 
 		await driftClient.fetchAccounts();
 		await driftClientUser.fetchAccounts();

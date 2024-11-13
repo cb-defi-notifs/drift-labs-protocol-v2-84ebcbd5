@@ -24,13 +24,15 @@ use crate::math::repeg;
 use crate::math::safe_math::SafeMath;
 use crate::math::spot_balance::get_token_amount;
 
-use crate::state::oracle::OraclePriceData;
+use crate::state::oracle::{OraclePriceData, OracleSource};
 use crate::state::oracle_map::OracleMap;
 use crate::state::perp_market::{MarketStatus, PerpMarket};
 use crate::state::perp_market_map::PerpMarketMap;
+use crate::state::spot_market::SpotBalance;
 use crate::state::spot_market::SpotBalanceType;
 use crate::state::spot_market_map::SpotMarketMap;
 use crate::state::state::{OracleGuardRails, State};
+use crate::state::user::MarketType;
 use crate::validate;
 
 #[cfg(test)]
@@ -151,9 +153,14 @@ pub fn _update_amm(
     }
 
     let oracle_validity = oracle::oracle_validity(
+        MarketType::Perp,
+        market.market_index,
         market.amm.historical_oracle_data.last_oracle_price_twap,
         oracle_price_data,
         &state.oracle_guard_rails.validity,
+        market.get_max_confidence_interval_multiplier()?,
+        &market.amm.oracle_source,
+        true,
     )?;
 
     let mut amm_update_cost = 0;
@@ -166,8 +173,12 @@ pub fn _update_amm(
             let (optimal_peg, fee_budget, check_lower_bound) =
                 repeg::calculate_optimal_peg_and_budget(market, oracle_price_data)?;
 
-            let (repegged_market, repegged_cost) =
-                repeg::adjust_amm(market, optimal_peg, fee_budget, true)?;
+            let (repegged_market, repegged_cost) = repeg::adjust_amm(
+                market,
+                optimal_peg,
+                fee_budget,
+                curve_update_intensity >= 100,
+            )?;
 
             let cost_applied = apply_cost_to_market(market, repegged_cost, check_lower_bound)?;
             if cost_applied {
@@ -211,7 +222,7 @@ pub fn _update_amm(
         market.amm.last_oracle_valid = false;
     }
 
-    update_spreads(&mut market.amm, reserve_price_after)?;
+    update_spreads(market, reserve_price_after)?;
 
     Ok(amm_update_cost)
 }
@@ -230,9 +241,14 @@ pub fn update_amm_and_check_validity(
     let risk_ema_price = market.amm.historical_oracle_data.last_oracle_price_twap;
 
     let oracle_validity = oracle_validity(
+        MarketType::Perp,
+        market.market_index,
         risk_ema_price,
         oracle_price_data,
         &state.oracle_guard_rails.validity,
+        market.get_max_confidence_interval_multiplier()?,
+        &market.amm.oracle_source,
+        false,
     )?;
 
     validate!(
@@ -263,7 +279,6 @@ pub fn apply_cost_to_market(
             .safe_add(market.amm.total_liquidation_fee)?
             .safe_sub(market.amm.total_fee_withdrawn)?
             .cast::<i128>()?;
-
         // Only a portion of the protocol fees are allocated to repegging
         // This checks that the total_fee_minus_distributions does not decrease too much after repeg
         if check_lower_bound {
@@ -389,19 +404,20 @@ pub fn settle_expired_market(
         }
     }
 
-    let pnl_pool_amount = get_token_amount(
-        market.pnl_pool.scaled_balance,
-        spot_market,
-        &SpotBalanceType::Deposit,
-    )?;
-
     validate!(
         10_u128.pow(spot_market.decimals) == QUOTE_PRECISION,
         ErrorCode::UnsupportedSpotMarket,
         "Only support bank.decimals == QUOTE_PRECISION"
     )?;
 
-    let target_expiry_price = market.amm.historical_oracle_data.last_oracle_price_twap;
+    let target_expiry_price = if market.amm.oracle_source == OracleSource::Prelaunch {
+        market.amm.historical_oracle_data.last_oracle_price
+    } else {
+        market.amm.historical_oracle_data.last_oracle_price_twap
+    };
+
+    crate::dlog!(target_expiry_price);
+
     validate!(
         target_expiry_price > 0,
         ErrorCode::MarketSettlementTargetPriceInvalid,
@@ -409,11 +425,32 @@ pub fn settle_expired_market(
         target_expiry_price
     )?;
 
+    let pnl_pool_token_amount = get_token_amount(
+        market.pnl_pool.scaled_balance,
+        spot_market,
+        market.pnl_pool.balance_type(),
+    )?;
+
+    let fee_pool_token_amount = get_token_amount(
+        market.amm.fee_pool.scaled_balance,
+        spot_market,
+        market.amm.fee_pool.balance_type(),
+    )?;
+
+    let total_excess_balance: i128 = pnl_pool_token_amount
+        .safe_add(fee_pool_token_amount)?
+        .cast()?;
+
+    crate::dlog!(market.market_index);
+    crate::dlog!(total_excess_balance);
+
     let expiry_price =
-        amm::calculate_expiry_price(&market.amm, target_expiry_price, pnl_pool_amount)?;
+        amm::calculate_expiry_price(&market.amm, target_expiry_price, total_excess_balance)?;
 
     market.expiry_price = expiry_price;
     market.status = MarketStatus::Settlement;
+
+    crate::dlog!(market.expiry_price);
 
     Ok(())
 }

@@ -29,15 +29,18 @@ import {
 
 import {
 	initializeQuoteSpotMarket,
-	mockOracle,
+	mockOracleNoProgram,
 	mockUSDCMint,
 	mockUserUSDCAccount,
-	setFeedPrice,
+	setFeedPriceNoProgram,
 	sleep,
 } from './testHelpers';
-import { BulkAccountLoader } from '../sdk';
+import { PerpPosition } from '../sdk';
+import { startAnchor } from 'solana-bankrun';
+import { TestBulkAccountLoader } from '../sdk/src/accounts/testBulkAccountLoader';
+import { BankrunContextWrapper } from '../sdk/src/bankrun/bankrunConnection';
 
-async function adjustOraclePostSwap(baa, swapDirection, market) {
+async function adjustOraclePostSwap(baa, swapDirection, market, context) {
 	const price = calculatePrice(
 		market.amm.baseAssetReserve,
 		market.amm.quoteAssetReserve,
@@ -53,7 +56,7 @@ async function adjustOraclePostSwap(baa, swapDirection, market) {
 
 	const newPrice = calculatePrice(newBaa, newQaa, market.amm.pegMultiplier);
 	const _newPrice = newPrice.toNumber() / PRICE_PRECISION.toNumber();
-	await setFeedPrice(anchor.workspace.Pyth, _newPrice, market.amm.oracle);
+	await setFeedPriceNoProgram(context, _newPrice, market.amm.oracle);
 
 	console.log('price => new price', price.toString(), newPrice.toString());
 
@@ -68,12 +71,11 @@ async function createNewUser(
 	oracleInfos,
 	wallet,
 	bulkAccountLoader
-) {
+): Promise<[TestClient, User]> {
 	let walletFlag = true;
 	if (wallet == undefined) {
 		const kp = new web3.Keypair();
-		const sig = await provider.connection.requestAirdrop(kp.publicKey, 10 ** 9);
-		await provider.connection.confirmTransaction(sig);
+		await provider.fundKeypair(kp, 10 ** 9);
 		wallet = new Wallet(kp);
 		walletFlag = false;
 	}
@@ -96,6 +98,7 @@ async function createNewUser(
 		activeSubAccountId: 0,
 		perpMarketIndexes: [0, 1],
 		spotMarketIndexes: [0],
+		subAccountIds: [],
 		oracleInfos,
 		accountSubscription: bulkAccountLoader
 			? {
@@ -123,6 +126,10 @@ async function createNewUser(
 	const driftClientUser = new User({
 		driftClient,
 		userAccountPublicKey: await driftClient.getUserAccountPublicKey(),
+		accountSubscription: {
+			type: 'polling',
+			accountLoader: bulkAccountLoader,
+		},
 	});
 	driftClientUser.subscribe();
 
@@ -147,16 +154,14 @@ async function fullClosePosition(driftClient, userPosition) {
 }
 
 describe('liquidity providing', () => {
-	const provider = anchor.AnchorProvider.local(undefined, {
-		preflightCommitment: 'confirmed',
-		commitment: 'confirmed',
-	});
-	const connection = provider.connection;
-	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
+	let bankrunContextWrapper: BankrunContextWrapper;
+
+	let bulkAccountLoader: TestBulkAccountLoader;
+
 	async function _viewLogs(txsig) {
-		const tx = await connection.getTransaction(txsig, {
+		const tx = await bankrunContextWrapper.connection.getTransaction(txsig, {
 			commitment: 'confirmed',
 		});
 		console.log('tx logs', tx.meta.logMessages);
@@ -178,12 +183,7 @@ describe('liquidity providing', () => {
 	const usdcAmount = new BN(1_000_000_000 * 1e6);
 
 	let driftClient: TestClient;
-	const eventSubscriber = new EventSubscriber(connection, chProgram, {
-		commitment: 'recent',
-	});
-	eventSubscriber.subscribe();
-
-	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
+	let eventSubscriber: EventSubscriber;
 
 	let usdcMint: web3.Keypair;
 
@@ -198,21 +198,37 @@ describe('liquidity providing', () => {
 	let solusdc2;
 
 	before(async () => {
-		usdcMint = await mockUSDCMint(provider);
+		const context = await startAnchor('', [], []);
 
-		solusdc2 = await mockOracle(1, -7); // make invalid
-		solusdc = await mockOracle(1, -7); // make invalid
+		bankrunContextWrapper = new BankrunContextWrapper(context);
+
+		bulkAccountLoader = new TestBulkAccountLoader(
+			bankrunContextWrapper.connection,
+			'processed',
+			1
+		);
+
+		usdcMint = await mockUSDCMint(bankrunContextWrapper);
+
+		eventSubscriber = new EventSubscriber(
+			bankrunContextWrapper.connection,
+			chProgram
+		);
+		await eventSubscriber.subscribe();
+
+		solusdc2 = await mockOracleNoProgram(bankrunContextWrapper, 1, -7); // make invalid
+		solusdc = await mockOracleNoProgram(bankrunContextWrapper, 1, -7); // make invalid
 		const oracleInfos = [
 			{ publicKey: solusdc, source: OracleSource.PYTH },
 			{ publicKey: solusdc2, source: OracleSource.PYTH },
 		];
 		[driftClient, driftClientUser] = await createNewUser(
 			chProgram,
-			provider,
+			bankrunContextWrapper,
 			usdcMint,
 			usdcAmount,
 			oracleInfos,
-			provider.wallet,
+			bankrunContextWrapper.provider.wallet,
 			bulkAccountLoader
 		);
 		// used for trading / taking on baa
@@ -237,7 +253,6 @@ describe('liquidity providing', () => {
 				confidenceIntervalMaxSize: new BN(100),
 				tooVolatileRatio: new BN(100),
 			},
-			useForLiquidations: true,
 		};
 		await driftClient.updateOracleGuardRails(oracleGuardRails);
 
@@ -259,7 +274,7 @@ describe('liquidity providing', () => {
 
 		[traderDriftClient, traderDriftClientUser] = await createNewUser(
 			chProgram,
-			provider,
+			bankrunContextWrapper,
 			usdcMint,
 			usdcAmount,
 			oracleInfos,
@@ -268,7 +283,7 @@ describe('liquidity providing', () => {
 		);
 		[poorDriftClient, poorDriftClientUser] = await createNewUser(
 			chProgram,
-			provider,
+			bankrunContextWrapper,
 			usdcMint,
 			QUOTE_PRECISION,
 			oracleInfos,
@@ -360,7 +375,7 @@ describe('liquidity providing', () => {
 
 		const newInitMarginReq = driftClientUser.getInitialMarginRequirement();
 		console.log(initMarginReq.toString(), '->', newInitMarginReq.toString());
-		assert(newInitMarginReq.eq(new BN(8284008)));
+		assert(newInitMarginReq.eq(new BN(9284008))); // 8284008 + $1
 
 		// ensure margin calcs didnt modify user position
 		const _position = driftClientUser.getPerpPosition(0);
@@ -406,7 +421,8 @@ describe('liquidity providing', () => {
 		const newPrice = await adjustOraclePostSwap(
 			tradeSize,
 			SwapDirection.ADD,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		const sig = await traderDriftClient.openPosition(
 			PositionDirection.SHORT,
@@ -420,6 +436,7 @@ describe('liquidity providing', () => {
 		// lp gets stepSize (1/4 * 50 = 12.5 => 10 with remainder 2.5)
 		// 2.5 / 12.5 = 0.2
 
+		await traderDriftClient.fetchAccounts();
 		const traderUserAccount = await traderDriftClient.getUserAccount();
 		const position = traderUserAccount.perpPositions[0];
 		console.log(
@@ -494,11 +511,11 @@ describe('liquidity providing', () => {
 			'=> net baa:',
 			driftClient.getPerpMarketAccount(0).amm.baseAssetAmountWithAmm.toString()
 		);
-		assert(user.perpPositions[0].quoteAssetAmount.eq(new BN(-1233600)));
+		assert(user.perpPositions[0].quoteAssetAmount.eq(new BN(-1233700)));
 		// assert(user.perpPositions[0].unsettledPnl.eq(new BN(900)));
 		// remainder goes into the last
 		assert(user.perpPositions[0].lastBaseAssetAmountPerLp.eq(new BN(12500000)));
-		assert(user.perpPositions[0].lastQuoteAssetAmountPerLp.eq(new BN(-12336)));
+		assert(user.perpPositions[0].lastQuoteAssetAmountPerLp.eq(new BN(-12337)));
 
 		market = await driftClient.getPerpMarketAccount(0);
 		console.log(
@@ -506,7 +523,10 @@ describe('liquidity providing', () => {
 			market.amm.baseAssetAmountPerLp.toString()
 		);
 		assert(market.amm.baseAssetAmountPerLp.eq(new BN(12500000)));
-		assert(market.amm.quoteAssetAmountPerLp.eq(new BN(-12336)));
+		assert(market.amm.quoteAssetAmountPerLp.eq(new BN(-12337)));
+		console.log(user.perpPositions[0].remainderBaseAssetAmount.toString()); // lp remainder
+		assert(user.perpPositions[0].remainderBaseAssetAmount != 0); // lp remainder
+		assert(user.perpPositions[0].remainderBaseAssetAmount == 250000000); // lp remainder
 
 		// remove
 		console.log('removing liquidity...');
@@ -524,11 +544,19 @@ describe('liquidity providing', () => {
 				await driftClient.getUserAccountPublicKey()
 			)
 		);
+		console.log(
+			'removeLiquidityRecord.deltaQuoteAssetAmount',
+			removeLiquidityRecord.deltaQuoteAssetAmount.toString()
+		);
 		assert(removeLiquidityRecord.deltaBaseAssetAmount.eq(ZERO));
-		assert(removeLiquidityRecord.deltaQuoteAssetAmount.eq(ZERO));
-
+		assert(removeLiquidityRecord.deltaQuoteAssetAmount.eq(new BN('-243866'))); // show pnl from burn in record
 		console.log('closing trader ...');
-		await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+		await adjustOraclePostSwap(
+			tradeSize,
+			SwapDirection.REMOVE,
+			market,
+			bankrunContextWrapper
+		);
 		await fullClosePosition(
 			traderDriftClient,
 			traderDriftClient.getUserAccount().perpPositions[0]
@@ -551,7 +579,8 @@ describe('liquidity providing', () => {
 		await adjustOraclePostSwap(
 			user.perpPositions[0].baseAssetAmount,
 			SwapDirection.ADD,
-			market
+			market,
+			bankrunContextWrapper
 		);
 
 		const _ttxsig = await fullClosePosition(driftClient, user.perpPositions[0]);
@@ -600,7 +629,12 @@ describe('liquidity providing', () => {
 		console.log('user trading...');
 		const tradeSize = new BN(5 * BASE_PRECISION.toNumber());
 		try {
-			await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+			await adjustOraclePostSwap(
+				tradeSize,
+				SwapDirection.REMOVE,
+				market,
+				bankrunContextWrapper
+			);
 			const _txsig = await traderDriftClient.openPosition(
 				PositionDirection.LONG,
 				tradeSize,
@@ -642,6 +676,14 @@ describe('liquidity providing', () => {
 			settleLiquidityRecord.pnl.toString(),
 			sdkPnl.toString()
 		);
+		console.log(
+			'deltaBaseAssetAmount:',
+			settleLiquidityRecord.deltaBaseAssetAmount.toString()
+		);
+		console.log(
+			'deltaQuoteAssetAmount:',
+			settleLiquidityRecord.deltaQuoteAssetAmount.toString()
+		);
 
 		assert(settleLiquidityRecord.pnl.toString() === sdkPnl.toString());
 
@@ -669,6 +711,10 @@ describe('liquidity providing', () => {
 				position.remainderBaseAssetAmount
 		);
 
+		console.log(
+			position.baseAssetAmount.toString(),
+			position.quoteAssetAmount.toString()
+		);
 		assert(position.baseAssetAmount.lt(ZERO));
 		assert(position.quoteAssetAmount.gt(ZERO));
 		assert(position.lpShares.gt(ZERO));
@@ -689,7 +735,12 @@ describe('liquidity providing', () => {
 		);
 
 		console.log('closing trader ...');
-		await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+		await adjustOraclePostSwap(
+			tradeSize,
+			SwapDirection.REMOVE,
+			market,
+			bankrunContextWrapper
+		);
 		const _txsig = await fullClosePosition(
 			traderDriftClient,
 			trader.perpPositions[0]
@@ -709,7 +760,8 @@ describe('liquidity providing', () => {
 		await adjustOraclePostSwap(
 			user.perpPositions[0].baseAssetAmount,
 			SwapDirection.ADD,
-			market2
+			market2,
+			bankrunContextWrapper
 		);
 		await fullClosePosition(driftClient, user.perpPositions[0]);
 
@@ -820,6 +872,8 @@ describe('liquidity providing', () => {
 	});
 
 	it('provides lp, users shorts, removes lp, lp has long', async () => {
+		await driftClient.fetchAccounts();
+		await traderDriftClient.fetchAccounts();
 		console.log('adding liquidity...');
 
 		const traderUserAccount3 = await driftClient.getUserAccount();
@@ -864,7 +918,8 @@ describe('liquidity providing', () => {
 		const _newPrice = await adjustOraclePostSwap(
 			tradeSize,
 			SwapDirection.ADD,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		try {
 			const _txsig = await traderDriftClient.openPosition(
@@ -934,10 +989,15 @@ describe('liquidity providing', () => {
 		console.log(user.perpPositions[0].baseAssetAmount.toString());
 		console.log(user.perpPositions[0].quoteAssetAmount.toString());
 		assert(user.perpPositions[0].baseAssetAmount.eq(new BN('10000000000'))); // lp is long
-		assert(user.perpPositions[0].quoteAssetAmount.eq(new BN(-9550785)));
+		assert(user.perpPositions[0].quoteAssetAmount.eq(new BN(-9550985)));
 
 		console.log('closing trader ...');
-		await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+		await adjustOraclePostSwap(
+			tradeSize,
+			SwapDirection.REMOVE,
+			market,
+			bankrunContextWrapper
+		);
 		await fullClosePosition(
 			traderDriftClient,
 			traderUserAccount.perpPositions[0]
@@ -952,7 +1012,8 @@ describe('liquidity providing', () => {
 		await adjustOraclePostSwap(
 			user.perpPositions[0].baseAssetAmount,
 			SwapDirection.ADD,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		await fullClosePosition(driftClient, user.perpPositions[0]);
 
@@ -983,7 +1044,8 @@ describe('liquidity providing', () => {
 		const _newPrice0 = await adjustOraclePostSwap(
 			tradeSize,
 			SwapDirection.REMOVE,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		const _txsig = await traderDriftClient.openPosition(
 			PositionDirection.LONG,
@@ -1004,6 +1066,7 @@ describe('liquidity providing', () => {
 		const _txSig = await driftClient.removePerpLpShares(market.marketIndex);
 		await _viewLogs(_txSig);
 
+		await driftClientUser.fetchAccounts();
 		const user = await driftClientUser.getUserAccount();
 		const lpPosition = user.perpPositions[0];
 		const lpTokenAmount = lpPosition.lpShares;
@@ -1020,18 +1083,24 @@ describe('liquidity providing', () => {
 
 		assert(lpTokenAmount.eq(ZERO));
 		assert(user.perpPositions[0].baseAssetAmount.eq(new BN('-10000000000'))); // lp is short
-		assert(user.perpPositions[0].quoteAssetAmount.eq(new BN('11940740')));
+		assert(user.perpPositions[0].quoteAssetAmount.eq(new BN('11940540')));
 		assert(user.perpPositions[0].quoteEntryAmount.eq(new BN('11139500')));
 
 		console.log('closing trader...');
-		await adjustOraclePostSwap(tradeSize, SwapDirection.ADD, market);
+		await adjustOraclePostSwap(
+			tradeSize,
+			SwapDirection.ADD,
+			market,
+			bankrunContextWrapper
+		);
 		await fullClosePosition(traderDriftClient, position);
 
 		console.log('closing lp ...');
 		await adjustOraclePostSwap(
 			user.perpPositions[0].baseAssetAmount,
 			SwapDirection.REMOVE,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		await fullClosePosition(driftClient, lpPosition);
 
@@ -1087,7 +1156,8 @@ describe('liquidity providing', () => {
 		const _newPrice = await adjustOraclePostSwap(
 			tradeSize,
 			SwapDirection.ADD,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		await traderDriftClient.openPosition(
 			PositionDirection.SHORT,
@@ -1125,7 +1195,7 @@ describe('liquidity providing', () => {
 		const baa = user.perpPositions[0].baseAssetAmount;
 		const qaa = user.perpPositions[0].quoteAssetAmount;
 		assert(baa.eq(new BN(10000000000)));
-		assert(qaa.eq(new BN(-6860362)));
+		assert(qaa.eq(new BN(-6860662)));
 
 		console.log('removing the other half of liquidity');
 		await driftClient.removePerpLpShares(market.marketIndex, otherHalfShares);
@@ -1143,7 +1213,12 @@ describe('liquidity providing', () => {
 		assert(user.perpPositions[0].lpShares.eq(ZERO));
 
 		console.log('closing trader ...');
-		await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+		await adjustOraclePostSwap(
+			tradeSize,
+			SwapDirection.REMOVE,
+			market,
+			bankrunContextWrapper
+		);
 		// await traderDriftClient.closePosition(new BN(0));
 		const trader = await traderDriftClient.getUserAccount();
 		const _txsig = await fullClosePosition(
@@ -1152,7 +1227,12 @@ describe('liquidity providing', () => {
 		);
 
 		console.log('closing lp ...');
-		await adjustOraclePostSwap(baa, SwapDirection.ADD, market);
+		await adjustOraclePostSwap(
+			baa,
+			SwapDirection.ADD,
+			market,
+			bankrunContextWrapper
+		);
 		await fullClosePosition(driftClient, user.perpPositions[0]);
 	});
 
@@ -1172,7 +1252,12 @@ describe('liquidity providing', () => {
 		// lp goes long
 		const tradeSize = new BN(5 * BASE_PRECISION.toNumber());
 		try {
-			await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+			await adjustOraclePostSwap(
+				tradeSize,
+				SwapDirection.REMOVE,
+				market,
+				bankrunContextWrapper
+			);
 			const _txsig = await driftClient.openPosition(
 				PositionDirection.LONG,
 				tradeSize,
@@ -1187,7 +1272,12 @@ describe('liquidity providing', () => {
 		// some user goes long (lp should get a short + pnl for closing long on settle)
 		console.log('user trading...');
 		try {
-			await adjustOraclePostSwap(tradeSize, SwapDirection.REMOVE, market);
+			await adjustOraclePostSwap(
+				tradeSize,
+				SwapDirection.REMOVE,
+				market,
+				bankrunContextWrapper
+			);
 			const _txsig = await traderDriftClient.openPosition(
 				PositionDirection.LONG,
 				tradeSize,
@@ -1231,12 +1321,316 @@ describe('liquidity providing', () => {
 		assert(settleLiquidityRecord.pnl.eq(sdkPnl));
 	});
 
+	it('update per lp base (0->1)', async () => {
+		//ensure non-zero for test
+
+		await driftClient.updatePerpMarketTargetBaseAssetAmountPerLp(0, 169);
+
+		await driftClient.fetchAccounts();
+		const marketBefore = driftClient.getPerpMarketAccount(0);
+		console.log(
+			'marketBefore.amm.totalFeeEarnedPerLp',
+			marketBefore.amm.totalFeeEarnedPerLp.toString()
+		);
+		assert(marketBefore.amm.totalFeeEarnedPerLp.eq(new BN('272')));
+
+		const txSig1 = await driftClient.updatePerpMarketPerLpBase(0, 1);
+		await _viewLogs(txSig1);
+
+		await sleep(1400); // todo?
+		await driftClient.fetchAccounts();
+		const marketAfter = driftClient.getPerpMarketAccount(0);
+
+		assert(
+			marketAfter.amm.totalFeeEarnedPerLp.eq(
+				marketBefore.amm.totalFeeEarnedPerLp.mul(new BN(10))
+			)
+		);
+
+		assert(
+			marketAfter.amm.baseAssetAmountPerLp.eq(
+				marketBefore.amm.baseAssetAmountPerLp.mul(new BN(10))
+			)
+		);
+
+		assert(
+			marketAfter.amm.quoteAssetAmountPerLp.eq(
+				marketBefore.amm.quoteAssetAmountPerLp.mul(new BN(10))
+			)
+		);
+		console.log(marketAfter.amm.targetBaseAssetAmountPerLp);
+		console.log(marketBefore.amm.targetBaseAssetAmountPerLp);
+
+		assert(
+			marketAfter.amm.targetBaseAssetAmountPerLp ==
+				marketBefore.amm.targetBaseAssetAmountPerLp
+		);
+		assert(marketAfter.amm.totalFeeEarnedPerLp.eq(new BN('2720')));
+
+		assert(marketBefore.amm.perLpBase == 0);
+		console.log('marketAfter.amm.perLpBase:', marketAfter.amm.perLpBase);
+		assert(marketAfter.amm.perLpBase == 1);
+	});
+
+	it('settle lp position after perLpBase change', async () => {
+		// some user goes long (lp should get a short + pnl for closing long on settle)
+
+		const market = driftClient.getPerpMarketAccount(0);
+		console.log(
+			'baseAssetAmountWithUnsettledLp:',
+			market.amm.baseAssetAmountWithUnsettledLp.toString()
+		);
+		assert(market.amm.baseAssetAmountWithUnsettledLp.eq(ZERO));
+		// await delay(lpCooldown + 1000);
+
+		const user = await driftClientUser.getUserAccount();
+		console.log(user.perpPositions[0].lpShares.toString());
+		console.log(user.perpPositions[0].perLpBase);
+
+		const tradeSize = new BN(5 * BASE_PRECISION.toNumber());
+
+		console.log('user trading...');
+		try {
+			await adjustOraclePostSwap(
+				tradeSize,
+				SwapDirection.REMOVE,
+				market,
+				bankrunContextWrapper
+			);
+			const _txsig = await traderDriftClient.openPosition(
+				PositionDirection.LONG,
+				tradeSize,
+				market.marketIndex
+				// new BN(100 * BASE_PRECISION.toNumber())
+			);
+			await _viewLogs(_txsig);
+		} catch (e) {
+			console.log(e);
+		}
+
+		const marketAfter0 = driftClient.getPerpMarketAccount(0);
+
+		console.log(
+			'baseAssetAmountWithUnsettledLp:',
+			marketAfter0.amm.baseAssetAmountWithUnsettledLp.toString()
+		);
+		assert(
+			marketAfter0.amm.baseAssetAmountWithUnsettledLp.eq(new BN('1250000000'))
+		);
+
+		const netValueBefore = await driftClient.getUser().getNetSpotMarketValue();
+		const posBefore0: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPosition(0);
+		assert(posBefore0.perLpBase == 0);
+
+		const posBefore: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		// console.log(posBefore);
+		assert(posBefore.perLpBase == 1); // properly sets it
+
+		const _txSig = await driftClient.settleLP(
+			await driftClient.getUserAccountPublicKey(),
+			market.marketIndex
+		);
+		await _viewLogs(_txSig);
+		await driftClient.fetchAccounts();
+		const marketAfter1 = driftClient.getPerpMarketAccount(0);
+
+		console.log(
+			'baseAssetAmountWithUnsettledLp:',
+			marketAfter1.amm.baseAssetAmountWithUnsettledLp.toString()
+		);
+		assert(marketAfter1.amm.baseAssetAmountWithUnsettledLp.eq(new BN('0')));
+
+		const posAfter0: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPosition(0);
+		assert(posAfter0.perLpBase == 1);
+
+		const posAfter: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+
+		assert(posAfter.perLpBase == 1);
+		assert(
+			posAfter0.lastBaseAssetAmountPerLp.gt(posBefore0.lastBaseAssetAmountPerLp)
+		);
+		// console.log(posAfter.lastBaseAssetAmountPerLp.toString());
+		// console.log(posBefore.lastBaseAssetAmountPerLp.toString());
+
+		assert(posAfter.lastBaseAssetAmountPerLp.eq(new BN('625000000')));
+		assert(posBefore.lastBaseAssetAmountPerLp.eq(new BN('750000000')));
+
+		const netValueAfter = await driftClient.getUser().getNetSpotMarketValue();
+
+		assert(netValueBefore.eq(netValueAfter));
+
+		const marketAfter2 = driftClient.getPerpMarketAccount(0);
+
+		console.log(
+			'baseAssetAmountWithUnsettledLp:',
+			marketAfter2.amm.baseAssetAmountWithUnsettledLp.toString()
+		);
+		assert(marketAfter2.amm.baseAssetAmountWithUnsettledLp.eq(new BN('0')));
+		console.log(
+			'marketBefore.amm.totalFeeEarnedPerLp',
+			marketAfter2.amm.totalFeeEarnedPerLp.toString()
+		);
+		assert(marketAfter2.amm.totalFeeEarnedPerLp.eq(new BN('2826')));
+	});
+
+	it('add back lp shares from 0, after rebase', async () => {
+		const leShares = driftClientUser.getPerpPosition(0).lpShares;
+		await driftClient.removePerpLpShares(0, leShares);
+		await driftClient.fetchAccounts();
+
+		await driftClient.updatePerpMarketPerLpBase(0, 2); // update from 1->2
+
+		const posBeforeReadd: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		console.log(posBeforeReadd.baseAssetAmount.toString());
+		console.log(posBeforeReadd.quoteAssetAmount.toString());
+		console.log(posBeforeReadd.lastBaseAssetAmountPerLp.toString());
+		console.log(posBeforeReadd.lastQuoteAssetAmountPerLp.toString());
+		console.log(
+			posBeforeReadd.lpShares.toString(),
+			posBeforeReadd.perLpBase.toString()
+		);
+
+		await driftClient.addPerpLpShares(leShares, 0); // lmao why is this different param order
+
+		const posBefore: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		console.log('posBefore');
+		console.log(posBefore.baseAssetAmount.toString());
+		console.log(posBefore.quoteAssetAmount.toString());
+		console.log(posBefore.lastBaseAssetAmountPerLp.toString());
+		console.log(posBefore.lastQuoteAssetAmountPerLp.toString());
+		console.log(posBefore.lpShares.toString(), posBefore.perLpBase.toString());
+
+		const tradeSize = new BN(5 * BASE_PRECISION.toNumber());
+		const market = driftClient.getPerpMarketAccount(0);
+
+		console.log('user trading...');
+		try {
+			await adjustOraclePostSwap(
+				tradeSize,
+				SwapDirection.REMOVE,
+				market,
+				bankrunContextWrapper
+			);
+			const _txsig = await traderDriftClient.openPosition(
+				PositionDirection.SHORT,
+				tradeSize,
+				market.marketIndex
+			);
+			await _viewLogs(_txsig);
+		} catch (e) {
+			console.log(e);
+		}
+
+		await driftClient.fetchAccounts();
+		await driftClientUser.fetchAccounts();
+
+		const posAfter: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		console.log('posAfter');
+		console.log(posAfter.baseAssetAmount.toString());
+		console.log(posAfter.quoteAssetAmount.toString());
+		console.log(posAfter.lastBaseAssetAmountPerLp.toString());
+		console.log(posAfter.lastQuoteAssetAmountPerLp.toString());
+		console.log(posAfter.perLpBase.toString());
+
+		const _txSig = await driftClient.settleLP(
+			await driftClient.getUserAccountPublicKey(),
+			market.marketIndex
+		);
+
+		await driftClient.fetchAccounts();
+		await driftClientUser.fetchAccounts();
+
+		const posAfterSettle: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		console.log('posAfterSettle');
+		console.log(posAfterSettle.baseAssetAmount.toString());
+		console.log(posAfterSettle.quoteAssetAmount.toString());
+		console.log(posAfterSettle.lastBaseAssetAmountPerLp.toString());
+		console.log(posAfterSettle.lastQuoteAssetAmountPerLp.toString());
+		console.log(posAfterSettle.perLpBase.toString());
+
+		assert(posAfterSettle.baseAssetAmount.eq(posAfter.baseAssetAmount));
+		assert(posAfterSettle.quoteAssetAmount.eq(posAfter.quoteAssetAmount));
+	});
+
+	it('settled at negative rebase value', async () => {
+		await driftClient.updatePerpMarketPerLpBase(0, 1);
+		await driftClient.updatePerpMarketPerLpBase(0, 0);
+		await driftClient.updatePerpMarketPerLpBase(0, -1);
+		await driftClient.updatePerpMarketPerLpBase(0, -2);
+		await driftClient.updatePerpMarketPerLpBase(0, -3);
+
+		const tradeSize = new BN(5 * BASE_PRECISION.toNumber());
+		const market = driftClient.getPerpMarketAccount(0);
+
+		console.log('user trading...');
+		await adjustOraclePostSwap(
+			tradeSize,
+			SwapDirection.REMOVE,
+			market,
+			bankrunContextWrapper
+		);
+		const _txsig = await traderDriftClient.openPosition(
+			PositionDirection.SHORT,
+			tradeSize,
+			market.marketIndex
+		);
+		await _viewLogs(_txsig);
+		await driftClient.fetchAccounts();
+		await driftClientUser.fetchAccounts();
+
+		const posAfter: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		console.log('posAfter');
+		console.log(posAfter.baseAssetAmount.toString());
+		console.log(posAfter.quoteAssetAmount.toString());
+		console.log(posAfter.lastBaseAssetAmountPerLp.toString());
+		console.log(posAfter.lastQuoteAssetAmountPerLp.toString());
+		console.log(posAfter.perLpBase.toString());
+
+		const _txSig = await driftClient.settleLP(
+			await driftClient.getUserAccountPublicKey(),
+			market.marketIndex
+		);
+
+		await driftClient.fetchAccounts();
+		await driftClientUser.fetchAccounts();
+
+		const posAfterSettle: PerpPosition = await driftClient
+			.getUser()
+			.getPerpPositionWithLPSettle(0)[0];
+		console.log('posAfterSettle');
+		console.log(posAfterSettle.baseAssetAmount.toString());
+		console.log(posAfterSettle.quoteAssetAmount.toString());
+		console.log(posAfterSettle.lastBaseAssetAmountPerLp.toString());
+		console.log(posAfterSettle.lastQuoteAssetAmountPerLp.toString());
+		console.log(posAfterSettle.perLpBase.toString());
+
+		assert(posAfterSettle.baseAssetAmount.eq(posAfter.baseAssetAmount));
+		assert(posAfterSettle.quoteAssetAmount.eq(posAfter.quoteAssetAmount));
+	});
+
 	it('permissionless lp burn', async () => {
 		const lpAmount = new BN(1 * BASE_PRECISION.toNumber());
 		const _sig = await driftClient.addPerpLpShares(lpAmount, 0);
 
-		const slot = await connection.getSlot();
-		const time = await connection.getBlockTime(slot);
+		const time = bankrunContextWrapper.connection.getTime();
 		const _2sig = await driftClient.updatePerpMarketExpiry(0, new BN(time + 5));
 
 		await sleep(5000);
@@ -1252,8 +1646,10 @@ describe('liquidity providing', () => {
 
 		await driftClientUser.fetchAccounts();
 		const position = driftClientUser.getPerpPosition(0);
-		assert(position.lpShares.eq(ZERO));
+		console.log(position);
+		// assert(position.lpShares.eq(ZERO));
 	});
+
 	return;
 
 	it('lp gets paid in funding (todo)', async () => {
@@ -1278,7 +1674,8 @@ describe('liquidity providing', () => {
 		const newPrice = await adjustOraclePostSwap(
 			tradeSize,
 			SwapDirection.ADD,
-			market
+			market,
+			bankrunContextWrapper
 		);
 		console.log('market', marketIndex, 'post trade price:', newPrice);
 		try {

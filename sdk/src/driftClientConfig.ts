@@ -1,4 +1,5 @@
 import {
+	Commitment,
 	ConfirmOptions,
 	Connection,
 	PublicKey,
@@ -9,15 +10,19 @@ import { OracleInfo } from './oracles/types';
 import { BulkAccountLoader } from './accounts/bulkAccountLoader';
 import { DriftEnv } from './config';
 import { TxSender } from './tx/types';
+import { TxHandler, TxHandlerConfig } from './tx/txHandler';
+import { DelistedMarketSetting, GrpcConfigs } from './accounts/types';
 
 export type DriftClientConfig = {
 	connection: Connection;
 	wallet: IWallet;
 	env?: DriftEnv;
 	programID?: PublicKey;
+	swiftID?: PublicKey;
 	accountSubscription?: DriftClientSubscriptionConfig;
 	opts?: ConfirmOptions;
 	txSender?: TxSender;
+	txHandler?: TxHandler;
 	subAccountIds?: number[];
 	activeSubAccountId?: number;
 	perpMarketIndexes?: number[];
@@ -31,11 +36,23 @@ export type DriftClientConfig = {
 	skipLoadUsers?: boolean; // if passed to constructor, no user accounts will be loaded. they will load if updateWallet is called afterwards.
 	txVersion?: TransactionVersion; // which tx version to use
 	txParams?: TxParams; // default tx params to use
+	enableMetricsEvents?: boolean;
+	txHandlerConfig?: TxHandlerConfig;
+	delistedMarketSetting?: DelistedMarketSetting;
 };
 
 export type DriftClientSubscriptionConfig =
 	| {
+			type: 'grpc';
+			grpcConfigs: GrpcConfigs;
+			resubTimeoutMs?: number;
+			logResubMessages?: boolean;
+	  }
+	| {
 			type: 'websocket';
+			resubTimeoutMs?: number;
+			logResubMessages?: boolean;
+			commitment?: Commitment;
 	  }
 	| {
 			type: 'polling';

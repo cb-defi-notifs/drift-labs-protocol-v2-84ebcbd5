@@ -18,14 +18,14 @@ use crate::math::spot_balance::{
 };
 use crate::math::stats::{calculate_new_twap, calculate_weighted_average};
 
-use crate::state::events::SpotInterestRecord;
-use crate::state::oracle::OraclePriceData;
-use crate::state::perp_market::{MarketStatus, PerpMarket};
-use crate::state::spot_market::{SpotBalance, SpotBalanceType, SpotMarket};
-use crate::validate;
-
 use crate::math::oracle::{is_oracle_valid_for_action, DriftAction};
 use crate::math::safe_math::SafeMath;
+use crate::state::events::SpotInterestRecord;
+use crate::state::oracle::OraclePriceData;
+use crate::state::paused_operations::SpotOperation;
+use crate::state::spot_market::{SpotBalance, SpotBalanceType, SpotMarket};
+use crate::state::user::MarketType;
+use crate::validate;
 
 #[cfg(test)]
 mod tests;
@@ -90,7 +90,7 @@ pub fn update_spot_market_twap_stats(
             now,
             spot_market.historical_oracle_data.last_oracle_price_twap,
             spot_market.historical_oracle_data.last_oracle_price_twap_ts,
-            ONE_HOUR as i64,
+            ONE_HOUR,
         )?;
 
         let oracle_price_twap_5min = calculate_new_twap(
@@ -124,7 +124,7 @@ pub fn update_spot_market_cumulative_interest(
     oracle_price_data: Option<&OraclePriceData>,
     now: i64,
 ) -> DriftResult {
-    if spot_market.status == MarketStatus::FundingPaused {
+    if spot_market.is_operation_paused(SpotOperation::UpdateCumulativeInterest) {
         update_spot_market_twap_stats(spot_market, oracle_price_data, now)?;
         return Ok(());
     }
@@ -204,7 +204,7 @@ pub fn update_spot_balances(
     update_direction: &SpotBalanceType,
     spot_market: &mut SpotMarket,
     spot_balance: &mut dyn SpotBalance,
-    force_round_up: bool,
+    is_leaving_drift: bool,
 ) -> DriftResult {
     let increase_user_existing_balance = update_direction == spot_balance.balance_type();
     if increase_user_existing_balance {
@@ -225,7 +225,7 @@ pub fn update_spot_balances(
             // determine how much to reduce balance based on size of current token amount
             let (token_delta, balance_delta) = if current_token_amount > token_amount {
                 let round_up =
-                    force_round_up || spot_balance.balance_type() == &SpotBalanceType::Borrow;
+                    is_leaving_drift || spot_balance.balance_type() == &SpotBalanceType::Borrow;
                 let balance_delta = get_spot_balance(
                     token_amount,
                     spot_market,
@@ -252,7 +252,7 @@ pub fn update_spot_balances(
         }
     }
 
-    if let SpotBalanceType::Borrow = update_direction {
+    if is_leaving_drift && update_direction == &SpotBalanceType::Borrow {
         let deposit_token_amount = get_token_amount(
             spot_market.deposit_balance,
             spot_market,
@@ -293,13 +293,15 @@ pub fn transfer_spot_balances(
         return Ok(());
     }
 
-    validate!(
-        spot_market.deposit_balance >= from_spot_balance.balance(),
-        ErrorCode::InvalidSpotMarketState,
-        "spot_market.deposit_balance={} lower than individual spot balance={}",
-        spot_market.deposit_balance,
-        from_spot_balance.balance()
-    )?;
+    if from_spot_balance.balance_type() == &SpotBalanceType::Deposit {
+        validate!(
+            spot_market.deposit_balance >= from_spot_balance.balance(),
+            ErrorCode::InvalidSpotMarketState,
+            "spot_market.deposit_balance={} lower than individual spot balance={}",
+            spot_market.deposit_balance,
+            from_spot_balance.balance()
+        )?;
+    }
 
     update_spot_balances(
         token_amount.unsigned_abs(),
@@ -376,23 +378,6 @@ pub fn transfer_spot_balance_to_revenue_pool(
     Ok(())
 }
 
-pub fn check_perp_market_valid(
-    perp_market: &PerpMarket,
-    spot_market: &SpotMarket,
-    spot_balance: &mut dyn SpotBalance,
-    current_slot: u64,
-) -> DriftResult {
-    // todo
-
-    if perp_market.amm.oracle == spot_market.oracle
-        && spot_balance.balance_type() == &SpotBalanceType::Borrow
-        && (perp_market.amm.last_update_slot != current_slot || !perp_market.amm.last_oracle_valid)
-    {
-        return Err(ErrorCode::InvalidOracle);
-    }
-
-    Ok(())
-}
 pub fn update_spot_market_and_check_validity(
     spot_market: &mut SpotMarket,
     oracle_price_data: &OraclePriceData,
@@ -410,7 +395,16 @@ pub fn update_spot_market_and_check_validity(
     // 1 hour EMA
     let risk_ema_price = spot_market.historical_oracle_data.last_oracle_price_twap;
 
-    let oracle_validity = oracle_validity(risk_ema_price, oracle_price_data, validity_guard_rails)?;
+    let oracle_validity = oracle_validity(
+        MarketType::Spot,
+        spot_market.market_index,
+        risk_ema_price,
+        oracle_price_data,
+        validity_guard_rails,
+        spot_market.get_max_confidence_interval_multiplier()?,
+        &spot_market.oracle_source,
+        false,
+    )?;
 
     validate!(
         is_oracle_valid_for_action(oracle_validity, action)?,

@@ -9,6 +9,7 @@ import {
 	getUserAccountPublicKeySync,
 	getUserStatsAccountPublicKey,
 } from './addresses/pda';
+import { grpcUserStatsAccountSubscriber } from './accounts/grpcUserStatsAccountSubscriber';
 
 export class UserStats {
 	driftClient: DriftClient;
@@ -25,14 +26,29 @@ export class UserStats {
 				config.userStatsAccountPublicKey,
 				config.accountSubscription.accountLoader
 			);
-		} else if (config.accountSubscription?.type === 'custom') {
-			throw new Error(
-				'Custom account subscription not yet implemented for user stats'
+		} else if (config.accountSubscription?.type === 'grpc') {
+			this.accountSubscriber = new grpcUserStatsAccountSubscriber(
+				config.accountSubscription.grpcConfigs,
+				config.driftClient.program,
+				config.userStatsAccountPublicKey,
+				{
+					resubTimeoutMs: config.accountSubscription?.resubTimeoutMs,
+					logResubMessages: config.accountSubscription?.logResubMessages,
+				}
 			);
-		} else {
+		} else if (config.accountSubscription?.type === 'websocket') {
 			this.accountSubscriber = new WebSocketUserStatsAccountSubscriber(
 				config.driftClient.program,
-				config.userStatsAccountPublicKey
+				config.userStatsAccountPublicKey,
+				{
+					resubTimeoutMs: config.accountSubscription?.resubTimeoutMs,
+					logResubMessages: config.accountSubscription?.logResubMessages,
+				},
+				config.accountSubscription.commitment
+			);
+		} else {
+			throw new Error(
+				`Unknown user stats account subscription type: ${config.accountSubscription?.type}`
 			);
 		}
 	}
@@ -79,5 +95,13 @@ export class UserStats {
 				),
 			};
 		}
+	}
+
+	public static getOldestActionTs(account: UserStatsAccount): number {
+		return Math.min(
+			account.lastFillerVolume30DTs.toNumber(),
+			account.lastMakerVolume30DTs.toNumber(),
+			account.lastTakerVolume30DTs.toNumber()
+		);
 	}
 }

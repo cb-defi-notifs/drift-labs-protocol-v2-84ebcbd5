@@ -83,12 +83,14 @@ export const AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO =
 export const MARGIN_PRECISION = TEN_THOUSAND;
 export const BID_ASK_SPREAD_PRECISION = new BN(1000000); // 10^6
 export const LIQUIDATION_PCT_PRECISION = TEN_THOUSAND;
+export const FUNDING_RATE_OFFSET_DENOMINATOR = new BN(5000);
 
 export const FIVE_MINUTE = new BN(60 * 5);
 export const ONE_HOUR = new BN(60 * 60);
 export const ONE_YEAR = new BN(31536000);
 
 export const QUOTE_SPOT_MARKET_INDEX = 0;
+export const GOV_SPOT_MARKET_INDEX = 15;
 
 export const LAMPORTS_PRECISION = new BN(LAMPORTS_PER_SOL);
 export const LAMPORTS_EXP = new BN(Math.log10(LAMPORTS_PER_SOL));
@@ -98,3 +100,14 @@ export const OPEN_ORDER_MARGIN_REQUIREMENT = QUOTE_PRECISION.div(new BN(100));
 export const DEFAULT_REVENUE_SINCE_LAST_FUNDING_SPREAD_RETREAT = new BN(
 	-25
 ).mul(QUOTE_PRECISION);
+
+export const ACCOUNT_AGE_DELETION_CUTOFF_SECONDS = 60 * 60 * 24 * 13; // 13 days
+export const IDLE_TIME_SLOTS = 9000;
+export const SLOT_TIME_ESTIMATE_MS = 400;
+
+export const DUST_POSITION_SIZE = QUOTE_PRECISION.divn(100); // Dust position is any position smaller than 1c
+
+export const FUEL_WINDOW = new BN(60 * 60 * 24 * 28); // 28 days
+export const FUEL_START_TS = new BN(1723147200); // unix timestamp
+
+export const MAX_PREDICTION_PRICE = PRICE_PRECISION;

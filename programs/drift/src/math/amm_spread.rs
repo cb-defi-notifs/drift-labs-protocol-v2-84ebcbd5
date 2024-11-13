@@ -9,17 +9,15 @@ use crate::math::bn::U192;
 use crate::math::casting::Cast;
 use crate::math::constants::{
     AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO_I128, AMM_TO_QUOTE_PRECISION_RATIO_I128,
-    BID_ASK_SPREAD_PRECISION, BID_ASK_SPREAD_PRECISION_I128, BID_ASK_SPREAD_PRECISION_U128,
-    DEFAULT_LARGE_BID_ASK_FACTOR, DEFAULT_REVENUE_SINCE_LAST_FUNDING_SPREAD_RETREAT,
-    MAX_BID_ASK_INVENTORY_SKEW_FACTOR, PEG_PRECISION, PERCENTAGE_PRECISION, PRICE_PRECISION,
-    PRICE_PRECISION_I128,
+    BID_ASK_SPREAD_PRECISION, BID_ASK_SPREAD_PRECISION_I128, DEFAULT_LARGE_BID_ASK_FACTOR,
+    DEFAULT_REVENUE_SINCE_LAST_FUNDING_SPREAD_RETREAT, FUNDING_RATE_BUFFER,
+    MAX_BID_ASK_INVENTORY_SKEW_FACTOR, PEG_PRECISION, PERCENTAGE_PRECISION,
+    PERCENTAGE_PRECISION_I128, PERCENTAGE_PRECISION_U64, PRICE_PRECISION, PRICE_PRECISION_I128,
+    PRICE_PRECISION_I64,
 };
 use crate::math::safe_math::SafeMath;
-
-use crate::state::perp_market::AMM;
+use crate::state::perp_market::{ContractType, PerpMarket, AMM};
 use crate::validate;
-
-use super::constants::PERCENTAGE_PRECISION_I128;
 
 #[cfg(test)]
 mod tests;
@@ -80,12 +78,12 @@ pub fn cap_to_max_spread(
     if total_spread > max_spread {
         if long_spread > short_spread {
             long_spread = long_spread
-                .safe_mul(max_spread)?
+                .saturating_mul(max_spread)
                 .safe_div_ceil(total_spread)?;
             short_spread = max_spread.safe_sub(long_spread)?;
         } else {
             short_spread = short_spread
-                .safe_mul(max_spread)?
+                .saturating_mul(max_spread)
                 .safe_div_ceil(total_spread)?;
             long_spread = max_spread.safe_sub(short_spread)?;
         }
@@ -139,16 +137,23 @@ pub fn calculate_long_short_vol_spread(
         .safe_div(max(volume_24h.cast::<u128>()?, 1))?
         .clamp(factor_clamp_min, factor_clamp_max);
 
+    // only consider confidence interval at full value when above 25 bps
+    let conf_component = if last_oracle_conf_pct > PERCENTAGE_PRECISION_U64 / 400 {
+        last_oracle_conf_pct
+    } else {
+        last_oracle_conf_pct.safe_div(10)?
+    };
+
     Ok((
         max(
-            last_oracle_conf_pct,
+            conf_component,
             vol_spread
                 .safe_mul(long_vol_spread_factor)?
                 .safe_div(PERCENTAGE_PRECISION)?
                 .cast::<u64>()?,
         ),
         max(
-            last_oracle_conf_pct,
+            conf_component,
             vol_spread
                 .safe_mul(short_vol_spread_factor)?
                 .safe_div(PERCENTAGE_PRECISION)?
@@ -289,6 +294,30 @@ pub fn calculate_spread_revenue_retreat_amount(
     Ok(revenue_retreat_amount)
 }
 
+pub fn calculate_max_target_spread(
+    reserve_price: u64,
+    last_oracle_reserve_price_spread_pct: i64,
+    last_oracle_conf_pct: u64,
+    mark_std: u64,
+    oracle_std: u64,
+    max_spread: u32,
+) -> DriftResult<u64> {
+    let max_spread_baseline = last_oracle_reserve_price_spread_pct.unsigned_abs().max(
+        last_oracle_conf_pct
+            .safe_mul(2)?
+            .max(
+                mark_std
+                    .max(oracle_std)
+                    .safe_mul(PERCENTAGE_PRECISION_U64)?
+                    .safe_div(reserve_price)?,
+            )
+            .min(BID_ASK_SPREAD_PRECISION),
+    );
+
+    let max_target_spread = max_spread.cast::<u64>()?.max(max_spread_baseline);
+    Ok(max_target_spread)
+}
+
 #[allow(clippy::comparison_chain)]
 pub fn calculate_spread(
     base_spread: u32,
@@ -321,12 +350,19 @@ pub fn calculate_spread(
         volume_24h,
     )?;
 
-    let mut long_spread = max((base_spread / 2) as u64, long_vol_spread);
-    let mut short_spread = max((base_spread / 2) as u64, short_vol_spread);
+    let half_base_spread_u64 = (base_spread / 2) as u64;
 
-    let max_target_spread = max_spread
-        .cast::<u64>()?
-        .max(last_oracle_reserve_price_spread_pct.unsigned_abs());
+    let mut long_spread = max(half_base_spread_u64, long_vol_spread);
+    let mut short_spread = max(half_base_spread_u64, short_vol_spread);
+
+    let max_target_spread = calculate_max_target_spread(
+        reserve_price,
+        last_oracle_reserve_price_spread_pct,
+        last_oracle_conf_pct,
+        mark_std,
+        oracle_std,
+        max_spread,
+    )?;
 
     // oracle retreat
     // if mark - oracle < 0 (mark below oracle) and user going long then increase spread
@@ -372,10 +408,10 @@ pub fn calculate_spread(
 
     if total_fee_minus_distributions <= 0 {
         long_spread = long_spread
-            .safe_mul(DEFAULT_LARGE_BID_ASK_FACTOR)?
+            .saturating_mul(DEFAULT_LARGE_BID_ASK_FACTOR)
             .safe_div(BID_ASK_SPREAD_PRECISION)?;
         short_spread = short_spread
-            .safe_mul(DEFAULT_LARGE_BID_ASK_FACTOR)?
+            .saturating_mul(DEFAULT_LARGE_BID_ASK_FACTOR)
             .safe_div(BID_ASK_SPREAD_PRECISION)?;
     } else {
         // effective leverage scale
@@ -433,31 +469,57 @@ pub fn get_spread_reserves(amm: &AMM, direction: PositionDirection) -> DriftResu
 }
 
 pub fn calculate_spread_reserves(
-    amm: &AMM,
+    market: &PerpMarket,
     direction: PositionDirection,
 ) -> DriftResult<(u128, u128)> {
     let spread = match direction {
-        PositionDirection::Long => amm.long_spread,
-        PositionDirection::Short => amm.short_spread,
+        PositionDirection::Long => market.amm.long_spread,
+        PositionDirection::Short => market.amm.short_spread,
     };
 
-    let quote_asset_reserve_delta = if spread > 0 {
-        amm.quote_asset_reserve
-            .safe_div(BID_ASK_SPREAD_PRECISION_U128 / (spread.cast::<u128>()? / 2))?
+    let spread_with_offset: i32 = if direction == PositionDirection::Short {
+        (-spread.cast::<i32>()?).safe_add(market.amm.reference_price_offset)?
     } else {
-        0
+        spread
+            .cast::<i32>()?
+            .safe_add(market.amm.reference_price_offset)?
     };
 
-    let quote_asset_reserve = match direction {
-        PositionDirection::Long => amm
+    let quote_asset_reserve_delta = if spread_with_offset.abs() > 1 {
+        let quote_reserve_divisor =
+            BID_ASK_SPREAD_PRECISION_I128 / (spread_with_offset / 2).cast::<i128>()?;
+        market
+            .amm
             .quote_asset_reserve
-            .safe_add(quote_asset_reserve_delta)?,
-        PositionDirection::Short => amm
-            .quote_asset_reserve
-            .safe_sub(quote_asset_reserve_delta)?,
+            .cast::<i128>()?
+            .safe_div(quote_reserve_divisor)?
+    } else {
+        0_i128
     };
 
-    let invariant_sqrt_u192 = U192::from(amm.sqrt_k);
+    let mut quote_asset_reserve = if quote_asset_reserve_delta > 0 {
+        market
+            .amm
+            .quote_asset_reserve
+            .safe_add(quote_asset_reserve_delta.unsigned_abs())?
+    } else {
+        market
+            .amm
+            .quote_asset_reserve
+            .safe_sub(quote_asset_reserve_delta.unsigned_abs())?
+    };
+
+    if market.contract_type == ContractType::Prediction {
+        let (quote_asset_reserve_lower_bound, quote_asset_reserve_upper_bound) =
+            market.get_quote_asset_reserve_prediction_market_bounds(direction)?;
+
+        quote_asset_reserve = quote_asset_reserve.clamp(
+            quote_asset_reserve_lower_bound,
+            quote_asset_reserve_upper_bound,
+        );
+    }
+
+    let invariant_sqrt_u192 = U192::from(market.amm.sqrt_k);
     let invariant = invariant_sqrt_u192.safe_mul(invariant_sqrt_u192)?;
 
     let base_asset_reserve = invariant
@@ -465,4 +527,76 @@ pub fn calculate_spread_reserves(
         .try_to_u128()?;
 
     Ok((base_asset_reserve, quote_asset_reserve))
+}
+
+#[allow(clippy::comparison_chain)]
+pub fn calculate_reference_price_offset(
+    reserve_price: u64,
+    last_24h_avg_funding_rate: i64,
+    liquidity_fraction: i128,
+    _min_order_size: u64,
+    oracle_twap_fast: i64,
+    mark_twap_fast: u64,
+    oracle_twap_slow: i64,
+    mark_twap_slow: u64,
+    max_offset_pct: i64,
+) -> DriftResult<i32> {
+    if last_24h_avg_funding_rate == 0 {
+        return Ok(0);
+    }
+
+    let max_offset_in_price = max_offset_pct
+        .safe_mul(reserve_price.cast()?)?
+        .safe_div(PERCENTAGE_PRECISION.cast()?)?;
+
+    // calculate quote denominated market premium
+    let mark_premium_minute: i64 = mark_twap_fast
+        .cast::<i64>()?
+        .safe_sub(oracle_twap_fast)?
+        .clamp(-max_offset_in_price, max_offset_in_price);
+    let mark_premium_hour: i64 = mark_twap_slow
+        .cast::<i64>()?
+        .safe_sub(oracle_twap_slow)?
+        .clamp(-max_offset_in_price, max_offset_in_price);
+    // convert last_24h_avg_funding_rate to quote denominated premium
+    let mark_premium_day: i64 = last_24h_avg_funding_rate
+        .safe_div(FUNDING_RATE_BUFFER.cast()?)?
+        .safe_mul(24)?
+        .clamp(-max_offset_in_price, max_offset_in_price); // todo: look at how 24h funding is calc w.r.t. the funding_period
+
+    // take average clamped premium as the price-based offset
+    let mark_premium_avg = mark_premium_minute
+        .safe_add(mark_premium_hour)?
+        .safe_add(mark_premium_day)?
+        .safe_div(3_i64)?;
+
+    let mark_premium_avg_pct: i64 = mark_premium_avg
+        .safe_mul(PRICE_PRECISION_I64)?
+        .safe_div(reserve_price.cast()?)?;
+
+    let inventory_pct = liquidity_fraction
+        .cast::<i64>()?
+        .safe_mul(max_offset_pct)?
+        .safe_div(PERCENTAGE_PRECISION.cast::<i64>()?)?
+        .clamp(-max_offset_pct, max_offset_pct);
+
+    // only apply when inventory is consistent with recent and 24h market premium
+    let offset_pct = if (mark_premium_avg_pct >= 0 && inventory_pct >= 0)
+        || (mark_premium_avg_pct <= 0 && inventory_pct <= 0)
+    {
+        mark_premium_avg_pct.safe_add(inventory_pct)?
+    } else {
+        0
+    };
+
+    let clamped_offset_pct = offset_pct.clamp(-max_offset_pct, max_offset_pct);
+
+    validate!(
+        clamped_offset_pct.abs() <= max_offset_pct,
+        ErrorCode::InvalidAmmDetected,
+        "clamp offset pct failed {}",
+        clamped_offset_pct
+    )?;
+
+    clamped_offset_pct.cast()
 }

@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use solana_program::msg;
 
 use crate::controller::spot_balance::{
@@ -15,6 +15,7 @@ use crate::math::constants::{
     SHARE_OF_REVENUE_ALLOCATED_TO_INSURANCE_FUND_VAULT_DENOMINATOR,
     SHARE_OF_REVENUE_ALLOCATED_TO_INSURANCE_FUND_VAULT_NUMERATOR,
 };
+use crate::math::fuel::calculate_insurance_fuel_bonus;
 use crate::math::helpers::get_proportion_u128;
 use crate::math::helpers::on_the_hour_update;
 use crate::math::insurance::{
@@ -30,10 +31,70 @@ use crate::state::perp_market::PerpMarket;
 use crate::state::spot_market::{SpotBalanceType, SpotMarket};
 use crate::state::state::State;
 use crate::state::user::UserStats;
-use crate::{emit, validate};
+use crate::{emit, validate, FUEL_START_TS, GOV_SPOT_MARKET_INDEX, QUOTE_SPOT_MARKET_INDEX};
 
 #[cfg(test)]
 mod tests;
+
+pub fn update_user_stats_if_stake_amount(
+    if_stake_amount_delta: i64,
+    insurance_vault_amount: u64,
+    insurance_fund_stake: &mut InsuranceFundStake,
+    user_stats: &mut UserStats,
+    spot_market: &mut SpotMarket,
+    now: i64,
+) -> DriftResult {
+    if spot_market.market_index != QUOTE_SPOT_MARKET_INDEX
+        && spot_market.market_index != GOV_SPOT_MARKET_INDEX
+        && spot_market.fuel_boost_insurance == 0
+    {
+        return Ok(());
+    }
+
+    let if_stake_amount = if if_stake_amount_delta >= 0 {
+        if_shares_to_vault_amount(
+            insurance_fund_stake.checked_if_shares(spot_market)?,
+            spot_market.insurance_fund.total_shares,
+            insurance_vault_amount.safe_add(if_stake_amount_delta.unsigned_abs())?,
+        )?
+    } else {
+        if_shares_to_vault_amount(
+            insurance_fund_stake.checked_if_shares(spot_market)?,
+            spot_market.insurance_fund.total_shares,
+            insurance_vault_amount.safe_sub(if_stake_amount_delta.unsigned_abs())?,
+        )?
+    };
+
+    if spot_market.market_index == QUOTE_SPOT_MARKET_INDEX {
+        user_stats.if_staked_quote_asset_amount = if_stake_amount;
+    } else if spot_market.market_index == GOV_SPOT_MARKET_INDEX {
+        user_stats.if_staked_gov_token_amount = if_stake_amount;
+    }
+
+    if spot_market.fuel_boost_insurance != 0 && now >= FUEL_START_TS {
+        let now_u32: u32 = now.cast()?;
+        let since_last = now_u32.safe_sub(
+            user_stats
+                .last_fuel_if_bonus_update_ts
+                .max(FUEL_START_TS.cast()?),
+        )?;
+
+        // calculate their stake amount prior to update
+        let fuel_bonus_insurance = calculate_insurance_fuel_bonus(
+            spot_market,
+            if_stake_amount,
+            if_stake_amount_delta,
+            since_last,
+        )?;
+
+        user_stats.fuel_insurance = user_stats
+            .fuel_insurance
+            .saturating_add(fuel_bonus_insurance.cast()?);
+        user_stats.last_fuel_if_bonus_update_ts = now_u32;
+    }
+
+    Ok(())
+}
 
 pub fn add_insurance_fund_stake(
     amount: u64,
@@ -77,13 +138,14 @@ pub fn add_insurance_fund_stake(
     spot_market.insurance_fund.user_shares =
         spot_market.insurance_fund.user_shares.safe_add(n_shares)?;
 
-    if spot_market.market_index == 0 {
-        user_stats.if_staked_quote_asset_amount = if_shares_to_vault_amount(
-            insurance_fund_stake.checked_if_shares(spot_market)?,
-            spot_market.insurance_fund.total_shares,
-            insurance_vault_amount.safe_add(amount)?,
-        )?;
-    }
+    update_user_stats_if_stake_amount(
+        amount.cast()?,
+        insurance_vault_amount,
+        insurance_fund_stake,
+        user_stats,
+        spot_market,
+        now,
+    )?;
 
     let if_shares_after = insurance_fund_stake.checked_if_shares(spot_market)?;
 
@@ -231,13 +293,14 @@ pub fn request_remove_insurance_fund_stake(
 
     let if_shares_after = insurance_fund_stake.checked_if_shares(spot_market)?;
 
-    if spot_market.market_index == 0 {
-        user_stats.if_staked_quote_asset_amount = if_shares_to_vault_amount(
-            insurance_fund_stake.checked_if_shares(spot_market)?,
-            spot_market.insurance_fund.total_shares,
-            insurance_vault_amount,
-        )?;
-    }
+    update_user_stats_if_stake_amount(
+        0,
+        insurance_vault_amount,
+        insurance_fund_stake,
+        user_stats,
+        spot_market,
+        now,
+    )?;
 
     emit!(InsuranceFundStakeRecord {
         ts: now,
@@ -302,13 +365,14 @@ pub fn cancel_request_remove_insurance_fund_stake(
 
     let if_shares_after = insurance_fund_stake.checked_if_shares(spot_market)?;
 
-    if spot_market.market_index == 0 {
-        user_stats.if_staked_quote_asset_amount = if_shares_to_vault_amount(
-            if_shares_after,
-            spot_market.insurance_fund.total_shares,
-            insurance_vault_amount,
-        )?;
-    }
+    update_user_stats_if_stake_amount(
+        0,
+        insurance_vault_amount,
+        insurance_fund_stake,
+        user_stats,
+        spot_market,
+        now,
+    )?;
 
     emit!(InsuranceFundStakeRecord {
         ts: now,
@@ -397,13 +461,14 @@ pub fn remove_insurance_fund_stake(
 
     let if_shares_after = insurance_fund_stake.checked_if_shares(spot_market)?;
 
-    if spot_market.market_index == 0 {
-        user_stats.if_staked_quote_asset_amount = if_shares_to_vault_amount(
-            if_shares_after,
-            spot_market.insurance_fund.total_shares,
-            insurance_vault_amount.safe_sub(amount)?,
-        )?;
-    }
+    update_user_stats_if_stake_amount(
+        -(withdraw_amount.cast()?),
+        insurance_vault_amount,
+        insurance_fund_stake,
+        user_stats,
+        spot_market,
+        now,
+    )?;
 
     emit!(InsuranceFundStakeRecord {
         ts: now,
@@ -454,7 +519,10 @@ pub fn admin_remove_insurance_fund_stake(
     spot_market.insurance_fund.total_shares =
         spot_market.insurance_fund.total_shares.safe_sub(n_shares)?;
 
-    let if_shares_after = spot_market.insurance_fund.total_shares;
+    let if_shares_after = spot_market
+        .insurance_fund
+        .total_shares
+        .safe_sub(user_if_shares_before)?;
 
     emit!(InsuranceFundStakeRecord {
         ts: now,
@@ -474,14 +542,105 @@ pub fn admin_remove_insurance_fund_stake(
     Ok(withdraw_amount)
 }
 
-pub fn attempt_settle_revenue_to_insurance_fund<'info>(
-    spot_market_vault: &Account<'info, TokenAccount>,
-    insurance_fund_vault: &Account<'info, TokenAccount>,
+pub fn transfer_protocol_insurance_fund_stake(
+    insurance_vault_amount: u64,
+    n_shares: u128,
+    target_insurance_fund_stake: &mut InsuranceFundStake,
+    user_stats: &mut UserStats,
     spot_market: &mut SpotMarket,
     now: i64,
-    token_program: &Program<'info, Token>,
+    signer_pubkey: Pubkey,
+) -> DriftResult<u64> {
+    apply_rebase_to_insurance_fund(insurance_vault_amount, spot_market)?;
+
+    let total_if_shares_before = spot_market.insurance_fund.total_shares;
+    let user_if_shares_before = spot_market.insurance_fund.user_shares;
+
+    let if_shares_before = total_if_shares_before.safe_sub(user_if_shares_before)?;
+    let target_if_shares_before = target_insurance_fund_stake.checked_if_shares(spot_market)?;
+    validate!(
+        if_shares_before >= n_shares,
+        ErrorCode::InsufficientIFShares,
+        "if_shares_before={} < n_shares={}",
+        if_shares_before,
+        n_shares
+    )?;
+
+    spot_market.insurance_fund.user_shares =
+        spot_market.insurance_fund.user_shares.safe_add(n_shares)?;
+
+    target_insurance_fund_stake.increase_if_shares(n_shares, spot_market)?;
+
+    let target_if_shares_after = target_insurance_fund_stake.checked_if_shares(spot_market)?;
+
+    if spot_market.market_index == QUOTE_SPOT_MARKET_INDEX {
+        user_stats.if_staked_quote_asset_amount = if_shares_to_vault_amount(
+            target_if_shares_after,
+            spot_market.insurance_fund.total_shares,
+            insurance_vault_amount,
+        )?;
+    } else if spot_market.market_index == GOV_SPOT_MARKET_INDEX {
+        user_stats.if_staked_gov_token_amount = if_shares_to_vault_amount(
+            target_if_shares_after,
+            spot_market.insurance_fund.total_shares,
+            insurance_vault_amount,
+        )?;
+    }
+
+    let withdraw_amount = if_shares_to_vault_amount(
+        n_shares,
+        spot_market.insurance_fund.total_shares,
+        insurance_vault_amount,
+    )?;
+    let user_if_shares_after = spot_market.insurance_fund.user_shares;
+
+    let protocol_if_shares_after = spot_market
+        .insurance_fund
+        .total_shares
+        .safe_sub(user_if_shares_after)?;
+
+    emit!(InsuranceFundStakeRecord {
+        ts: now,
+        user_authority: signer_pubkey,
+        action: StakeAction::UnstakeTransfer,
+        amount: withdraw_amount,
+        market_index: spot_market.market_index,
+        insurance_vault_amount_before: insurance_vault_amount,
+        if_shares_before,
+        user_if_shares_before,
+        total_if_shares_before,
+        if_shares_after: protocol_if_shares_after,
+        total_if_shares_after: spot_market.insurance_fund.total_shares,
+        user_if_shares_after: spot_market.insurance_fund.user_shares,
+    });
+
+    emit!(InsuranceFundStakeRecord {
+        ts: now,
+        user_authority: target_insurance_fund_stake.authority,
+        action: StakeAction::StakeTransfer,
+        amount: withdraw_amount,
+        market_index: spot_market.market_index,
+        insurance_vault_amount_before: insurance_vault_amount,
+        if_shares_before: target_if_shares_before,
+        user_if_shares_before,
+        total_if_shares_before,
+        if_shares_after: target_insurance_fund_stake.checked_if_shares(spot_market)?,
+        total_if_shares_after: spot_market.insurance_fund.total_shares,
+        user_if_shares_after: spot_market.insurance_fund.user_shares,
+    });
+
+    Ok(withdraw_amount)
+}
+
+pub fn attempt_settle_revenue_to_insurance_fund<'info>(
+    spot_market_vault: &InterfaceAccount<'info, TokenAccount>,
+    insurance_fund_vault: &InterfaceAccount<'info, TokenAccount>,
+    spot_market: &mut SpotMarket,
+    now: i64,
+    token_program: &Interface<'info, TokenInterface>,
     drift_signer: &AccountInfo<'info>,
     state: &State,
+    mint: &Option<InterfaceAccount<'info, Mint>>,
 ) -> Result<()> {
     let valid_revenue_settle_time = if spot_market.insurance_fund.revenue_settle_period > 0 {
         let time_until_next_update = on_the_hour_update(
@@ -505,6 +664,7 @@ pub fn attempt_settle_revenue_to_insurance_fund<'info>(
             insurance_fund_vault_amount,
             spot_market,
             now,
+            false,
         )?;
 
         if token_amount > 0 {
@@ -521,6 +681,7 @@ pub fn attempt_settle_revenue_to_insurance_fund<'info>(
                 drift_signer,
                 state.signer_nonce,
                 token_amount.cast()?,
+                mint,
             )?;
         }
 
@@ -539,14 +700,14 @@ pub fn settle_revenue_to_insurance_fund(
     insurance_vault_amount: u64,
     spot_market: &mut SpotMarket,
     now: i64,
+    check_invariants: bool,
 ) -> DriftResult<u64> {
     update_spot_market_cumulative_interest(spot_market, None, now)?;
 
-    validate!(
-        spot_market.insurance_fund.revenue_settle_period > 0,
-        ErrorCode::RevenueSettingsCannotSettleToIF,
-        "invalid revenue_settle_period settings on spot market"
-    )?;
+    if spot_market.insurance_fund.revenue_settle_period == 0 {
+        // revenue pool not configured to settle, ending early
+        return Ok(0);
+    }
 
     validate!(
         spot_market.insurance_fund.user_factor <= spot_market.insurance_fund.total_factor,
@@ -555,7 +716,7 @@ pub fn settle_revenue_to_insurance_fund(
     )?;
 
     let depositors_claim =
-        validate_spot_market_vault_amount(spot_market, spot_market_vault_amount)?.cast::<u128>()?;
+        validate_spot_market_vault_amount(spot_market, spot_market_vault_amount)?;
 
     let mut token_amount = get_token_amount(
         spot_market.revenue_pool.scaled_balance,
@@ -563,13 +724,13 @@ pub fn settle_revenue_to_insurance_fund(
         &SpotBalanceType::Deposit,
     )?;
 
-    if depositors_claim < token_amount {
+    if depositors_claim < token_amount.cast()? {
         // only allow half of withdraw available when utilization is high
-        token_amount = depositors_claim.safe_div(2)?;
+        token_amount = depositors_claim.max(0).cast::<u128>()?.safe_div(2)?;
     }
 
     if spot_market.insurance_fund.user_shares > 0 {
-        // only allow MAX_APR_PER_REVENUE_SETTLE_TO_INSURANCE_FUND_VAULT or half revenue pool to be settled
+        // only allow MAX_APR_PER_REVENUE_SETTLE_TO_INSURANCE_FUND_VAULT or 1/10th of revenue pool to be settled
         let capped_apr_amount = insurance_vault_amount
             .cast::<u128>()?
             .safe_mul(MAX_APR_PER_REVENUE_SETTLE_TO_INSURANCE_FUND_VAULT.cast::<u128>()?)?
@@ -590,11 +751,13 @@ pub fn settle_revenue_to_insurance_fund(
     )?
     .cast::<u64>()?;
 
-    validate!(
-        insurance_fund_token_amount != 0,
-        ErrorCode::NoRevenueToSettleToIF,
-        "no amount to settle to insurance fund"
-    )?;
+    if check_invariants {
+        validate!(
+            insurance_fund_token_amount != 0,
+            ErrorCode::NoRevenueToSettleToIF,
+            "no amount to settle to insurance fund"
+        )?;
+    }
 
     spot_market.insurance_fund.last_revenue_settle_ts = now;
 

@@ -7,10 +7,14 @@ import {
 	Order,
 	PositionDirection,
 } from '../types';
-import { ZERO, TWO } from '../constants/numericConstants';
+import { ZERO, TWO, ONE } from '../constants/numericConstants';
 import { BN } from '@coral-xyz/anchor';
 import { OraclePriceData } from '../oracles/types';
-import { getAuctionPrice, isAuctionComplete } from './auction';
+import {
+	getAuctionPrice,
+	isAuctionComplete,
+	isFallbackAvailableLiquiditySource,
+} from './auction';
 import {
 	calculateMaxBaseAssetAmountFillable,
 	calculateMaxBaseAssetAmountToTrade,
@@ -156,7 +160,10 @@ export function getLimitPrice(
 	if (hasAuctionPrice(order, slot)) {
 		limitPrice = getAuctionPrice(order, slot, oraclePriceData.price);
 	} else if (order.oraclePriceOffset !== 0) {
-		limitPrice = oraclePriceData.price.add(new BN(order.oraclePriceOffset));
+		limitPrice = BN.max(
+			oraclePriceData.price.add(new BN(order.oraclePriceOffset)),
+			ONE
+		);
 	} else if (order.price.eq(ZERO)) {
 		limitPrice = fallbackPrice;
 	} else {
@@ -186,10 +193,11 @@ export function isFillableByVAMM(
 	market: PerpMarketAccount,
 	oraclePriceData: OraclePriceData,
 	slot: number,
-	ts: number
+	ts: number,
+	minAuctionDuration: number
 ): boolean {
 	return (
-		(isAuctionComplete(order, slot) &&
+		(isFallbackAvailableLiquiditySource(order, minAuctionDuration, slot) &&
 			calculateBaseAssetAmountForAmmToFulfill(
 				order,
 				market,
@@ -279,7 +287,12 @@ function isSameDirection(
 	);
 }
 
-export function isOrderExpired(order: Order, ts: number): boolean {
+export function isOrderExpired(
+	order: Order,
+	ts: number,
+	enforceBuffer = false,
+	bufferSeconds = 15
+): boolean {
 	if (
 		mustBeTriggered(order) ||
 		!isVariant(order.status, 'open') ||
@@ -288,7 +301,14 @@ export function isOrderExpired(order: Order, ts: number): boolean {
 		return false;
 	}
 
-	return new BN(ts).gt(order.maxTs);
+	let maxTs;
+	if (enforceBuffer && isLimitOrder(order)) {
+		maxTs = order.maxTs.addn(bufferSeconds);
+	} else {
+		maxTs = order.maxTs;
+	}
+
+	return new BN(ts).gt(maxTs);
 }
 
 export function isMarketOrder(order: Order): boolean {
@@ -311,9 +331,11 @@ export function isTriggered(order: Order): boolean {
 }
 
 export function isRestingLimitOrder(order: Order, slot: number): boolean {
-	return (
-		isLimitOrder(order) && (order.postOnly || isAuctionComplete(order, slot))
-	);
+	if (!isLimitOrder(order)) {
+		return false;
+	}
+
+	return order.postOnly || isAuctionComplete(order, slot);
 }
 
 export function isTakingOrder(order: Order, slot: number): boolean {

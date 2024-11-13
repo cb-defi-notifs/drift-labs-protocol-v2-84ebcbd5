@@ -15,13 +15,14 @@ use crate::math::constants::{
 use crate::math::cp_curve;
 use crate::math::oracle;
 use crate::math::oracle::OracleValidity;
-use crate::math::position::_calculate_base_asset_value_and_pnl;
+use crate::math::position::calculate_base_asset_value_and_pnl;
 use crate::math::safe_math::SafeMath;
 
 use crate::state::oracle::get_oracle_price;
 use crate::state::oracle::OraclePriceData;
 use crate::state::perp_market::{PerpMarket, AMM};
 use crate::state::state::OracleGuardRails;
+use crate::state::user::MarketType;
 
 #[cfg(test)]
 mod tests;
@@ -36,9 +37,14 @@ pub fn calculate_repeg_validity_from_oracle_account(
     let oracle_price_data =
         get_oracle_price(&market.amm.oracle_source, oracle_account_info, clock_slot)?;
     let oracle_is_valid = oracle::oracle_validity(
+        MarketType::Perp,
+        market.market_index,
         market.amm.historical_oracle_data.last_oracle_price_twap,
         &oracle_price_data,
         &oracle_guard_rails.validity,
+        market.get_max_confidence_interval_multiplier()?,
+        &market.amm.oracle_source,
+        true,
     )? == OracleValidity::Valid;
 
     let (oracle_is_valid, direction_valid, profitability_valid, price_impact_valid) =
@@ -163,47 +169,6 @@ pub fn calculate_peg_from_target_price(
     Ok(new_peg.max(1))
 }
 
-pub fn calculate_amm_target_price(
-    amm: &AMM,
-    current_price: u64,
-    oracle_price_data: &OraclePriceData,
-) -> DriftResult<u64> {
-    // calculates peg_multiplier that changing to would cost no more than budget
-    let oracle_price_normalised =
-        amm::normalise_oracle_price(amm, oracle_price_data, Some(current_price))?.cast::<u64>()?;
-
-    let weight_denom = 100_u128;
-
-    let delay_penalty = max(
-        0,
-        oracle_price_data
-            .delay
-            .safe_mul(max(1, oracle_price_data.delay.safe_div(2)?))?,
-    );
-
-    let oracle_price_weight: u128 = max(0, 100_i64.safe_sub(delay_penalty)?).cast()?;
-
-    let target_price = if oracle_price_weight > 0 {
-        let current_price_weight: u128 = weight_denom.safe_sub(oracle_price_weight)?;
-
-        oracle_price_normalised
-            .cast::<u128>()?
-            .safe_mul(oracle_price_weight)?
-            .safe_div(weight_denom)?
-            .safe_add(
-                current_price
-                    .cast::<u128>()?
-                    .safe_mul(current_price_weight)?
-                    .safe_div(weight_denom)?,
-            )?
-            .cast::<u64>()?
-    } else {
-        current_price
-    };
-
-    Ok(target_price)
-}
-
 pub fn adjust_peg_cost(
     market: &PerpMarket,
     new_peg_candidate: u128,
@@ -212,20 +177,18 @@ pub fn adjust_peg_cost(
 
     let cost = if new_peg_candidate != market_clone.amm.peg_multiplier {
         // Find the net market value before adjusting peg
-        let (current_net_market_value, _) = _calculate_base_asset_value_and_pnl(
+        let (current_net_market_value, _) = calculate_base_asset_value_and_pnl(
             market_clone.amm.base_asset_amount_with_amm,
             0,
             &market_clone.amm,
-            false,
         )?;
 
         market_clone.amm.peg_multiplier = new_peg_candidate;
 
-        let (_new_net_market_value, cost) = _calculate_base_asset_value_and_pnl(
+        let (_new_net_market_value, cost) = calculate_base_asset_value_and_pnl(
             market_clone.amm.base_asset_amount_with_amm,
             current_net_market_value,
             &market_clone.amm,
-            false,
         )?;
         cost
     } else {
@@ -327,11 +290,14 @@ pub fn adjust_amm(
         let adjustment_cost: i128 = if adjust_k && can_lower_k {
             // TODO can be off by 1?
 
+            // always let protocol-owned sqrt_k be either least .1% of lps or the base amount / min order
+            let new_sqrt_k_lower_bound = market.amm.get_lower_bound_sqrt_k()?;
+
             let new_sqrt_k = market
                 .amm
                 .sqrt_k
                 .safe_sub(market.amm.sqrt_k.safe_div(1000)?)?
-                .max(market.amm.user_lp_shares.safe_add(1)?);
+                .max(new_sqrt_k_lower_bound);
 
             let update_k_result =
                 cp_curve::get_update_k_result(market, bn::U192::from(new_sqrt_k), true)?;
@@ -383,6 +349,7 @@ pub fn calculate_optimal_peg_and_budget(
     let reserve_price_before = market.amm.reserve_price()?;
 
     let mut fee_budget = calculate_fee_pool(market)?;
+
     let target_price_i64 = oracle_price_data.price;
     let target_price = target_price_i64.cast()?;
     let mut optimal_peg = calculate_peg_from_target_price(
@@ -426,9 +393,7 @@ pub fn calculate_optimal_peg_and_budget(
             fee_budget = calculate_repeg_cost(&market.amm, optimal_peg)?.cast::<u128>()?;
 
             check_lower_bound = false;
-        } else if market.amm.total_fee_minus_distributions
-            < get_total_fee_lower_bound(market)?.cast()?
-        {
+        } else if fee_budget == 0 {
             check_lower_bound = false;
         }
     }
@@ -437,7 +402,11 @@ pub fn calculate_optimal_peg_and_budget(
 }
 
 pub fn calculate_fee_pool(market: &PerpMarket) -> DriftResult<u128> {
-    let total_fee_minus_distributions_lower_bound = get_total_fee_lower_bound(market)?.cast()?;
+    let total_fee_minus_distributions_lower_bound = get_total_fee_lower_bound(market)?
+        .safe_add(market.amm.total_liquidation_fee)?
+        .safe_sub(market.amm.total_fee_withdrawn)?
+        .cast::<i128>()
+        .unwrap_or(0);
 
     let fee_pool =
         if market.amm.total_fee_minus_distributions > total_fee_minus_distributions_lower_bound {

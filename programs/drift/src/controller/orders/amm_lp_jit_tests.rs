@@ -45,6 +45,7 @@ pub mod amm_lp_jit {
         SPOT_CUMULATIVE_INTEREST_PRECISION, SPOT_WEIGHT_PRECISION,
     };
     use crate::math::constants::{CONCENTRATION_PRECISION, PRICE_PRECISION_U64};
+    use crate::state::fill_mode::FillMode;
     use crate::state::oracle::{HistoricalOracleData, OracleSource};
     use crate::state::perp_market::{AMMLiquiditySplit, MarketStatus, PerpMarket, AMM};
     use crate::state::perp_market_map::PerpMarketMap;
@@ -57,6 +58,186 @@ pub mod amm_lp_jit {
     use crate::validation::perp_market::validate_perp_market;
 
     use super::*;
+
+    #[test]
+    fn max_jit_amounts() {
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                base_asset_amount_per_lp: -505801343,
+                quote_asset_amount_per_lp: 10715933,
+                target_base_asset_amount_per_lp: -1000000000,
+                base_asset_amount_with_amm: (AMM_RESERVE_PRECISION / 2) as i128,
+                base_asset_amount_long: (AMM_RESERVE_PRECISION / 2) as i128,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 1000,
+                order_tick_size: 1,
+                oracle: oracle_price_key,
+                amm_jit_intensity: 200,
+                base_spread: 20000,
+                long_spread: 2000,
+                short_spread: 2000,
+                historical_oracle_data: HistoricalOracleData {
+                    last_oracle_price: (100 * PRICE_PRECISION) as i64,
+                    last_oracle_price_twap: (100 * PRICE_PRECISION) as i64,
+                    last_oracle_price_twap_5min: (100 * PRICE_PRECISION) as i64,
+
+                    ..HistoricalOracleData::default()
+                },
+                user_lp_shares: 10 * AMM_RESERVE_PRECISION, // some lps exist
+                concentration_coef: CONCENTRATION_PRECISION + 1,
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            status: MarketStatus::Initialized,
+            ..PerpMarket::default_test()
+        };
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            100 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 500000000);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            100 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Long,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 500000000);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            99_920_000,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Long,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 300000000);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            99 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Long,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 0);
+
+        market.amm.long_spread = 11000;
+        market.amm.short_spread = 11000;
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            99 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Long,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 45454000);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            101 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 45454000);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            102 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 0);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            104 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 0);
+
+        market.amm.short_spread = 20000;
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            104 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 0);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            105 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 0);
+
+        market.amm.long_spread = 51000;
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            105 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Short,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 9803000);
+
+        let jit_base_asset_amount = crate::math::amm_jit::calculate_jit_base_asset_amount(
+            &market,
+            BASE_PRECISION_U64,
+            95 * PRICE_PRECISION_U64,
+            Some(100 * PRICE_PRECISION_I64),
+            PositionDirection::Long,
+            AMMLiquiditySplit::Shared,
+        )
+        .unwrap();
+        assert_eq!(jit_base_asset_amount, 0);
+    }
 
     #[test]
     fn zero_asks_with_amm_lp_jit_taker_long() {
@@ -104,17 +285,11 @@ pub mod amm_lp_jit {
         market.amm.min_base_asset_reserve = 0;
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -151,6 +326,7 @@ pub mod amm_lp_jit {
             BASE_PRECISION_U64,
             BASE_PRECISION_U64,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(amm_liquidity_split, AMMLiquiditySplit::ProtocolOwned);
@@ -208,17 +384,11 @@ pub mod amm_lp_jit {
         );
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -243,6 +413,7 @@ pub mod amm_lp_jit {
             BASE_PRECISION_U64,
             BASE_PRECISION_U64,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(amm_liquidity_split, AMMLiquiditySplit::Shared);
@@ -258,6 +429,7 @@ pub mod amm_lp_jit {
             BASE_PRECISION_U64 * 2,
             BASE_PRECISION_U64,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(amm_liquidity_split, AMMLiquiditySplit::ProtocolOwned);
@@ -273,6 +445,7 @@ pub mod amm_lp_jit {
             BASE_PRECISION_U64 * 100,
             BASE_PRECISION_U64 * 100,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(amm_liquidity_split, AMMLiquiditySplit::Shared);
@@ -288,6 +461,7 @@ pub mod amm_lp_jit {
             BASE_PRECISION_U64,
             BASE_PRECISION_U64,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(amm_liquidity_split, AMMLiquiditySplit::ProtocolOwned);
@@ -352,17 +526,11 @@ pub mod amm_lp_jit {
         market.amm.min_base_asset_reserve = 0;
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -484,7 +652,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             0,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -685,7 +855,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             10,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -893,7 +1065,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             10,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -1108,7 +1282,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             10,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -1326,7 +1502,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             10,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -1402,17 +1580,11 @@ pub mod amm_lp_jit {
         market.amm.max_base_asset_reserve = u64::MAX as u128;
         market.amm.min_base_asset_reserve = 0;
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -1532,7 +1704,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             0,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -1611,17 +1785,11 @@ pub mod amm_lp_jit {
         market.amm.min_base_asset_reserve = 0;
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -1747,7 +1915,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             0,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -1822,17 +1992,11 @@ pub mod amm_lp_jit {
         market.amm.min_base_asset_reserve = 0;
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -1954,7 +2118,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             0,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
@@ -2143,11 +2309,13 @@ pub mod amm_lp_jit {
             now,
             slot,
             10,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
-        assert_eq!(base_asset_amount, BASE_PRECISION_U64 / 2); // auctions not over so no amm fill
+        assert_eq!(base_asset_amount, BASE_PRECISION_U64 * 3 / 4); // auctions not over so no amm fill
 
         let maker = makers_and_referrers.get_ref_mut(&maker_key).unwrap();
         let maker_position = &maker.perp_positions[0];
@@ -2344,11 +2512,13 @@ pub mod amm_lp_jit {
             now,
             slot,
             10,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 
-        assert_eq!(base_asset_amount, BASE_PRECISION_U64 / 2); // auctions not over so no amm fill
+        assert_eq!(base_asset_amount, BASE_PRECISION_U64 * 3 / 4); // auctions not over so no amm fill
 
         let market_after = market_map.get_ref(&0).unwrap();
 
@@ -2419,17 +2589,11 @@ pub mod amm_lp_jit {
         market.amm.min_base_asset_reserve = 0;
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -2530,9 +2694,14 @@ pub mod amm_lp_jit {
                 break;
             }
 
-            let auction_price =
-                crate::math::auction::calculate_auction_price(&taker.orders[0], slot, 1, None)
-                    .unwrap();
+            let auction_price = crate::math::auction::calculate_auction_price(
+                &taker.orders[0],
+                slot,
+                1,
+                None,
+                false,
+            )
+            .unwrap();
             let baa = market.amm.order_step_size * 4;
 
             let (mark, ask, bid) = {
@@ -2551,7 +2720,7 @@ pub mod amm_lp_jit {
                     post_only: true,
                     order_type: OrderType::Limit,
                     direction: PositionDirection::Short,
-                    base_asset_amount: baa as u64,
+                    base_asset_amount: baa,
                     price: auction_price,
                     ..Order::default()
                 }),
@@ -2594,7 +2763,9 @@ pub mod amm_lp_jit {
                 now,
                 slot,
                 auction_duration,
-                true,
+                crate::state::perp_market::AMMAvailability::AfterMinDuration,
+                FillMode::Fill,
+                None,
             )
             .unwrap();
 
@@ -2699,17 +2870,11 @@ pub mod amm_lp_jit {
         market.amm.min_base_asset_reserve = 0;
 
         let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Long,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
         let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
-            crate::math::amm_spread::calculate_spread_reserves(
-                &market.amm,
-                PositionDirection::Short,
-            )
-            .unwrap();
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
         market.amm.ask_base_asset_reserve = new_ask_base_asset_reserve;
         market.amm.bid_base_asset_reserve = new_bid_base_asset_reserve;
         market.amm.ask_quote_asset_reserve = new_ask_quote_asset_reserve;
@@ -2813,9 +2978,14 @@ pub mod amm_lp_jit {
                 break;
             }
 
-            let auction_price =
-                crate::math::auction::calculate_auction_price(&taker.orders[0], slot, 1, None)
-                    .unwrap();
+            let auction_price = crate::math::auction::calculate_auction_price(
+                &taker.orders[0],
+                slot,
+                1,
+                None,
+                false,
+            )
+            .unwrap();
             let baa = 1000 * 4;
 
             let (mark, ask, bid) = {
@@ -2877,7 +3047,9 @@ pub mod amm_lp_jit {
                 now,
                 slot,
                 10,
-                true,
+                crate::state::perp_market::AMMAvailability::AfterMinDuration,
+                FillMode::Fill,
+                None,
             )
             .unwrap();
 
@@ -3107,7 +3279,9 @@ pub mod amm_lp_jit {
             now,
             slot,
             0,
-            true,
+            crate::state::perp_market::AMMAvailability::AfterMinDuration,
+            FillMode::Fill,
+            None,
         )
         .unwrap();
 

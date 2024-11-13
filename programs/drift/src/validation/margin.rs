@@ -3,12 +3,14 @@ use crate::math::constants::{
     LIQUIDATION_FEE_TO_MARGIN_PRECISION_RATIO, MAX_MARGIN_RATIO, MIN_MARGIN_RATIO,
     SPOT_IMF_PRECISION, SPOT_WEIGHT_PRECISION,
 };
-use crate::validate;
+use crate::{validate, HIGH_LEVERAGE_MIN_MARGIN_RATIO};
 use solana_program::msg;
 
 pub fn validate_margin(
     margin_ratio_initial: u32,
     margin_ratio_maintenance: u32,
+    high_leverage_margin_ratio_initial: u32,
+    high_leverage_margin_ratio_maintenance: u32,
     liquidation_fee: u32,
     max_spread: u32,
 ) -> DriftResult {
@@ -16,11 +18,47 @@ pub fn validate_margin(
         return Err(ErrorCode::InvalidMarginRatio);
     }
 
-    if margin_ratio_initial <= margin_ratio_maintenance {
+    if !(MIN_MARGIN_RATIO..=MAX_MARGIN_RATIO).contains(&margin_ratio_maintenance) {
         return Err(ErrorCode::InvalidMarginRatio);
     }
 
-    if !(MIN_MARGIN_RATIO..=MAX_MARGIN_RATIO).contains(&margin_ratio_maintenance) {
+    if high_leverage_margin_ratio_initial != 0 && high_leverage_margin_ratio_maintenance != 0 {
+        if margin_ratio_initial <= high_leverage_margin_ratio_initial {
+            return Err(ErrorCode::InvalidMarginRatio);
+        }
+
+        if margin_ratio_maintenance <= high_leverage_margin_ratio_maintenance {
+            return Err(ErrorCode::InvalidMarginRatio);
+        }
+
+        if high_leverage_margin_ratio_initial <= high_leverage_margin_ratio_maintenance {
+            return Err(ErrorCode::InvalidMarginRatio);
+        }
+
+        if !(HIGH_LEVERAGE_MIN_MARGIN_RATIO..=MAX_MARGIN_RATIO)
+            .contains(&high_leverage_margin_ratio_initial)
+        {
+            return Err(ErrorCode::InvalidMarginRatio);
+        }
+
+        if !(HIGH_LEVERAGE_MIN_MARGIN_RATIO..=MAX_MARGIN_RATIO)
+            .contains(&high_leverage_margin_ratio_maintenance)
+        {
+            return Err(ErrorCode::InvalidMarginRatio);
+        }
+
+        validate!(
+            high_leverage_margin_ratio_maintenance * LIQUIDATION_FEE_TO_MARGIN_PRECISION_RATIO
+                > liquidation_fee,
+            ErrorCode::InvalidMarginRatio,
+            "high_leverage_margin_ratio_maintenance must be greater than liquidation fee"
+        )?;
+    } else if high_leverage_margin_ratio_initial != 0 || high_leverage_margin_ratio_maintenance != 0
+    {
+        return Err(ErrorCode::InvalidMarginRatio);
+    }
+
+    if margin_ratio_initial <= margin_ratio_maintenance {
         return Err(ErrorCode::InvalidMarginRatio);
     }
 
@@ -33,7 +71,9 @@ pub fn validate_margin(
     validate!(
         margin_ratio_initial * 100 > max_spread,
         ErrorCode::InvalidMarginRatio,
-        "margin_ratio_initial must be greater than max_spread (or must lower max_spread first)"
+        "margin_ratio_initial ({}) must be greater than max_spread ({}) (or must lower max_spread first)",
+        margin_ratio_initial * 100,
+        max_spread
     )?;
 
     Ok(())

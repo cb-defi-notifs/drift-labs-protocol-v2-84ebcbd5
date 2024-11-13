@@ -3,67 +3,86 @@ import { EventEmitter } from 'events';
 import StrictEventEmitter from 'strict-event-emitter-types';
 import { DriftClient } from './driftClient';
 import {
+	HealthComponent,
+	HealthComponents,
 	isVariant,
 	MarginCategory,
 	Order,
-	UserAccount,
+	PerpMarketAccount,
 	PerpPosition,
 	SpotPosition,
-	isOneOfVariant,
-	PerpMarketAccount,
+	UserAccount,
+	UserStatus,
+	UserStatsAccount,
 } from './types';
-import { calculateEntryPrice, positionIsAvailable } from './math/position';
 import {
-	PRICE_PRECISION,
-	AMM_TO_QUOTE_PRECISION_RATIO,
-	ZERO,
-	TEN_THOUSAND,
-	BN_MAX,
-	QUOTE_PRECISION,
+	calculateEntryPrice,
+	calculateUnsettledFundingPnl,
+	positionIsAvailable,
+} from './math/position';
+import {
 	AMM_RESERVE_PRECISION,
-	MARGIN_PRECISION,
-	SPOT_MARKET_WEIGHT_PRECISION,
-	QUOTE_SPOT_MARKET_INDEX,
-	TEN,
-	OPEN_ORDER_MARGIN_REQUIREMENT,
-	FIVE_MINUTE,
+	AMM_RESERVE_PRECISION_EXP,
+	AMM_TO_QUOTE_PRECISION_RATIO,
 	BASE_PRECISION,
+	BN_MAX,
+	DUST_POSITION_SIZE,
+	FIVE_MINUTE,
+	MARGIN_PRECISION,
 	ONE,
+	OPEN_ORDER_MARGIN_REQUIREMENT,
+	PRICE_PRECISION,
+	QUOTE_PRECISION,
+	QUOTE_PRECISION_EXP,
+	QUOTE_SPOT_MARKET_INDEX,
+	SPOT_MARKET_WEIGHT_PRECISION,
+	GOV_SPOT_MARKET_INDEX,
+	TEN,
+	TEN_THOUSAND,
 	TWO,
+	ZERO,
+	FUEL_START_TS,
 } from './constants/numericConstants';
 import {
-	UserAccountSubscriber,
-	UserAccountEvents,
 	DataAndSlot,
+	UserAccountEvents,
+	UserAccountSubscriber,
 } from './accounts/types';
 import {
-	calculateReservePrice,
-	calculateBaseAssetValue,
-	calculatePositionFundingPNL,
-	calculatePositionPNL,
-	calculateUnrealizedAssetWeight,
-	calculateMarketMarginRatio,
-	PositionDirection,
+	BigNum,
 	BN,
-	SpotMarketAccount,
-	getTokenValue,
-	MarketType,
-	getStrictTokenValue,
+	calculateBaseAssetValue,
+	calculateMarketMarginRatio,
+	calculatePerpLiabilityValue,
+	calculatePositionPNL,
+	calculateReservePrice,
 	calculateSpotMarketMarginRatio,
-	getSignedTokenAmount,
-	SpotBalanceType,
-	sigNum,
+	calculateUnrealizedAssetWeight,
+	calculateWorstCasePerpLiabilityValue,
+	divCeil,
 	getBalance,
+	getSignedTokenAmount,
+	getStrictTokenValue,
+	getTokenValue,
+	getUser30dRollingVolumeEstimate,
+	MarketType,
+	PositionDirection,
+	sigNum,
+	SpotBalanceType,
+	SpotMarketAccount,
+	standardizeBaseAssetAmount,
 } from '.';
 import {
-	getTokenAmount,
 	calculateAssetWeight,
 	calculateLiabilityWeight,
 	calculateWithdrawLimit,
+	getTokenAmount,
 } from './math/spotBalance';
 import { calculateMarketOpenBidAsk } from './math/amm';
 import {
 	calculateBaseAssetValueWithOracle,
+	calculateCollateralDepositRequiredForTrade,
+	calculateMarginUSDCRequiredForTrade,
 	calculateWorstCaseBaseAssetAmount,
 } from './math/margin';
 import { OraclePriceData } from './oracles/types';
@@ -71,12 +90,20 @@ import { UserConfig } from './userConfig';
 import { PollingUserAccountSubscriber } from './accounts/pollingUserAccountSubscriber';
 import { WebSocketUserAccountSubscriber } from './accounts/webSocketUserAccountSubscriber';
 import {
+	calculateWeightedTokenValue,
 	getWorstCaseTokenAmounts,
 	isSpotPositionAvailable,
 } from './math/spotPosition';
-
 import { calculateLiveOracleTwap } from './math/oracles';
 import { getPerpMarketTierNumber, getSpotMarketTierNumber } from './math/tiers';
+import { StrictOraclePrice } from './oracles/strictOraclePrice';
+
+import {
+	calculateSpotFuelBonus,
+	calculatePerpFuelBonus,
+	calculateInsuranceFuelBonus,
+} from './math/fuel';
+import { grpcUserAccountSubscriber } from './accounts/grpcUserAccountSubscriber';
 
 export class User {
 	driftClient: DriftClient;
@@ -98,16 +125,34 @@ export class User {
 		this.userAccountPublicKey = config.userAccountPublicKey;
 		if (config.accountSubscription?.type === 'polling') {
 			this.accountSubscriber = new PollingUserAccountSubscriber(
-				config.driftClient.program,
+				config.driftClient.connection,
 				config.userAccountPublicKey,
-				config.accountSubscription.accountLoader
+				config.accountSubscription.accountLoader,
+				this.driftClient.program.account.user.coder.accounts.decodeUnchecked.bind(
+					this.driftClient.program.account.user.coder.accounts
+				)
 			);
 		} else if (config.accountSubscription?.type === 'custom') {
 			this.accountSubscriber = config.accountSubscription.userAccountSubscriber;
+		} else if (config.accountSubscription?.type === 'grpc') {
+			this.accountSubscriber = new grpcUserAccountSubscriber(
+				config.accountSubscription.grpcConfigs,
+				config.driftClient.program,
+				config.userAccountPublicKey,
+				{
+					resubTimeoutMs: config.accountSubscription?.resubTimeoutMs,
+					logResubMessages: config.accountSubscription?.logResubMessages,
+				}
+			);
 		} else {
 			this.accountSubscriber = new WebSocketUserAccountSubscriber(
 				config.driftClient.program,
-				config.userAccountPublicKey
+				config.userAccountPublicKey,
+				{
+					resubTimeoutMs: config.accountSubscription?.resubTimeoutMs,
+					logResubMessages: config.accountSubscription?.logResubMessages,
+				},
+				config.accountSubscription?.commitment
 			);
 		}
 		this.eventEmitter = this.accountSubscriber.eventEmitter;
@@ -147,13 +192,44 @@ export class User {
 		return this.accountSubscriber.getUserAccountAndSlot();
 	}
 
+	public getPerpPositionForUserAccount(
+		userAccount: UserAccount,
+		marketIndex: number
+	): PerpPosition | undefined {
+		return this.getActivePerpPositionsForUserAccount(userAccount).find(
+			(position) => position.marketIndex === marketIndex
+		);
+	}
+
 	/**
 	 * Gets the user's current position for a given perp market. If the user has no position returns undefined
 	 * @param marketIndex
 	 * @returns userPerpPosition
 	 */
 	public getPerpPosition(marketIndex: number): PerpPosition | undefined {
-		return this.getUserAccount().perpPositions.find(
+		const userAccount = this.getUserAccount();
+		return this.getPerpPositionForUserAccount(userAccount, marketIndex);
+	}
+
+	public getPerpPositionAndSlot(
+		marketIndex: number
+	): DataAndSlot<PerpPosition | undefined> {
+		const userAccount = this.getUserAccountAndSlot();
+		const perpPosition = this.getPerpPositionForUserAccount(
+			userAccount.data,
+			marketIndex
+		);
+		return {
+			data: perpPosition,
+			slot: userAccount.slot,
+		};
+	}
+
+	public getSpotPositionForUserAccount(
+		userAccount: UserAccount,
+		marketIndex: number
+	): SpotPosition | undefined {
+		return userAccount.spotPositions.find(
 			(position) => position.marketIndex === marketIndex
 		);
 	}
@@ -164,9 +240,22 @@ export class User {
 	 * @returns userSpotPosition
 	 */
 	public getSpotPosition(marketIndex: number): SpotPosition | undefined {
-		return this.getUserAccount().spotPositions.find(
-			(position) => position.marketIndex === marketIndex
+		const userAccount = this.getUserAccount();
+		return this.getSpotPositionForUserAccount(userAccount, marketIndex);
+	}
+
+	public getSpotPositionAndSlot(
+		marketIndex: number
+	): DataAndSlot<SpotPosition | undefined> {
+		const userAccount = this.getUserAccountAndSlot();
+		const spotPosition = this.getSpotPositionForUserAccount(
+			userAccount.data,
+			marketIndex
 		);
+		return {
+			data: spotPosition,
+			slot: userAccount.slot,
+		};
 	}
 
 	getEmptySpotPosition(marketIndex: number): SpotPosition {
@@ -219,6 +308,7 @@ export class User {
 			lpShares: ZERO,
 			lastBaseAssetAmountPerLp: ZERO,
 			lastQuoteAssetAmountPerLp: ZERO,
+			perLpBase: 0,
 		};
 	}
 
@@ -227,13 +317,37 @@ export class User {
 		return clonedPosition;
 	}
 
+	public getOrderForUserAccount(
+		userAccount: UserAccount,
+		orderId: number
+	): Order | undefined {
+		return userAccount.orders.find((order) => order.orderId === orderId);
+	}
+
 	/**
 	 * @param orderId
 	 * @returns Order
 	 */
 	public getOrder(orderId: number): Order | undefined {
-		return this.getUserAccount().orders.find(
-			(order) => order.orderId === orderId
+		const userAccount = this.getUserAccount();
+		return this.getOrderForUserAccount(userAccount, orderId);
+	}
+
+	public getOrderAndSlot(orderId: number): DataAndSlot<Order | undefined> {
+		const userAccount = this.getUserAccountAndSlot();
+		const order = this.getOrderForUserAccount(userAccount.data, orderId);
+		return {
+			data: order,
+			slot: userAccount.slot,
+		};
+	}
+
+	public getOrderByUserIdForUserAccount(
+		userAccount: UserAccount,
+		userOrderId: number
+	): Order | undefined {
+		return userAccount.orders.find(
+			(order) => order.userOrderId === userOrderId
 		);
 	}
 
@@ -242,15 +356,42 @@ export class User {
 	 * @returns Order
 	 */
 	public getOrderByUserOrderId(userOrderId: number): Order | undefined {
-		return this.getUserAccount().orders.find(
-			(order) => order.userOrderId === userOrderId
+		const userAccount = this.getUserAccount();
+		return this.getOrderByUserIdForUserAccount(userAccount, userOrderId);
+	}
+
+	public getOrderByUserOrderIdAndSlot(
+		userOrderId: number
+	): DataAndSlot<Order | undefined> {
+		const userAccount = this.getUserAccountAndSlot();
+		const order = this.getOrderByUserIdForUserAccount(
+			userAccount.data,
+			userOrderId
+		);
+		return {
+			data: order,
+			slot: userAccount.slot,
+		};
+	}
+
+	public getOpenOrdersForUserAccount(userAccount?: UserAccount): Order[] {
+		return userAccount?.orders.filter((order) =>
+			isVariant(order.status, 'open')
 		);
 	}
 
 	public getOpenOrders(): Order[] {
-		return this.getUserAccount()?.orders.filter((order) =>
-			isVariant(order.status, 'open')
-		);
+		const userAccount = this.getUserAccount();
+		return this.getOpenOrdersForUserAccount(userAccount);
+	}
+
+	public getOpenOrdersAndSlot(): DataAndSlot<Order[]> {
+		const userAccount = this.getUserAccountAndSlot();
+		const openOrders = this.getOpenOrdersForUserAccount(userAccount.data);
+		return {
+			data: openOrders,
+			slot: userAccount.slot,
+		};
 	}
 
 	public getUserAccountPublicKey(): PublicKey {
@@ -283,12 +424,16 @@ export class User {
 
 	/**
 	 * calculates the open bids and asks for an lp
+	 * optionally pass in lpShares to see what bid/asks a user *would* take on
 	 * @returns : lp open bids
 	 * @returns : lp open asks
 	 */
-	public getLPBidAsks(marketIndex: number): [BN, BN] {
+	public getLPBidAsks(marketIndex: number, lpShares?: BN): [BN, BN] {
 		const position = this.getPerpPosition(marketIndex);
-		if (position === undefined || position.lpShares.eq(ZERO)) {
+
+		const lpSharesToCalc = lpShares ?? position?.lpShares;
+
+		if (!lpSharesToCalc || lpSharesToCalc.eq(ZERO)) {
 			return [ZERO, ZERO];
 		}
 
@@ -300,12 +445,8 @@ export class User {
 			market.amm.orderStepSize
 		);
 
-		const lpOpenBids = marketOpenBids
-			.mul(position.lpShares)
-			.div(market.amm.sqrtK);
-		const lpOpenAsks = marketOpenAsks
-			.mul(position.lpShares)
-			.div(market.amm.sqrtK);
+		const lpOpenBids = marketOpenBids.mul(lpSharesToCalc).div(market.amm.sqrtK);
+		const lpOpenAsks = marketOpenAsks.mul(lpSharesToCalc).div(market.amm.sqrtK);
 
 		return [lpOpenBids, lpOpenAsks];
 	}
@@ -318,7 +459,9 @@ export class User {
 	 */
 	public getPerpPositionWithLPSettle(
 		marketIndex: number,
-		originalPosition?: PerpPosition
+		originalPosition?: PerpPosition,
+		burnLpShares = false,
+		includeRemainderInBaseAmount = false
 	): [PerpPosition, BN, BN] {
 		originalPosition =
 			originalPosition ??
@@ -330,18 +473,62 @@ export class User {
 		}
 
 		const position = this.getClonedPosition(originalPosition);
-
 		const market = this.driftClient.getPerpMarketAccount(position.marketIndex);
+
+		if (market.amm.perLpBase != position.perLpBase) {
+			// perLpBase = 1 => per 10 LP shares, perLpBase = -1 => per 0.1 LP shares
+			const expoDiff = market.amm.perLpBase - position.perLpBase;
+			const marketPerLpRebaseScalar = new BN(10 ** Math.abs(expoDiff));
+
+			if (expoDiff > 0) {
+				position.lastBaseAssetAmountPerLp =
+					position.lastBaseAssetAmountPerLp.mul(marketPerLpRebaseScalar);
+				position.lastQuoteAssetAmountPerLp =
+					position.lastQuoteAssetAmountPerLp.mul(marketPerLpRebaseScalar);
+			} else {
+				position.lastBaseAssetAmountPerLp =
+					position.lastBaseAssetAmountPerLp.div(marketPerLpRebaseScalar);
+				position.lastQuoteAssetAmountPerLp =
+					position.lastQuoteAssetAmountPerLp.div(marketPerLpRebaseScalar);
+			}
+
+			position.perLpBase = position.perLpBase + expoDiff;
+		}
+
 		const nShares = position.lpShares;
+
+		// incorp unsettled funding on pre settled position
+		const quoteFundingPnl = calculateUnsettledFundingPnl(market, position);
+
+		let baseUnit = AMM_RESERVE_PRECISION;
+		if (market.amm.perLpBase == position.perLpBase) {
+			if (
+				position.perLpBase >= 0 &&
+				position.perLpBase <= AMM_RESERVE_PRECISION_EXP.toNumber()
+			) {
+				const marketPerLpRebase = new BN(10 ** market.amm.perLpBase);
+				baseUnit = baseUnit.mul(marketPerLpRebase);
+			} else if (
+				position.perLpBase < 0 &&
+				position.perLpBase >= -AMM_RESERVE_PRECISION_EXP.toNumber()
+			) {
+				const marketPerLpRebase = new BN(10 ** Math.abs(market.amm.perLpBase));
+				baseUnit = baseUnit.div(marketPerLpRebase);
+			} else {
+				throw 'cannot calc';
+			}
+		} else {
+			throw 'market.amm.perLpBase != position.perLpBase';
+		}
 
 		const deltaBaa = market.amm.baseAssetAmountPerLp
 			.sub(position.lastBaseAssetAmountPerLp)
 			.mul(nShares)
-			.div(AMM_RESERVE_PRECISION);
+			.div(baseUnit);
 		const deltaQaa = market.amm.quoteAssetAmountPerLp
 			.sub(position.lastQuoteAssetAmountPerLp)
 			.mul(nShares)
-			.div(AMM_RESERVE_PRECISION);
+			.div(baseUnit);
 
 		function sign(v: BN) {
 			return v.isNeg() ? new BN(-1) : new BN(1);
@@ -371,6 +558,17 @@ export class User {
 			position.baseAssetAmount =
 				position.baseAssetAmount.add(newStandardizedBaa);
 			position.remainderBaseAssetAmount = newRemainderBaa.toNumber();
+		}
+
+		let dustBaseAssetValue = ZERO;
+		if (burnLpShares && position.remainderBaseAssetAmount != 0) {
+			const oraclePriceData = this.driftClient.getOracleDataForPerpMarket(
+				position.marketIndex
+			);
+			dustBaseAssetValue = new BN(Math.abs(position.remainderBaseAssetAmount))
+				.mul(oraclePriceData.price)
+				.div(AMM_RESERVE_PRECISION)
+				.add(ONE);
 		}
 
 		let updateType;
@@ -406,8 +604,32 @@ export class User {
 		}
 		position.quoteEntryAmount = newQuoteEntry;
 		position.baseAssetAmount = position.baseAssetAmount.add(standardizedBaa);
-		position.quoteAssetAmount = position.quoteAssetAmount.add(deltaQaa);
+		position.quoteAssetAmount = position.quoteAssetAmount
+			.add(deltaQaa)
+			.add(quoteFundingPnl)
+			.sub(dustBaseAssetValue);
+		position.quoteBreakEvenAmount = position.quoteBreakEvenAmount
+			.add(deltaQaa)
+			.add(quoteFundingPnl)
+			.sub(dustBaseAssetValue);
 
+		// update open bids/asks
+		const [marketOpenBids, marketOpenAsks] = calculateMarketOpenBidAsk(
+			market.amm.baseAssetReserve,
+			market.amm.minBaseAssetReserve,
+			market.amm.maxBaseAssetReserve,
+			market.amm.orderStepSize
+		);
+		const lpOpenBids = marketOpenBids
+			.mul(position.lpShares)
+			.div(market.amm.sqrtK);
+		const lpOpenAsks = marketOpenAsks
+			.mul(position.lpShares)
+			.div(market.amm.sqrtK);
+		position.openBids = lpOpenBids.add(position.openBids);
+		position.openAsks = lpOpenAsks.add(position.openAsks);
+
+		// eliminate counting funding on settled position
 		if (position.baseAssetAmount.gt(ZERO)) {
 			position.lastCumulativeFundingRate = market.amm.cumulativeFundingRateLong;
 		} else if (position.baseAssetAmount.lt(ZERO)) {
@@ -417,20 +639,40 @@ export class User {
 			position.lastCumulativeFundingRate = ZERO;
 		}
 
-		return [position, remainderBaa, pnl];
+		const remainderBeforeRemoval = new BN(position.remainderBaseAssetAmount);
+
+		if (includeRemainderInBaseAmount) {
+			position.baseAssetAmount = position.baseAssetAmount.add(
+				remainderBeforeRemoval
+			);
+			position.remainderBaseAssetAmount = 0;
+		}
+
+		return [position, remainderBeforeRemoval, pnl];
 	}
 
 	/**
 	 * calculates Buying Power = free collateral / initial margin ratio
 	 * @returns : Precision QUOTE_PRECISION
 	 */
-	public getPerpBuyingPower(marketIndex: number): BN {
-		const perpPosition = this.getPerpPosition(marketIndex);
+	public getPerpBuyingPower(marketIndex: number, collateralBuffer = ZERO): BN {
+		const perpPosition = this.getPerpPositionWithLPSettle(
+			marketIndex,
+			undefined,
+			true
+		)[0];
+
+		const perpMarket = this.driftClient.getPerpMarketAccount(marketIndex);
+		const oraclePriceData = this.getOracleDataForPerpMarket(marketIndex);
 		const worstCaseBaseAssetAmount = perpPosition
-			? calculateWorstCaseBaseAssetAmount(perpPosition)
+			? calculateWorstCaseBaseAssetAmount(
+					perpPosition,
+					perpMarket,
+					oraclePriceData.price
+			  )
 			: ZERO;
 
-		const freeCollateral = this.getFreeCollateral();
+		const freeCollateral = this.getFreeCollateral().sub(collateralBuffer);
 
 		return this.getPerpBuyingPowerFromFreeCollateralAndBaseAssetAmount(
 			marketIndex,
@@ -447,20 +689,25 @@ export class User {
 		const marginRatio = calculateMarketMarginRatio(
 			this.driftClient.getPerpMarketAccount(marketIndex),
 			baseAssetAmount,
-			'Initial'
+			'Initial',
+			this.getUserAccount().maxMarginRatio,
+			this.isHighLeverageMode()
 		);
 
 		return freeCollateral.mul(MARGIN_PRECISION).div(new BN(marginRatio));
 	}
 
 	/**
-	 * calculates Free Collateral = Total collateral - initial margin requirement
+	 * calculates Free Collateral = Total collateral - margin requirement
 	 * @returns : Precision QUOTE_PRECISION
 	 */
-	public getFreeCollateral(): BN {
-		const totalCollateral = this.getTotalCollateral('Initial', true);
-		const initialMarginRequirement = this.getInitialMarginRequirement();
-		const freeCollateral = totalCollateral.sub(initialMarginRequirement);
+	public getFreeCollateral(marginCategory: MarginCategory = 'Initial'): BN {
+		const totalCollateral = this.getTotalCollateral(marginCategory, true);
+		const marginRequirement =
+			marginCategory === 'Initial'
+				? this.getInitialMarginRequirement()
+				: this.getMaintenanceMarginRequirement();
+		const freeCollateral = totalCollateral.sub(marginRequirement);
 		return freeCollateral.gte(ZERO) ? freeCollateral : ZERO;
 	}
 
@@ -470,19 +717,20 @@ export class User {
 	public getMarginRequirement(
 		marginCategory: MarginCategory,
 		liquidationBuffer?: BN,
-		strict = false
+		strict = false,
+		includeOpenOrders = true
 	): BN {
-		return this.getTotalPerpPositionValue(
+		return this.getTotalPerpPositionLiability(
 			marginCategory,
 			liquidationBuffer,
-			true,
+			includeOpenOrders,
 			strict
 		).add(
 			this.getSpotMarketLiabilityValue(
 				undefined,
 				marginCategory,
 				liquidationBuffer,
-				true,
+				includeOpenOrders,
 				strict
 			)
 		);
@@ -498,12 +746,22 @@ export class User {
 	/**
 	 * @returns The maintenance margin requirement in USDC. : QUOTE_PRECISION
 	 */
-	public getMaintenanceMarginRequirement(liquidationBuffer?: BN): BN {
+	public getMaintenanceMarginRequirement(): BN {
+		// if user being liq'd, can continue to be liq'd until total collateral above the margin requirement plus buffer
+		let liquidationBuffer = undefined;
+		if (this.isBeingLiquidated()) {
+			liquidationBuffer = new BN(
+				this.driftClient.getStateAccount().liquidationMarginBufferRatio
+			);
+		}
+
 		return this.getMarginRequirement('Maintenance', liquidationBuffer);
 	}
 
-	public getActivePerpPositions(): PerpPosition[] {
-		return this.getUserAccount().perpPositions.filter(
+	public getActivePerpPositionsForUserAccount(
+		userAccount: UserAccount
+	): PerpPosition[] {
+		return userAccount.perpPositions.filter(
 			(pos) =>
 				!pos.baseAssetAmount.eq(ZERO) ||
 				!pos.quoteAssetAmount.eq(ZERO) ||
@@ -512,10 +770,42 @@ export class User {
 		);
 	}
 
-	public getActiveSpotPositions(): SpotPosition[] {
-		return this.getUserAccount().spotPositions.filter(
+	public getActivePerpPositions(): PerpPosition[] {
+		const userAccount = this.getUserAccount();
+		return this.getActivePerpPositionsForUserAccount(userAccount);
+	}
+	public getActivePerpPositionsAndSlot(): DataAndSlot<PerpPosition[]> {
+		const userAccount = this.getUserAccountAndSlot();
+		const positions = this.getActivePerpPositionsForUserAccount(
+			userAccount.data
+		);
+		return {
+			data: positions,
+			slot: userAccount.slot,
+		};
+	}
+
+	public getActiveSpotPositionsForUserAccount(
+		userAccount: UserAccount
+	): SpotPosition[] {
+		return userAccount.spotPositions.filter(
 			(pos) => !isSpotPositionAvailable(pos)
 		);
+	}
+
+	public getActiveSpotPositions(): SpotPosition[] {
+		const userAccount = this.getUserAccount();
+		return this.getActiveSpotPositionsForUserAccount(userAccount);
+	}
+	public getActiveSpotPositionsAndSlot(): DataAndSlot<SpotPosition[]> {
+		const userAccount = this.getUserAccountAndSlot();
+		const positions = this.getActiveSpotPositionsForUserAccount(
+			userAccount.data
+		);
+		return {
+			data: positions,
+			slot: userAccount.slot,
+		};
 	}
 
 	/**
@@ -529,7 +819,9 @@ export class User {
 		strict = false
 	): BN {
 		return this.getActivePerpPositions()
-			.filter((pos) => (marketIndex ? pos.marketIndex === marketIndex : true))
+			.filter((pos) =>
+				marketIndex !== undefined ? pos.marketIndex === marketIndex : true
+			)
 			.reduce((unrealizedPnl, perpPosition) => {
 				const market = this.driftClient.getPerpMarketAccount(
 					perpPosition.marketIndex
@@ -547,7 +839,9 @@ export class User {
 
 				if (perpPosition.lpShares.gt(ZERO)) {
 					perpPosition = this.getPerpPositionWithLPSettle(
-						perpPosition.marketIndex
+						perpPosition.marketIndex,
+						undefined,
+						!!withWeightMarginCategory
 					)[0];
 				}
 
@@ -575,7 +869,7 @@ export class User {
 
 				positionUnrealizedPnl = positionUnrealizedPnl
 					.mul(quotePrice)
-					.div(new BN(PRICE_PRECISION));
+					.div(PRICE_PRECISION);
 
 				if (withWeightMarginCategory !== undefined) {
 					if (positionUnrealizedPnl.gt(ZERO)) {
@@ -604,14 +898,183 @@ export class User {
 	public getUnrealizedFundingPNL(marketIndex?: number): BN {
 		return this.getUserAccount()
 			.perpPositions.filter((pos) =>
-				marketIndex ? pos.marketIndex === marketIndex : true
+				marketIndex !== undefined ? pos.marketIndex === marketIndex : true
 			)
 			.reduce((pnl, perpPosition) => {
 				const market = this.driftClient.getPerpMarketAccount(
 					perpPosition.marketIndex
 				);
-				return pnl.add(calculatePositionFundingPNL(market, perpPosition));
+				return pnl.add(calculateUnsettledFundingPnl(market, perpPosition));
 			}, ZERO);
+	}
+
+	public getFuelBonus(
+		now: BN,
+		includeSettled = true,
+		includeUnsettled = true
+	): {
+		depositFuel: BN;
+		borrowFuel: BN;
+		positionFuel: BN;
+		takerFuel: BN;
+		makerFuel: BN;
+		insuranceFuel: BN;
+	} {
+		const userAccount: UserAccount = this.getUserAccount();
+
+		const result = {
+			insuranceFuel: ZERO,
+			takerFuel: ZERO,
+			makerFuel: ZERO,
+			depositFuel: ZERO,
+			borrowFuel: ZERO,
+			positionFuel: ZERO,
+		};
+
+		if (includeSettled) {
+			const userStats: UserStatsAccount = this.driftClient
+				.getUserStats()
+				.getAccount();
+			result.insuranceFuel = result.insuranceFuel.add(
+				new BN(userStats.fuelInsurance)
+			);
+			result.takerFuel = result.takerFuel.add(new BN(userStats.fuelTaker));
+			result.makerFuel = result.makerFuel.add(new BN(userStats.fuelMaker));
+			result.depositFuel = result.depositFuel.add(
+				new BN(userStats.fuelDeposits)
+			);
+			result.borrowFuel = result.borrowFuel.add(new BN(userStats.fuelBorrows));
+			result.positionFuel = result.positionFuel.add(
+				new BN(userStats.fuelPositions)
+			);
+		}
+
+		if (includeUnsettled) {
+			const fuelBonusNumerator = BN.max(
+				now.sub(
+					BN.max(new BN(userAccount.lastFuelBonusUpdateTs), FUEL_START_TS)
+				),
+				ZERO
+			);
+
+			if (fuelBonusNumerator.gt(ZERO)) {
+				for (const spotPosition of this.getActiveSpotPositions()) {
+					const spotMarketAccount: SpotMarketAccount =
+						this.driftClient.getSpotMarketAccount(spotPosition.marketIndex);
+
+					const tokenAmount = this.getTokenAmount(spotPosition.marketIndex);
+					const oraclePriceData = this.getOracleDataForSpotMarket(
+						spotPosition.marketIndex
+					);
+
+					const twap5min = calculateLiveOracleTwap(
+						spotMarketAccount.historicalOracleData,
+						oraclePriceData,
+						now,
+						FIVE_MINUTE // 5MIN
+					);
+					const strictOraclePrice = new StrictOraclePrice(
+						oraclePriceData.price,
+						twap5min
+					);
+
+					const signedTokenValue = getStrictTokenValue(
+						tokenAmount,
+						spotMarketAccount.decimals,
+						strictOraclePrice
+					);
+
+					if (signedTokenValue.gt(ZERO)) {
+						result.depositFuel = result.depositFuel.add(
+							calculateSpotFuelBonus(
+								spotMarketAccount,
+								signedTokenValue,
+								fuelBonusNumerator
+							)
+						);
+					} else {
+						result.borrowFuel = result.borrowFuel.add(
+							calculateSpotFuelBonus(
+								spotMarketAccount,
+								signedTokenValue,
+								fuelBonusNumerator
+							)
+						);
+					}
+				}
+
+				for (const perpPosition of this.getActivePerpPositions()) {
+					const oraclePriceData = this.getOracleDataForPerpMarket(
+						perpPosition.marketIndex
+					);
+
+					const perpMarketAccount = this.driftClient.getPerpMarketAccount(
+						perpPosition.marketIndex
+					);
+
+					const baseAssetValue = this.getPerpPositionValue(
+						perpPosition.marketIndex,
+						oraclePriceData,
+						false
+					);
+
+					result.positionFuel = result.positionFuel.add(
+						calculatePerpFuelBonus(
+							perpMarketAccount,
+							baseAssetValue,
+							fuelBonusNumerator
+						)
+					);
+				}
+			}
+
+			const userStats: UserStatsAccount = this.driftClient
+				.getUserStats()
+				.getAccount();
+
+			// todo: get real time ifStakedGovTokenAmount using ifStakeAccount
+			if (userStats.ifStakedGovTokenAmount.gt(ZERO)) {
+				const spotMarketAccount: SpotMarketAccount =
+					this.driftClient.getSpotMarketAccount(GOV_SPOT_MARKET_INDEX);
+
+				const fuelBonusNumeratorUserStats = BN.max(
+					now.sub(
+						BN.max(new BN(userStats.lastFuelIfBonusUpdateTs), FUEL_START_TS)
+					),
+					ZERO
+				);
+
+				result.insuranceFuel = result.insuranceFuel.add(
+					calculateInsuranceFuelBonus(
+						spotMarketAccount,
+						userStats.ifStakedGovTokenAmount,
+						fuelBonusNumeratorUserStats
+					)
+				);
+			}
+
+			if (userStats.ifStakedQuoteAssetAmount.gt(ZERO)) {
+				const spotMarketAccount: SpotMarketAccount =
+					this.driftClient.getSpotMarketAccount(QUOTE_SPOT_MARKET_INDEX);
+
+				const fuelBonusNumeratorUserStats = BN.max(
+					now.sub(
+						BN.max(new BN(userStats.lastFuelIfBonusUpdateTs), FUEL_START_TS)
+					),
+					ZERO
+				);
+
+				result.insuranceFuel = result.insuranceFuel.add(
+					calculateInsuranceFuelBonus(
+						spotMarketAccount,
+						userStats.ifStakedQuoteAssetAmount,
+						fuelBonusNumeratorUserStats
+					)
+				);
+			}
+		}
+
+		return result;
 	}
 
 	public getSpotMarketAssetAndLiabilityValue(
@@ -648,6 +1111,20 @@ export class User {
 				spotPosition.marketIndex
 			);
 
+			let twap5min;
+			if (strict) {
+				twap5min = calculateLiveOracleTwap(
+					spotMarketAccount.historicalOracleData,
+					oraclePriceData,
+					now,
+					FIVE_MINUTE // 5MIN
+				);
+			}
+			const strictOraclePrice = new StrictOraclePrice(
+				oraclePriceData.price,
+				twap5min
+			);
+
 			if (
 				spotPosition.marketIndex === QUOTE_SPOT_MARKET_INDEX &&
 				countForQuote
@@ -664,23 +1141,19 @@ export class User {
 				if (isVariant(spotPosition.balanceType, 'borrow')) {
 					const weightedTokenValue = this.getSpotLiabilityValue(
 						tokenAmount,
-						oraclePriceData,
+						strictOraclePrice,
 						spotMarketAccount,
 						marginCategory,
-						liquidationBuffer,
-						strict,
-						now
+						liquidationBuffer
 					).abs();
 
 					netQuoteValue = netQuoteValue.sub(weightedTokenValue);
 				} else {
 					const weightedTokenValue = this.getSpotAssetValue(
 						tokenAmount,
-						oraclePriceData,
+						strictOraclePrice,
 						spotMarketAccount,
-						marginCategory,
-						strict,
-						now
+						marginCategory
 					);
 
 					netQuoteValue = netQuoteValue.add(weightedTokenValue);
@@ -701,12 +1174,10 @@ export class User {
 					);
 					const liabilityValue = this.getSpotLiabilityValue(
 						tokenAmount,
-						oraclePriceData,
+						strictOraclePrice,
 						spotMarketAccount,
 						marginCategory,
-						liquidationBuffer,
-						strict,
-						now
+						liquidationBuffer
 					).abs();
 					totalLiabilityValue = totalLiabilityValue.add(liabilityValue);
 
@@ -719,11 +1190,9 @@ export class User {
 					);
 					const assetValue = this.getSpotAssetValue(
 						tokenAmount,
-						oraclePriceData,
+						strictOraclePrice,
 						spotMarketAccount,
-						marginCategory,
-						strict,
-						now
+						marginCategory
 					);
 					totalAssetValue = totalAssetValue.add(assetValue);
 
@@ -731,21 +1200,23 @@ export class User {
 				}
 			}
 
-			const [worstCaseTokenAmount, worstCaseQuoteTokenAmount] =
-				getWorstCaseTokenAmounts(
-					spotPosition,
-					spotMarketAccount,
-					this.getOracleDataForSpotMarket(spotPosition.marketIndex)
-				);
+			const {
+				tokenAmount: worstCaseTokenAmount,
+				ordersValue: worstCaseQuoteTokenAmount,
+			} = getWorstCaseTokenAmounts(
+				spotPosition,
+				spotMarketAccount,
+				strictOraclePrice,
+				marginCategory,
+				this.getUserAccount().maxMarginRatio
+			);
 
 			if (worstCaseTokenAmount.gt(ZERO) && countForBase) {
 				const baseAssetValue = this.getSpotAssetValue(
 					worstCaseTokenAmount,
-					oraclePriceData,
+					strictOraclePrice,
 					spotMarketAccount,
-					marginCategory,
-					strict,
-					now
+					marginCategory
 				);
 
 				totalAssetValue = totalAssetValue.add(baseAssetValue);
@@ -754,12 +1225,10 @@ export class User {
 			if (worstCaseTokenAmount.lt(ZERO) && countForBase) {
 				const baseLiabilityValue = this.getSpotLiabilityValue(
 					worstCaseTokenAmount,
-					oraclePriceData,
+					strictOraclePrice,
 					spotMarketAccount,
 					marginCategory,
-					liquidationBuffer,
-					strict,
-					now
+					liquidationBuffer
 				).abs();
 
 				totalLiabilityValue = totalLiabilityValue.add(baseLiabilityValue);
@@ -820,35 +1289,16 @@ export class User {
 
 	getSpotLiabilityValue(
 		tokenAmount: BN,
-		oraclePriceData: OraclePriceData,
+		strictOraclePrice: StrictOraclePrice,
 		spotMarketAccount: SpotMarketAccount,
 		marginCategory?: MarginCategory,
-		liquidationBuffer?: BN,
-		strict = false,
-		now?: BN
+		liquidationBuffer?: BN
 	): BN {
-		let liabilityValue = null;
-
-		if (strict) {
-			const estOracleTwap = calculateLiveOracleTwap(
-				spotMarketAccount.historicalOracleData,
-				oraclePriceData,
-				now,
-				FIVE_MINUTE // 5MIN
-			);
-			liabilityValue = getStrictTokenValue(
-				tokenAmount,
-				spotMarketAccount.decimals,
-				oraclePriceData,
-				estOracleTwap
-			);
-		} else {
-			liabilityValue = getTokenValue(
-				tokenAmount,
-				spotMarketAccount.decimals,
-				oraclePriceData
-			);
-		}
+		let liabilityValue = getStrictTokenValue(
+			tokenAmount,
+			spotMarketAccount.decimals,
+			strictOraclePrice
+		);
 
 		if (marginCategory !== undefined) {
 			let weight = calculateLiabilityWeight(
@@ -857,8 +1307,16 @@ export class User {
 				marginCategory
 			);
 
-			if (marginCategory === 'Initial') {
-				weight = BN.max(weight, new BN(this.getUserAccount().maxMarginRatio));
+			if (
+				marginCategory === 'Initial' &&
+				spotMarketAccount.marketIndex !== QUOTE_SPOT_MARKET_INDEX
+			) {
+				weight = BN.max(
+					weight,
+					SPOT_MARKET_WEIGHT_PRECISION.addn(
+						this.getUserAccount().maxMarginRatio
+					)
+				);
 			}
 
 			if (liquidationBuffer !== undefined) {
@@ -893,40 +1351,36 @@ export class User {
 
 	getSpotAssetValue(
 		tokenAmount: BN,
-		oraclePriceData: OraclePriceData,
+		strictOraclePrice: StrictOraclePrice,
 		spotMarketAccount: SpotMarketAccount,
-		marginCategory?: MarginCategory,
-		strict = false,
-		now?: BN
+		marginCategory?: MarginCategory
 	): BN {
-		let assetValue = null;
-		if (strict) {
-			const estOracleTwap = calculateLiveOracleTwap(
-				spotMarketAccount.historicalOracleData,
-				oraclePriceData,
-				now,
-				FIVE_MINUTE // 5MIN
-			);
-			assetValue = getStrictTokenValue(
-				tokenAmount,
-				spotMarketAccount.decimals,
-				oraclePriceData,
-				estOracleTwap
-			);
-		} else {
-			assetValue = getTokenValue(
-				tokenAmount,
-				spotMarketAccount.decimals,
-				oraclePriceData
-			);
-		}
+		let assetValue = getStrictTokenValue(
+			tokenAmount,
+			spotMarketAccount.decimals,
+			strictOraclePrice
+		);
 
 		if (marginCategory !== undefined) {
-			const weight = calculateAssetWeight(
+			let weight = calculateAssetWeight(
 				tokenAmount,
+				strictOraclePrice.current,
 				spotMarketAccount,
 				marginCategory
 			);
+
+			if (
+				marginCategory === 'Initial' &&
+				spotMarketAccount.marketIndex !== QUOTE_SPOT_MARKET_INDEX
+			) {
+				const userCustomAssetWeight = BN.max(
+					ZERO,
+					SPOT_MARKET_WEIGHT_PRECISION.subn(
+						this.getUserAccount().maxMarginRatio
+					)
+				);
+				weight = BN.min(weight, userCustomAssetWeight);
+			}
 
 			assetValue = assetValue.mul(weight).div(SPOT_MARKET_WEIGHT_PRECISION);
 		}
@@ -985,12 +1439,7 @@ export class User {
 	 * @returns : number (value from [0, 100])
 	 */
 	public getHealth(): number {
-		const userAccount = this.getUserAccount();
-
-		if (
-			isVariant(userAccount.status, 'beingLiquidated') ||
-			isVariant(userAccount.status, 'bankrupt')
-		) {
+		if (this.isBeingLiquidated()) {
 			return 0;
 		}
 
@@ -1004,29 +1453,160 @@ export class User {
 		} else if (totalCollateral.lte(ZERO)) {
 			health = 0;
 		} else {
-			const healthP1 =
-				Math.max(
-					0,
-					(1 - maintenanceMarginReq.toNumber() / totalCollateral.toNumber()) *
-						100
-				) + 1;
-
-			health = Math.min(1, Math.log(healthP1) / Math.log(100)) * 100;
-			if (health > 1) {
-				health = Math.round(health);
-			} else {
-				health = Math.round(health * 100) / 100;
-			}
+			health = Math.round(
+				Math.min(
+					100,
+					Math.max(
+						0,
+						(1 - maintenanceMarginReq.toNumber() / totalCollateral.toNumber()) *
+							100
+					)
+				)
+			);
 		}
 
 		return health;
+	}
+
+	calculateWeightedPerpPositionLiability(
+		perpPosition: PerpPosition,
+		marginCategory?: MarginCategory,
+		liquidationBuffer?: BN,
+		includeOpenOrders?: boolean,
+		strict = false
+	): BN {
+		const market = this.driftClient.getPerpMarketAccount(
+			perpPosition.marketIndex
+		);
+
+		if (perpPosition.lpShares.gt(ZERO)) {
+			// is an lp, clone so we dont mutate the position
+			perpPosition = this.getPerpPositionWithLPSettle(
+				market.marketIndex,
+				this.getClonedPosition(perpPosition),
+				!!marginCategory
+			)[0];
+		}
+
+		let valuationPrice = this.getOracleDataForPerpMarket(
+			market.marketIndex
+		).price;
+
+		if (isVariant(market.status, 'settlement')) {
+			valuationPrice = market.expiryPrice;
+		}
+
+		let baseAssetAmount: BN;
+		let liabilityValue;
+		if (includeOpenOrders) {
+			const { worstCaseBaseAssetAmount, worstCaseLiabilityValue } =
+				calculateWorstCasePerpLiabilityValue(
+					perpPosition,
+					market,
+					valuationPrice
+				);
+			baseAssetAmount = worstCaseBaseAssetAmount;
+			liabilityValue = worstCaseLiabilityValue;
+		} else {
+			baseAssetAmount = perpPosition.baseAssetAmount;
+			liabilityValue = calculatePerpLiabilityValue(
+				baseAssetAmount,
+				valuationPrice,
+				isVariant(market.contractType, 'prediction')
+			);
+		}
+
+		if (marginCategory) {
+			let marginRatio = new BN(
+				calculateMarketMarginRatio(
+					market,
+					baseAssetAmount.abs(),
+					marginCategory,
+					this.getUserAccount().maxMarginRatio,
+					this.isHighLeverageMode()
+				)
+			);
+
+			if (liquidationBuffer !== undefined) {
+				marginRatio = marginRatio.add(liquidationBuffer);
+			}
+
+			if (isVariant(market.status, 'settlement')) {
+				marginRatio = ZERO;
+			}
+
+			const quoteSpotMarket = this.driftClient.getSpotMarketAccount(
+				market.quoteSpotMarketIndex
+			);
+			const quoteOraclePriceData = this.driftClient.getOracleDataForSpotMarket(
+				QUOTE_SPOT_MARKET_INDEX
+			);
+
+			let quotePrice;
+			if (strict) {
+				quotePrice = BN.max(
+					quoteOraclePriceData.price,
+					quoteSpotMarket.historicalOracleData.lastOraclePriceTwap5Min
+				);
+			} else {
+				quotePrice = quoteOraclePriceData.price;
+			}
+
+			liabilityValue = liabilityValue
+				.mul(quotePrice)
+				.div(PRICE_PRECISION)
+				.mul(marginRatio)
+				.div(MARGIN_PRECISION);
+
+			if (includeOpenOrders) {
+				liabilityValue = liabilityValue.add(
+					new BN(perpPosition.openOrders).mul(OPEN_ORDER_MARGIN_REQUIREMENT)
+				);
+
+				if (perpPosition.lpShares.gt(ZERO)) {
+					liabilityValue = liabilityValue.add(
+						BN.max(
+							QUOTE_PRECISION,
+							valuationPrice
+								.mul(market.amm.orderStepSize)
+								.mul(QUOTE_PRECISION)
+								.div(AMM_RESERVE_PRECISION)
+								.div(PRICE_PRECISION)
+						)
+					);
+				}
+			}
+		}
+
+		return liabilityValue;
+	}
+
+	/**
+	 * calculates position value of a single perp market in margin system
+	 * @returns : Precision QUOTE_PRECISION
+	 */
+	public getPerpMarketLiabilityValue(
+		marketIndex: number,
+		marginCategory?: MarginCategory,
+		liquidationBuffer?: BN,
+		includeOpenOrders?: boolean,
+		strict = false
+	): BN {
+		const perpPosition = this.getPerpPosition(marketIndex);
+		return this.calculateWeightedPerpPositionLiability(
+			perpPosition,
+			marginCategory,
+			liquidationBuffer,
+			includeOpenOrders,
+			strict
+		);
 	}
 
 	/**
 	 * calculates sum of position value across all positions in margin system
 	 * @returns : Precision QUOTE_PRECISION
 	 */
-	getTotalPerpPositionValue(
+	getTotalPerpPositionLiability(
 		marginCategory?: MarginCategory,
 		liquidationBuffer?: BN,
 		includeOpenOrders?: boolean,
@@ -1034,102 +1614,13 @@ export class User {
 	): BN {
 		return this.getActivePerpPositions().reduce(
 			(totalPerpValue, perpPosition) => {
-				const market = this.driftClient.getPerpMarketAccount(
-					perpPosition.marketIndex
+				const baseAssetValue = this.calculateWeightedPerpPositionLiability(
+					perpPosition,
+					marginCategory,
+					liquidationBuffer,
+					includeOpenOrders,
+					strict
 				);
-
-				if (perpPosition.lpShares.gt(ZERO)) {
-					// is an lp
-					// clone so we dont mutate the position
-					perpPosition = this.getClonedPosition(perpPosition);
-
-					// settle position
-					const [settledPosition, dustBaa, _] =
-						this.getPerpPositionWithLPSettle(market.marketIndex);
-					perpPosition.baseAssetAmount =
-						settledPosition.baseAssetAmount.add(dustBaa);
-					perpPosition.quoteAssetAmount = settledPosition.quoteAssetAmount;
-
-					const [totalOpenBids, totalOpenAsks] = this.getPerpBidAsks(
-						market.marketIndex
-					);
-
-					perpPosition.openAsks = totalOpenAsks;
-					perpPosition.openBids = totalOpenBids;
-				}
-
-				let valuationPrice = this.getOracleDataForPerpMarket(
-					market.marketIndex
-				).price;
-
-				if (isVariant(market.status, 'settlement')) {
-					valuationPrice = market.expiryPrice;
-				}
-
-				const baseAssetAmount = includeOpenOrders
-					? calculateWorstCaseBaseAssetAmount(perpPosition)
-					: perpPosition.baseAssetAmount;
-
-				let baseAssetValue = baseAssetAmount
-					.abs()
-					.mul(valuationPrice)
-					.div(AMM_TO_QUOTE_PRECISION_RATIO.mul(PRICE_PRECISION));
-
-				if (marginCategory) {
-					let marginRatio = new BN(
-						calculateMarketMarginRatio(
-							market,
-							baseAssetAmount.abs(),
-							marginCategory
-						)
-					);
-
-					if (marginCategory === 'Initial') {
-						marginRatio = BN.max(
-							marginRatio,
-							new BN(this.getUserAccount().maxMarginRatio)
-						);
-					}
-
-					if (liquidationBuffer !== undefined) {
-						marginRatio = marginRatio.add(liquidationBuffer);
-					}
-
-					if (isVariant(market.status, 'settlement')) {
-						marginRatio = ZERO;
-					}
-
-					const quoteSpotMarket = this.driftClient.getSpotMarketAccount(
-						market.quoteSpotMarketIndex
-					);
-					const quoteOraclePriceData =
-						this.driftClient.getOraclePriceDataAndSlot(
-							quoteSpotMarket.oracle
-						).data;
-
-					let quotePrice;
-					if (strict) {
-						quotePrice = BN.max(
-							quoteOraclePriceData.price,
-							quoteSpotMarket.historicalOracleData.lastOraclePriceTwap5Min
-						);
-					} else {
-						quotePrice = quoteOraclePriceData.price;
-					}
-
-					baseAssetValue = baseAssetValue
-						.mul(quotePrice)
-						.div(PRICE_PRECISION)
-						.mul(marginRatio)
-						.div(MARGIN_PRECISION);
-
-					if (includeOpenOrders) {
-						baseAssetValue = baseAssetValue.add(
-							new BN(perpPosition.openOrders).mul(OPEN_ORDER_MARGIN_REQUIREMENT)
-						);
-					}
-				}
-
 				return totalPerpValue.add(baseAssetValue);
 			},
 			ZERO
@@ -1137,7 +1628,7 @@ export class User {
 	}
 
 	/**
-	 * calculates position value in margin system
+	 * calculates position value based on oracle
 	 * @returns : Precision QUOTE_PRECISION
 	 */
 	public getPerpPositionValue(
@@ -1146,8 +1637,12 @@ export class User {
 		includeOpenOrders = false
 	): BN {
 		const userPosition =
-			this.getPerpPositionWithLPSettle(marketIndex)[0] ||
-			this.getEmptyPosition(marketIndex);
+			this.getPerpPositionWithLPSettle(
+				marketIndex,
+				undefined,
+				false,
+				true
+			)[0] || this.getEmptyPosition(marketIndex);
 		const market = this.driftClient.getPerpMarketAccount(
 			userPosition.marketIndex
 		);
@@ -1157,6 +1652,41 @@ export class User {
 			oraclePriceData,
 			includeOpenOrders
 		);
+	}
+
+	/**
+	 * calculates position liabiltiy value in margin system
+	 * @returns : Precision QUOTE_PRECISION
+	 */
+	public getPerpLiabilityValue(
+		marketIndex: number,
+		oraclePriceData: OraclePriceData,
+		includeOpenOrders = false
+	): BN {
+		const userPosition =
+			this.getPerpPositionWithLPSettle(
+				marketIndex,
+				undefined,
+				false,
+				true
+			)[0] || this.getEmptyPosition(marketIndex);
+		const market = this.driftClient.getPerpMarketAccount(
+			userPosition.marketIndex
+		);
+
+		if (includeOpenOrders) {
+			return calculateWorstCasePerpLiabilityValue(
+				userPosition,
+				market,
+				oraclePriceData.price
+			).worstCaseLiabilityValue;
+		} else {
+			return calculatePerpLiabilityValue(
+				userPosition.baseAssetAmount,
+				oraclePriceData.price,
+				isVariant(market.contractType, 'prediction')
+			);
+		}
 	}
 
 	public getPositionSide(
@@ -1237,8 +1767,10 @@ export class User {
 	 * calculates current user leverage which is (total liability size) / (net asset value)
 	 * @returns : Precision TEN_THOUSAND
 	 */
-	public getLeverage(): BN {
-		return this.calculateLeverageFromComponents(this.getLeverageComponents());
+	public getLeverage(includeOpenOrders = true): BN {
+		return this.calculateLeverageFromComponents(
+			this.getLeverageComponents(includeOpenOrders)
+		);
 	}
 
 	calculateLeverageFromComponents({
@@ -1263,27 +1795,30 @@ export class User {
 		return totalLiabilityValue.mul(TEN_THOUSAND).div(netAssetValue);
 	}
 
-	getLeverageComponents(): {
+	getLeverageComponents(
+		includeOpenOrders = true,
+		marginCategory: MarginCategory = undefined
+	): {
 		perpLiabilityValue: BN;
 		perpPnl: BN;
 		spotAssetValue: BN;
 		spotLiabilityValue: BN;
 	} {
-		const perpLiability = this.getTotalPerpPositionValue(
+		const perpLiability = this.getTotalPerpPositionLiability(
+			marginCategory,
 			undefined,
-			undefined,
-			true
+			includeOpenOrders
 		);
-		const perpPnl = this.getUnrealizedPNL(true);
+		const perpPnl = this.getUnrealizedPNL(true, undefined, marginCategory);
 
 		const {
 			totalAssetValue: spotAssetValue,
 			totalLiabilityValue: spotLiabilityValue,
 		} = this.getSpotMarketAssetAndLiabilityValue(
 			undefined,
+			marginCategory,
 			undefined,
-			undefined,
-			true
+			includeOpenOrders
 		);
 
 		return {
@@ -1294,8 +1829,62 @@ export class User {
 		};
 	}
 
+	isDustDepositPosition(spotMarketAccount: SpotMarketAccount): boolean {
+		const marketIndex = spotMarketAccount.marketIndex;
+
+		const spotPosition = this.getSpotPosition(spotMarketAccount.marketIndex);
+
+		if (isSpotPositionAvailable(spotPosition)) {
+			return false;
+		}
+
+		const depositAmount = this.getTokenAmount(spotMarketAccount.marketIndex);
+
+		if (depositAmount.lte(ZERO)) {
+			return false;
+		}
+
+		const oraclePriceData = this.getOracleDataForSpotMarket(marketIndex);
+
+		const strictOraclePrice = new StrictOraclePrice(
+			oraclePriceData.price,
+			oraclePriceData.twap
+		);
+
+		const balanceValue = this.getSpotAssetValue(
+			depositAmount,
+			strictOraclePrice,
+			spotMarketAccount
+		);
+
+		if (balanceValue.lt(DUST_POSITION_SIZE)) {
+			return true;
+		}
+
+		return false;
+	}
+
+	getSpotMarketAccountsWithDustPosition() {
+		const spotMarketAccounts = this.driftClient.getSpotMarketAccounts();
+
+		const dustPositionAccounts: SpotMarketAccount[] = [];
+
+		for (const spotMarketAccount of spotMarketAccounts) {
+			const isDust = this.isDustDepositPosition(spotMarketAccount);
+			if (isDust) {
+				dustPositionAccounts.push(spotMarketAccount);
+			}
+		}
+
+		return dustPositionAccounts;
+	}
+
 	getTotalLiabilityValue(marginCategory?: MarginCategory): BN {
-		return this.getTotalPerpPositionValue(marginCategory, undefined, true).add(
+		return this.getTotalPerpPositionLiability(
+			marginCategory,
+			undefined,
+			true
+		).add(
 			this.getSpotMarketLiabilityValue(
 				undefined,
 				marginCategory,
@@ -1311,16 +1900,42 @@ export class User {
 		);
 	}
 
+	getNetUsdValue(): BN {
+		const netSpotValue = this.getNetSpotMarketValue();
+		const unrealizedPnl = this.getUnrealizedPNL(true, undefined, undefined);
+		return netSpotValue.add(unrealizedPnl);
+	}
+
+	/**
+	 * Calculates the all time P&L of the user.
+	 *
+	 * Net withdraws + Net spot market value + Net unrealized P&L -
+	 */
+	getTotalAllTimePnl(): BN {
+		const netUsdValue = this.getNetUsdValue();
+		const totalDeposits = this.getUserAccount().totalDeposits;
+		const totalWithdraws = this.getUserAccount().totalWithdraws;
+
+		const totalPnl = netUsdValue.add(totalWithdraws).sub(totalDeposits);
+
+		return totalPnl;
+	}
+
 	/**
 	 * calculates max allowable leverage exceeding hitting requirement category
-	 * @params category {Initial, Maintenance}
+	 * for large sizes where imf factor activates, result is a lower bound
+	 * @param marginCategory {Initial, Maintenance}
+	 * @param isLp if calculating max leveraging for adding lp, need to add buffer
 	 * @returns : Precision TEN_THOUSAND
 	 */
 	public getMaxLeverageForPerp(
 		perpMarketIndex: number,
-		category: MarginCategory = 'Initial'
+		marginCategory: MarginCategory = 'Initial',
+		isLp = false
 	): BN {
 		const market = this.driftClient.getPerpMarketAccount(perpMarketIndex);
+		const marketPrice =
+			this.driftClient.getOracleDataForPerpMarket(perpMarketIndex).price;
 
 		const { perpLiabilityValue, perpPnl, spotAssetValue, spotLiabilityValue } =
 			this.getLeverageComponents();
@@ -1335,12 +1950,71 @@ export class User {
 
 		const totalLiabilityValue = perpLiabilityValue.add(spotLiabilityValue);
 
-		const marginRatio = calculateMarketMarginRatio(
-			market,
-			ZERO, // todo
-			category
+		const lpBuffer = isLp
+			? marketPrice.mul(market.amm.orderStepSize).div(AMM_RESERVE_PRECISION)
+			: ZERO;
+
+		const freeCollateral = this.getFreeCollateral().sub(lpBuffer);
+
+		let rawMarginRatio;
+
+		switch (marginCategory) {
+			case 'Initial':
+				rawMarginRatio = Math.max(
+					market.marginRatioInitial,
+					this.getUserAccount().maxMarginRatio
+				);
+				break;
+			case 'Maintenance':
+				rawMarginRatio = market.marginRatioMaintenance;
+				break;
+			default:
+				rawMarginRatio = market.marginRatioInitial;
+				break;
+		}
+
+		// absolute max fesible size (upper bound)
+		const maxSize = BN.max(
+			ZERO,
+			freeCollateral
+				.mul(MARGIN_PRECISION)
+				.div(new BN(rawMarginRatio))
+				.mul(PRICE_PRECISION)
+				.div(marketPrice)
 		);
-		const freeCollateral = this.getFreeCollateral();
+
+		// margin ratio incorporting upper bound on size
+		let marginRatio = calculateMarketMarginRatio(
+			market,
+			maxSize,
+			marginCategory,
+			this.getUserAccount().maxMarginRatio,
+			this.isHighLeverageMode()
+		);
+
+		// use more fesible size since imf factor activated
+		let attempts = 0;
+		while (marginRatio > rawMarginRatio + 1e-4 && attempts < 10) {
+			// more fesible size (upper bound)
+			const targetSize = BN.max(
+				ZERO,
+				freeCollateral
+					.mul(MARGIN_PRECISION)
+					.div(new BN(marginRatio))
+					.mul(PRICE_PRECISION)
+					.div(marketPrice)
+			);
+
+			// margin ratio incorporting more fesible target size
+			marginRatio = calculateMarketMarginRatio(
+				market,
+				targetSize,
+				marginCategory,
+				this.getUserAccount().maxMarginRatio,
+				this.isHighLeverageMode()
+			);
+			attempts += 1;
+		}
 
 		// how much more liabilities can be opened w remaining free collateral
 		const additionalLiabilities = freeCollateral
@@ -1472,15 +2146,7 @@ export class User {
 	} {
 		const totalCollateral = this.getTotalCollateral('Maintenance');
 
-		// if user being liq'd, can continue to be liq'd until total collateral above the margin requirement plus buffer
-		let liquidationBuffer = undefined;
-		if (this.isBeingLiquidated()) {
-			liquidationBuffer = new BN(
-				this.driftClient.getStateAccount().liquidationMarginBufferRatio
-			);
-		}
-		const marginRequirement =
-			this.getMaintenanceMarginRequirement(liquidationBuffer);
+		const marginRequirement = this.getMaintenanceMarginRequirement();
 		const canBeLiquidated = totalCollateral.lt(marginRequirement);
 
 		return {
@@ -1491,14 +2157,23 @@ export class User {
 	}
 
 	public isBeingLiquidated(): boolean {
-		return isOneOfVariant(this.getUserAccount().status, [
-			'beingLiquidated',
-			'bankrupt',
-		]);
+		return (
+			(this.getUserAccount().status &
+				(UserStatus.BEING_LIQUIDATED | UserStatus.BANKRUPT)) >
+			0
+		);
+	}
+
+	public hasStatus(status: UserStatus): boolean {
+		return (this.getUserAccount().status & status) > 0;
 	}
 
 	public isBankrupt(): boolean {
-		return isVariant(this.getUserAccount().status, 'bankrupt');
+		return (this.getUserAccount().status & UserStatus.BANKRUPT) > 0;
+	}
+
+	public isHighLeverageMode(): boolean {
+		return isVariant(this.getUserAccount().marginMode, 'highLeverage');
 	}
 
 	/**
@@ -1576,16 +2251,21 @@ export class User {
 		const perpMarketWithSameOracle = this.driftClient
 			.getPerpMarketAccounts()
 			.find((market) => market.amm.oracle.equals(oracle));
+		const oraclePrice =
+			this.driftClient.getOracleDataForSpotMarket(marketIndex).price;
 		if (perpMarketWithSameOracle) {
-			const perpPosition = this.getPerpPosition(
-				perpMarketWithSameOracle.marketIndex
-			);
+			const perpPosition = this.getPerpPositionWithLPSettle(
+				perpMarketWithSameOracle.marketIndex,
+				undefined,
+				true
+			)[0];
 			if (perpPosition) {
 				const freeCollateralDeltaForPerp =
 					this.calculateFreeCollateralDeltaForPerp(
 						perpMarketWithSameOracle,
 						perpPosition,
-						ZERO
+						ZERO,
+						oraclePrice
 					);
 
 				freeCollateralDelta = freeCollateralDelta.add(
@@ -1598,8 +2278,6 @@ export class User {
 			return new BN(-1);
 		}
 
-		const oraclePrice =
-			this.driftClient.getOracleDataForSpotMarket(marketIndex).price;
 		const liqPriceDelta = freeCollateral
 			.mul(QUOTE_PRECISION)
 			.div(freeCollateralDelta);
@@ -1616,36 +2294,74 @@ export class User {
 	/**
 	 * Calculate the liquidation price of a perp position, with optional parameter to calculate the liquidation price after a trade
 	 * @param marketIndex
-	 * @param positionBaseSizeChange // change in position size to calculate liquidation price for : Precision 10^13
+	 * @param positionBaseSizeChange // change in position size to calculate liquidation price for : Precision 10^9
+	 * @param estimatedEntryPrice
+	 * @param marginCategory // allow Initial to be passed in if we are trying to calculate price for DLP de-risking
+	 * @param includeOpenOrders
+	 * @param offsetCollateral // allows calculating the liquidation price after this offset collateral is added to the user's account (e.g. : what will the liquidation price be for this position AFTER I deposit $x worth of collateral)
 	 * @returns Precision : PRICE_PRECISION
 	 */
 	public liquidationPrice(
 		marketIndex: number,
-		positionBaseSizeChange: BN = ZERO
+		positionBaseSizeChange: BN = ZERO,
+		estimatedEntryPrice: BN = ZERO,
+		marginCategory: MarginCategory = 'Maintenance',
+		includeOpenOrders = false,
+		offsetCollateral = ZERO
 	): BN {
-		const totalCollateral = this.getTotalCollateral('Maintenance');
-		const maintenanceMarginRequirement = this.getMaintenanceMarginRequirement();
-		const freeCollateral = BN.max(
-			ZERO,
-			totalCollateral.sub(maintenanceMarginRequirement)
+		const totalCollateral = this.getTotalCollateral(marginCategory);
+		const marginRequirement = this.getMarginRequirement(
+			marginCategory,
+			undefined,
+			false,
+			includeOpenOrders
 		);
+		let freeCollateral = BN.max(
+			ZERO,
+			totalCollateral.sub(marginRequirement)
+		).add(offsetCollateral);
+
+		const oracle =
+			this.driftClient.getPerpMarketAccount(marketIndex).amm.oracle;
+
+		const oraclePrice =
+			this.driftClient.getOracleDataForPerpMarket(marketIndex).price;
 
 		const market = this.driftClient.getPerpMarketAccount(marketIndex);
 		const currentPerpPosition =
-			this.getPerpPosition(marketIndex) || this.getEmptyPosition(marketIndex);
+			this.getPerpPositionWithLPSettle(marketIndex, undefined, true)[0] ||
+			this.getEmptyPosition(marketIndex);
+
+		positionBaseSizeChange = standardizeBaseAssetAmount(
+			positionBaseSizeChange,
+			market.amm.orderStepSize
+		);
+
+		const freeCollateralChangeFromNewPosition =
+			this.calculateEntriesEffectOnFreeCollateral(
+				market,
+				oraclePrice,
+				currentPerpPosition,
+				positionBaseSizeChange,
+				estimatedEntryPrice,
+				includeOpenOrders
+			);
+
+		freeCollateral = freeCollateral.add(freeCollateralChangeFromNewPosition);
 
 		let freeCollateralDelta = this.calculateFreeCollateralDeltaForPerp(
 			market,
 			currentPerpPosition,
-			positionBaseSizeChange
+			positionBaseSizeChange,
+			oraclePrice,
+			marginCategory,
+			includeOpenOrders
 		);
 
 		if (!freeCollateralDelta) {
 			return new BN(-1);
 		}
 
-		const oracle =
-			this.driftClient.getPerpMarketAccount(marketIndex).amm.oracle;
 		const spotMarketWithSameOracle = this.driftClient
 			.getSpotMarketAccounts()
 			.find((market) => market.oracle.equals(oracle));
@@ -1666,7 +2382,8 @@ export class User {
 				const spotFreeCollateralDelta =
 					this.calculateFreeCollateralDeltaForSpot(
 						spotMarketWithSameOracle,
-						signedTokenAmount
+						signedTokenAmount,
+						marginCategory
 					);
 				freeCollateralDelta = freeCollateralDelta.add(
 					spotFreeCollateralDelta || ZERO
@@ -1678,8 +2395,6 @@ export class User {
 			return new BN(-1);
 		}
 
-		const oraclePrice =
-			this.driftClient.getOracleDataForPerpMarket(marketIndex).price;
 		const liqPriceDelta = freeCollateral
 			.mul(QUOTE_PRECISION)
 			.div(freeCollateralDelta);
@@ -1693,52 +2408,149 @@ export class User {
 		return liqPrice;
 	}
 
+	calculateEntriesEffectOnFreeCollateral(
+		market: PerpMarketAccount,
+		oraclePrice: BN,
+		perpPosition: PerpPosition,
+		positionBaseSizeChange: BN,
+		estimatedEntryPrice: BN,
+		includeOpenOrders: boolean
+	): BN {
+		let freeCollateralChange = ZERO;
+
+		// update free collateral to account for change in pnl from new position
+		if (!estimatedEntryPrice.eq(ZERO) && !positionBaseSizeChange.eq(ZERO)) {
+			const costBasis = oraclePrice
+				.mul(positionBaseSizeChange.abs())
+				.div(BASE_PRECISION);
+			const newPositionValue = estimatedEntryPrice
+				.mul(positionBaseSizeChange.abs())
+				.div(BASE_PRECISION);
+			if (positionBaseSizeChange.gt(ZERO)) {
+				freeCollateralChange = costBasis.sub(newPositionValue);
+			} else {
+				freeCollateralChange = newPositionValue.sub(costBasis);
+			}
+
+			// assume worst fee tier
+			const takerFeeTier =
+				this.driftClient.getStateAccount().perpFeeStructure.feeTiers[0];
+			const takerFee = newPositionValue
+				.muln(takerFeeTier.feeNumerator)
+				.divn(takerFeeTier.feeDenominator);
+			freeCollateralChange = freeCollateralChange.sub(takerFee);
+		}
+
+		const calculateMarginRequirement = (perpPosition: PerpPosition) => {
+			let baseAssetAmount: BN;
+			let liabilityValue: BN;
+			if (includeOpenOrders) {
+				const { worstCaseBaseAssetAmount, worstCaseLiabilityValue } =
+					calculateWorstCasePerpLiabilityValue(
+						perpPosition,
+						market,
+						oraclePrice
+					);
+				baseAssetAmount = worstCaseBaseAssetAmount;
+				liabilityValue = worstCaseLiabilityValue;
+			} else {
+				baseAssetAmount = perpPosition.baseAssetAmount;
+				liabilityValue = calculatePerpLiabilityValue(
+					baseAssetAmount,
+					oraclePrice,
+					isVariant(market.contractType, 'prediction')
+				);
+			}
+
+			const marginRatio = calculateMarketMarginRatio(
+				market,
+				baseAssetAmount.abs(),
+				'Maintenance',
+				this.getUserAccount().maxMarginRatio,
+				this.isHighLeverageMode()
+			);
+
+			return liabilityValue.mul(new BN(marginRatio)).div(MARGIN_PRECISION);
+		};
+
+		const freeCollateralConsumptionBefore =
+			calculateMarginRequirement(perpPosition);
+
+		const perpPositionAfter = Object.assign({}, perpPosition);
+		perpPositionAfter.baseAssetAmount = perpPositionAfter.baseAssetAmount.add(
+			positionBaseSizeChange
+		);
+
+		const freeCollateralConsumptionAfter =
+			calculateMarginRequirement(perpPositionAfter);
+
+		return freeCollateralChange.sub(
+			freeCollateralConsumptionAfter.sub(freeCollateralConsumptionBefore)
+		);
+	}
+
 	calculateFreeCollateralDeltaForPerp(
 		market: PerpMarketAccount,
 		perpPosition: PerpPosition,
-		positionBaseSizeChange: BN
+		positionBaseSizeChange: BN,
+		oraclePrice: BN,
+		marginCategory: MarginCategory = 'Maintenance',
+		includeOpenOrders = false
 	): BN | undefined {
-		const currentBaseAssetAmount = perpPosition.baseAssetAmount;
+		const baseAssetAmount = includeOpenOrders
+			? calculateWorstCaseBaseAssetAmount(perpPosition, market, oraclePrice)
+			: perpPosition.baseAssetAmount;
 
-		const worstCaseBaseAssetAmount =
-			calculateWorstCaseBaseAssetAmount(perpPosition);
-		const orderBaseAssetAmount = worstCaseBaseAssetAmount.sub(
-			currentBaseAssetAmount
+		// zero if include orders == false
+		const orderBaseAssetAmount = baseAssetAmount.sub(
+			perpPosition.baseAssetAmount
 		);
-		const proposedBaseAssetAmount = currentBaseAssetAmount.add(
-			positionBaseSizeChange
-		);
-		const proposedWorstCaseBaseAssetAmount = worstCaseBaseAssetAmount.add(
-			positionBaseSizeChange
-		);
+
+		const proposedBaseAssetAmount = baseAssetAmount.add(positionBaseSizeChange);
 
 		const marginRatio = calculateMarketMarginRatio(
 			market,
-			proposedWorstCaseBaseAssetAmount.abs(),
-			'Maintenance'
+			proposedBaseAssetAmount.abs(),
+			marginCategory,
+			this.getUserAccount().maxMarginRatio,
+			this.isHighLeverageMode()
 		);
 		const marginRatioQuotePrecision = new BN(marginRatio)
 			.mul(QUOTE_PRECISION)
 			.div(MARGIN_PRECISION);
 
-		if (proposedWorstCaseBaseAssetAmount.eq(ZERO)) {
+		if (proposedBaseAssetAmount.eq(ZERO)) {
 			return undefined;
 		}
 
 		let freeCollateralDelta = ZERO;
-		if (proposedBaseAssetAmount.gt(ZERO)) {
-			freeCollateralDelta = QUOTE_PRECISION.sub(marginRatioQuotePrecision)
-				.mul(proposedBaseAssetAmount)
-				.div(BASE_PRECISION);
+		if (isVariant(market.contractType, 'prediction')) {
+			// for prediction market, increase in pnl and margin requirement will net out for position
+			// open order margin requirement will change with price though
+			if (orderBaseAssetAmount.gt(ZERO)) {
+				freeCollateralDelta = marginRatioQuotePrecision.neg();
+			} else if (orderBaseAssetAmount.lt(ZERO)) {
+				freeCollateralDelta = marginRatioQuotePrecision;
+			}
 		} else {
-			freeCollateralDelta = QUOTE_PRECISION.neg()
-				.sub(marginRatioQuotePrecision)
-				.mul(proposedBaseAssetAmount.abs())
-				.div(BASE_PRECISION);
-		}
+			if (proposedBaseAssetAmount.gt(ZERO)) {
+				freeCollateralDelta = QUOTE_PRECISION.sub(marginRatioQuotePrecision)
+					.mul(proposedBaseAssetAmount)
+					.div(BASE_PRECISION);
+			} else {
+				freeCollateralDelta = QUOTE_PRECISION.neg()
+					.sub(marginRatioQuotePrecision)
+					.mul(proposedBaseAssetAmount.abs())
+					.div(BASE_PRECISION);
+			}
 
-		if (!orderBaseAssetAmount.eq(ZERO)) {
-			freeCollateralDelta = freeCollateralDelta.sub(marginRatioQuotePrecision);
+			if (!orderBaseAssetAmount.eq(ZERO)) {
+				freeCollateralDelta = freeCollateralDelta.sub(
+					marginRatioQuotePrecision
+						.mul(orderBaseAssetAmount.abs())
+						.div(BASE_PRECISION)
+				);
+			}
 		}
 
 		return freeCollateralDelta;
@@ -1746,15 +2558,17 @@ export class User {
 
 	calculateFreeCollateralDeltaForSpot(
 		market: SpotMarketAccount,
-		signedTokenAmount: BN
+		signedTokenAmount: BN,
+		marginCategory: MarginCategory = 'Maintenance'
 	): BN {
 		const tokenPrecision = new BN(Math.pow(10, market.decimals));
 
 		if (signedTokenAmount.gt(ZERO)) {
 			const assetWeight = calculateAssetWeight(
 				signedTokenAmount,
+				this.driftClient.getOracleDataForSpotMarket(market.marketIndex).price,
 				market,
-				'Maintenance'
+				marginCategory
 			);
 
 			return QUOTE_PRECISION.mul(assetWeight)
@@ -1765,7 +2579,7 @@ export class User {
 			const liabilityWeight = calculateLiabilityWeight(
 				signedTokenAmount.abs(),
 				market,
-				'Maintenance'
+				marginCategory
 			);
 
 			return QUOTE_PRECISION.neg()
@@ -1784,11 +2598,15 @@ export class User {
 	 */
 	public liquidationPriceAfterClose(
 		positionMarketIndex: number,
-		closeQuoteAmount: BN
+		closeQuoteAmount: BN,
+		estimatedEntryPrice: BN = ZERO
 	): BN {
 		const currentPosition =
-			this.getPerpPosition(positionMarketIndex) ||
-			this.getEmptyPosition(positionMarketIndex);
+			this.getPerpPositionWithLPSettle(
+				positionMarketIndex,
+				undefined,
+				true
+			)[0] || this.getEmptyPosition(positionMarketIndex);
 
 		const closeBaseAmount = currentPosition.baseAssetAmount
 			.mul(closeQuoteAmount)
@@ -1800,7 +2618,41 @@ export class User {
 			)
 			.neg();
 
-		return this.liquidationPrice(positionMarketIndex, closeBaseAmount);
+		return this.liquidationPrice(
+			positionMarketIndex,
+			closeBaseAmount,
+			estimatedEntryPrice
+		);
+	}
+
+	public getMarginUSDCRequiredForTrade(
+		targetMarketIndex: number,
+		baseSize: BN,
+		estEntryPrice?: BN
+	): BN {
+		return calculateMarginUSDCRequiredForTrade(
+			this.driftClient,
+			targetMarketIndex,
+			baseSize,
+			this.getUserAccount().maxMarginRatio,
+			undefined,
+			estEntryPrice
+		);
+	}
+
+	public getCollateralDepositRequiredForTrade(
+		targetMarketIndex: number,
+		baseSize: BN,
+		collateralIndex: number
+	): BN {
+		return calculateCollateralDepositRequiredForTrade(
+			this.driftClient,
+			targetMarketIndex,
+			baseSize,
+			collateralIndex,
+			this.getUserAccount().maxMarginRatio,
+			false // assume user cant be high leverage if they havent created user account ?
+		);
 	}
 
 	/**
@@ -1822,14 +2674,18 @@ export class User {
 	 *
 	 * @param targetMarketIndex
 	 * @param tradeSide
-	 * @returns tradeSizeAllowed : Precision QUOTE_PRECISION
+	 * @param isLp
+	 * @returns { tradeSize: BN, oppositeSideTradeSize: BN} : Precision QUOTE_PRECISION
 	 */
 	public getMaxTradeSizeUSDCForPerp(
 		targetMarketIndex: number,
-		tradeSide: PositionDirection
-	): BN {
+		tradeSide: PositionDirection,
+		isLp = false
+	): { tradeSize: BN; oppositeSideTradeSize: BN } {
+		let tradeSize = ZERO;
+		let oppositeSideTradeSize = ZERO;
 		const currentPosition =
-			this.getPerpPosition(targetMarketIndex) ||
+			this.getPerpPositionWithLPSettle(targetMarketIndex, undefined, true)[0] ||
 			this.getEmptyPosition(targetMarketIndex);
 
 		const targetSide = isVariant(tradeSide, 'short') ? 'short' : 'long';
@@ -1844,41 +2700,59 @@ export class User {
 
 		const oracleData = this.getOracleDataForPerpMarket(targetMarketIndex);
 
-		// add any position we have on the opposite side of the current trade, because we can "flip" the size of this position without taking any extra leverage.
-		const oppositeSizeValueUSDC = targetingSameSide
-			? ZERO
-			: this.getPerpPositionValue(targetMarketIndex, oracleData);
+		const marketAccount =
+			this.driftClient.getPerpMarketAccount(targetMarketIndex);
 
-		let maxPositionSize = this.getPerpBuyingPower(targetMarketIndex);
+		const lpBuffer = isLp
+			? oracleData.price
+					.mul(marketAccount.amm.orderStepSize)
+					.div(AMM_RESERVE_PRECISION)
+			: ZERO;
+
+		// add any position we have on the opposite side of the current trade, because we can "flip" the size of this position without taking any extra leverage.
+		const oppositeSizeLiabilityValue = targetingSameSide
+			? ZERO
+			: calculatePerpLiabilityValue(
+					currentPosition.baseAssetAmount,
+					oracleData.price,
+					isVariant(marketAccount.contractType, 'prediction')
+			  );
+
+		const maxPositionSize = this.getPerpBuyingPower(
+			targetMarketIndex,
+			lpBuffer
+		);
+
 		if (maxPositionSize.gte(ZERO)) {
-			if (oppositeSizeValueUSDC.eq(ZERO)) {
+			if (oppositeSizeLiabilityValue.eq(ZERO)) {
 				// case 1 : Regular trade where current total position less than max, and no opposite position to account for
 				// do nothing
+				tradeSize = maxPositionSize;
 			} else {
 				// case 2 : trade where current total position less than max, but need to account for flipping the current position over to the other side
-				maxPositionSize = maxPositionSize.add(
-					oppositeSizeValueUSDC.mul(new BN(2))
-				);
+				tradeSize = maxPositionSize.add(oppositeSizeLiabilityValue);
+				oppositeSideTradeSize = oppositeSizeLiabilityValue;
 			}
 		} else {
 			// current leverage is greater than max leverage - can only reduce position size
 
 			if (!targetingSameSide) {
 				const market = this.driftClient.getPerpMarketAccount(targetMarketIndex);
-				const perpPositionValue = this.getPerpPositionValue(
-					targetMarketIndex,
-					oracleData
+				const perpLiabilityValue = calculatePerpLiabilityValue(
+					currentPosition.baseAssetAmount,
+					oracleData.price,
+					isVariant(market.contractType, 'prediction')
 				);
 				const totalCollateral = this.getTotalCollateral();
 				const marginRequirement = this.getInitialMarginRequirement();
-				const marginFreedByClosing = perpPositionValue
+				const marginFreedByClosing = perpLiabilityValue
 					.mul(new BN(market.marginRatioInitial))
 					.div(MARGIN_PRECISION);
 				const marginRequirementAfterClosing =
 					marginRequirement.sub(marginFreedByClosing);
 
 				if (marginRequirementAfterClosing.gt(totalCollateral)) {
-					maxPositionSize = perpPositionValue;
+					oppositeSideTradeSize = perpLiabilityValue;
 				} else {
 					const freeCollateralAfterClose = totalCollateral.sub(
 						marginRequirementAfterClosing
@@ -1890,14 +2764,16 @@ export class User {
 							freeCollateralAfterClose,
 							ZERO
 						);
-					maxPositionSize = perpPositionValue.add(buyingPowerAfterClose);
+					oppositeSideTradeSize = perpLiabilityValue;
+					tradeSize = buyingPowerAfterClose;
 				}
 			} else {
 				// do nothing if targetting same side
+				tradeSize = maxPositionSize;
 			}
 		}
 
-		return maxPositionSize;
+		return { tradeSize, oppositeSideTradeSize };
 	}
 
 	/**
@@ -1916,6 +2792,8 @@ export class User {
 		currentSpotMarketNetValue?: BN
 	): BN {
 		const market = this.driftClient.getSpotMarketAccount(targetMarketIndex);
+		const oraclePrice =
+			this.driftClient.getOracleDataForSpotMarket(targetMarketIndex).price;
 
 		currentQuoteAssetValue = this.getSpotMarketAssetValue(
 			QUOTE_SPOT_MARKET_INDEX
@@ -1927,11 +2805,13 @@ export class User {
 		let freeCollateral = this.getFreeCollateral();
 		const marginRatio = calculateSpotMarketMarginRatio(
 			market,
+			oraclePrice,
 			'Initial',
 			ZERO,
 			isVariant(direction, 'long')
 				? SpotBalanceType.DEPOSIT
-				: SpotBalanceType.BORROW
+				: SpotBalanceType.BORROW,
+			this.getUserAccount().maxMarginRatio
 		);
 
 		let tradeAmount = ZERO;
@@ -1941,9 +2821,11 @@ export class User {
 				tradeAmount = currentSpotMarketNetValue.abs();
 				const marginRatio = calculateSpotMarketMarginRatio(
 					market,
+					oraclePrice,
 					'Initial',
 					this.getTokenAmount(targetMarketIndex).abs(),
-					SpotBalanceType.BORROW
+					SpotBalanceType.BORROW,
+					this.getUserAccount().maxMarginRatio
 				);
 				freeCollateral = freeCollateral.add(
 					tradeAmount.mul(new BN(marginRatio)).div(MARGIN_PRECISION)
@@ -1955,9 +2837,11 @@ export class User {
 				tradeAmount = currentSpotMarketNetValue;
 				const marginRatio = calculateSpotMarketMarginRatio(
 					market,
+					oraclePrice,
 					'Initial',
 					this.getTokenAmount(targetMarketIndex),
-					SpotBalanceType.DEPOSIT
+					SpotBalanceType.DEPOSIT,
+					this.getUserAccount().maxMarginRatio
 				);
 				freeCollateral = freeCollateral.add(
 					tradeAmount.mul(new BN(marginRatio)).div(MARGIN_PRECISION)
@@ -2002,9 +2886,13 @@ export class User {
 		const inMarket = this.driftClient.getSpotMarketAccount(inMarketIndex);
 		const outMarket = this.driftClient.getSpotMarketAccount(outMarketIndex);
 
-		const inOraclePrice = this.getOracleDataForSpotMarket(inMarketIndex).price;
-		const outOraclePrice =
-			this.getOracleDataForSpotMarket(outMarketIndex).price;
+		const inOraclePriceData = this.getOracleDataForSpotMarket(inMarketIndex);
+		const inOraclePrice = inOraclePriceData.price;
+		const outOraclePriceData = this.getOracleDataForSpotMarket(outMarketIndex);
+		const outOraclePrice = outOraclePriceData.price;
+
+		const inStrictOraclePrice = new StrictOraclePrice(inOraclePrice);
+		const outStrictOraclePrice = new StrictOraclePrice(outOraclePrice);
 
 		const inPrecision = new BN(10 ** inMarket.decimals);
 		const outPrecision = new BN(10 ** outMarket.decimals);
@@ -2019,17 +2907,29 @@ export class User {
 		const freeCollateral = this.getFreeCollateral();
 
 		const inContributionInitial =
-			this.calculateSpotPositionFreeCollateralContribution(inSpotPosition);
+			this.calculateSpotPositionFreeCollateralContribution(
+				inSpotPosition,
+				inStrictOraclePrice
+			);
 		const {
 			totalAssetValue: inTotalAssetValueInitial,
 			totalLiabilityValue: inTotalLiabilityValueInitial,
-		} = this.calculateSpotPositionLeverageContribution(inSpotPosition);
+		} = this.calculateSpotPositionLeverageContribution(
+			inSpotPosition,
+			inStrictOraclePrice
+		);
 		const outContributionInitial =
-			this.calculateSpotPositionFreeCollateralContribution(outSpotPosition);
+			this.calculateSpotPositionFreeCollateralContribution(
+				outSpotPosition,
+				outStrictOraclePrice
+			);
 		const {
 			totalAssetValue: outTotalAssetValueInitial,
 			totalLiabilityValue: outTotalLiabilityValueInitial,
-		} = this.calculateSpotPositionLeverageContribution(outSpotPosition);
+		} = this.calculateSpotPositionLeverageContribution(
+			outSpotPosition,
+			outStrictOraclePrice
+		);
 		const initialContribution = inContributionInitial.add(
 			outContributionInitial
 		);
@@ -2089,10 +2989,14 @@ export class User {
 				);
 
 				const inContributionAfter =
-					this.calculateSpotPositionFreeCollateralContribution(inPositionAfter);
+					this.calculateSpotPositionFreeCollateralContribution(
+						inPositionAfter,
+						inStrictOraclePrice
+					);
 				const outContributionAfter =
 					this.calculateSpotPositionFreeCollateralContribution(
-						outPositionAfter
+						outPositionAfter,
+						outStrictOraclePrice
 					);
 
 				const contributionAfter = inContributionAfter.add(outContributionAfter);
@@ -2130,12 +3034,18 @@ export class User {
 		const {
 			totalAssetValue: inTotalAssetValueAfter,
 			totalLiabilityValue: inTotalLiabilityValueAfter,
-		} = this.calculateSpotPositionLeverageContribution(inPositionAfter);
+		} = this.calculateSpotPositionLeverageContribution(
+			inPositionAfter,
+			inStrictOraclePrice
+		);
 
 		const {
 			totalAssetValue: outTotalAssetValueAfter,
 			totalLiabilityValue: outTotalLiabilityValueAfter,
-		} = this.calculateSpotPositionLeverageContribution(outPositionAfter);
+		} = this.calculateSpotPositionLeverageContribution(
+			outPositionAfter,
+			outStrictOraclePrice
+		);
 
 		const spotAssetValueDelta = inTotalAssetValueAfter
 			.add(outTotalAssetValueAfter)
@@ -2212,108 +3122,56 @@ export class User {
 	}
 
 	calculateSpotPositionFreeCollateralContribution(
-		spotPosition: SpotPosition
+		spotPosition: SpotPosition,
+		strictOraclePrice: StrictOraclePrice
 	): BN {
-		let freeCollateralContribution = ZERO;
-		const now = new BN(new Date().getTime() / 1000);
-		const strict = true;
 		const marginCategory = 'Initial';
 
 		const spotMarketAccount: SpotMarketAccount =
 			this.driftClient.getSpotMarketAccount(spotPosition.marketIndex);
 
-		const oraclePriceData = this.getOracleDataForSpotMarket(
-			spotPosition.marketIndex
+		const { freeCollateralContribution } = getWorstCaseTokenAmounts(
+			spotPosition,
+			spotMarketAccount,
+			strictOraclePrice,
+			marginCategory,
+			this.getUserAccount().maxMarginRatio
 		);
-
-		const [worstCaseTokenAmount, worstCaseQuoteTokenAmount] =
-			getWorstCaseTokenAmounts(
-				spotPosition,
-				spotMarketAccount,
-				oraclePriceData
-			);
-
-		if (worstCaseTokenAmount.gt(ZERO)) {
-			const baseAssetValue = this.getSpotAssetValue(
-				worstCaseTokenAmount,
-				oraclePriceData,
-				spotMarketAccount,
-				marginCategory,
-				strict,
-				now
-			);
-
-			freeCollateralContribution =
-				freeCollateralContribution.add(baseAssetValue);
-		} else {
-			const baseLiabilityValue = this.getSpotLiabilityValue(
-				worstCaseTokenAmount,
-				oraclePriceData,
-				spotMarketAccount,
-				marginCategory,
-				undefined,
-				strict,
-				now
-			).abs();
-
-			freeCollateralContribution =
-				freeCollateralContribution.sub(baseLiabilityValue);
-		}
-
-		freeCollateralContribution.add(worstCaseQuoteTokenAmount);
 
 		return freeCollateralContribution;
 	}
 
-	calculateSpotPositionLeverageContribution(spotPosition: SpotPosition): {
+	calculateSpotPositionLeverageContribution(
+		spotPosition: SpotPosition,
+		strictOraclePrice: StrictOraclePrice
+	): {
 		totalAssetValue: BN;
 		totalLiabilityValue: BN;
 	} {
 		let totalAssetValue = ZERO;
 		let totalLiabilityValue = ZERO;
-		const now = new BN(new Date().getTime() / 1000);
 
 		const spotMarketAccount: SpotMarketAccount =
 			this.driftClient.getSpotMarketAccount(spotPosition.marketIndex);
 
-		const oraclePriceData = this.getOracleDataForSpotMarket(
-			spotPosition.marketIndex
+		const { tokenValue, ordersValue } = getWorstCaseTokenAmounts(
+			spotPosition,
+			spotMarketAccount,
+			strictOraclePrice,
+			'Initial',
+			this.getUserAccount().maxMarginRatio
 		);
 
-		const [worstCaseTokenAmount, worstCaseQuoteTokenAmount] =
-			getWorstCaseTokenAmounts(
-				spotPosition,
-				spotMarketAccount,
-				oraclePriceData
-			);
-
-		if (worstCaseTokenAmount.gt(ZERO)) {
-			totalAssetValue = this.getSpotAssetValue(
-				worstCaseTokenAmount,
-				oraclePriceData,
-				spotMarketAccount,
-				undefined,
-				false,
-				now
-			);
+		if (tokenValue.gte(ZERO)) {
+			totalAssetValue = tokenValue;
 		} else {
-			totalLiabilityValue = this.getSpotLiabilityValue(
-				worstCaseTokenAmount,
-				oraclePriceData,
-				spotMarketAccount,
-				undefined,
-				undefined,
-				false,
-				now
-			).abs();
+			totalLiabilityValue = tokenValue.abs();
 		}
 
-		if (worstCaseQuoteTokenAmount.gt(ZERO)) {
-			totalAssetValue = totalAssetValue.add(worstCaseQuoteTokenAmount);
+		if (ordersValue.gt(ZERO)) {
+			totalAssetValue = totalAssetValue.add(ordersValue);
 		} else {
-			totalLiabilityValue = totalLiabilityValue.add(
-				worstCaseQuoteTokenAmount.abs()
-			);
+			totalLiabilityValue = totalLiabilityValue.add(ordersValue.abs());
 		}
 
 		return {
@@ -2343,6 +3201,13 @@ export class User {
 		const inMarket = this.driftClient.getSpotMarketAccount(inMarketIndex);
 		const outMarket = this.driftClient.getSpotMarketAccount(outMarketIndex);
 
+		const inOraclePriceData = this.getOracleDataForSpotMarket(inMarketIndex);
+		const inOraclePrice = inOraclePriceData.price;
+		const outOraclePriceData = this.getOracleDataForSpotMarket(outMarketIndex);
+		const outOraclePrice = outOraclePriceData.price;
+		const inStrictOraclePrice = new StrictOraclePrice(inOraclePrice);
+		const outStrictOraclePrice = new StrictOraclePrice(outOraclePrice);
+
 		const inSpotPosition =
 			this.getSpotPosition(inMarketIndex) ||
 			this.getEmptySpotPosition(inMarketIndex);
@@ -2353,11 +3218,17 @@ export class User {
 		const {
 			totalAssetValue: inTotalAssetValueInitial,
 			totalLiabilityValue: inTotalLiabilityValueInitial,
-		} = this.calculateSpotPositionLeverageContribution(inSpotPosition);
+		} = this.calculateSpotPositionLeverageContribution(
+			inSpotPosition,
+			inStrictOraclePrice
+		);
 		const {
 			totalAssetValue: outTotalAssetValueInitial,
 			totalLiabilityValue: outTotalLiabilityValueInitial,
-		} = this.calculateSpotPositionLeverageContribution(outSpotPosition);
+		} = this.calculateSpotPositionLeverageContribution(
+			outSpotPosition,
+			outStrictOraclePrice
+		);
 
 		const { perpLiabilityValue, perpPnl, spotAssetValue, spotLiabilityValue } =
 			this.getLeverageComponents();
@@ -2376,12 +3247,18 @@ export class User {
 		const {
 			totalAssetValue: inTotalAssetValueAfter,
 			totalLiabilityValue: inTotalLiabilityValueAfter,
-		} = this.calculateSpotPositionLeverageContribution(inPositionAfter);
+		} = this.calculateSpotPositionLeverageContribution(
+			inPositionAfter,
+			inStrictOraclePrice
+		);
 
 		const {
 			totalAssetValue: outTotalAssetValueAfter,
 			totalLiabilityValue: outTotalLiabilityValueAfter,
-		} = this.calculateSpotPositionLeverageContribution(outPositionAfter);
+		} = this.calculateSpotPositionLeverageContribution(
+			outPositionAfter,
+			outStrictOraclePrice
+		);
 
 		const spotAssetValueDelta = inTotalAssetValueAfter
 			.add(outTotalAssetValueAfter)
@@ -2523,19 +3400,26 @@ export class User {
 		}
 
 		const currentPosition =
-			this.getPerpPosition(targetMarketIndex) ||
+			this.getPerpPositionWithLPSettle(targetMarketIndex)[0] ||
 			this.getEmptyPosition(targetMarketIndex);
 
+		const perpMarket = this.driftClient.getPerpMarketAccount(targetMarketIndex);
 		const oracleData = this.getOracleDataForPerpMarket(targetMarketIndex);
 
-		let currentPositionQuoteAmount = this.getPerpPositionValue(
-			targetMarketIndex,
-			oracleData,
-			includeOpenOrders
+		let {
+			// eslint-disable-next-line prefer-const
+			worstCaseBaseAssetAmount: worstCaseBase,
+			worstCaseLiabilityValue: currentPositionQuoteAmount,
+		} = calculateWorstCasePerpLiabilityValue(
+			currentPosition,
+			perpMarket,
+			oracleData.price
 		);
 
+		// current side is short if position base asset amount is negative OR there is no position open but open orders are short
 		const currentSide =
-			currentPosition && currentPosition.baseAssetAmount.isNeg()
+			currentPosition.baseAssetAmount.isNeg() ||
+			(currentPosition.baseAssetAmount.eq(ZERO) && worstCaseBase.isNeg())
 				? PositionDirection.SHORT
 				: PositionDirection.LONG;
 
@@ -2586,17 +3470,78 @@ export class User {
 		return newLeverage;
 	}
 
+	public getUserFeeTier(marketType: MarketType, now?: BN) {
+		const state = this.driftClient.getStateAccount();
+
+		let feeTierIndex = 0;
+		if (isVariant(marketType, 'perp')) {
+			if (this.isHighLeverageMode()) {
+				return state.perpFeeStructure.feeTiers[0];
+			}
+
+			const userStatsAccount: UserStatsAccount = this.driftClient
+				.getUserStats()
+				.getAccount();
+
+			const total30dVolume = getUser30dRollingVolumeEstimate(
+				userStatsAccount,
+				now
+			);
+
+			const stakedQuoteAssetAmount = userStatsAccount.ifStakedQuoteAssetAmount;
+			const volumeTiers = [
+				new BN(100_000_000).mul(QUOTE_PRECISION),
+				new BN(50_000_000).mul(QUOTE_PRECISION),
+				new BN(10_000_000).mul(QUOTE_PRECISION),
+				new BN(5_000_000).mul(QUOTE_PRECISION),
+				new BN(1_000_000).mul(QUOTE_PRECISION),
+			];
+			const stakedTiers = [
+				new BN(10000).mul(QUOTE_PRECISION),
+				new BN(5000).mul(QUOTE_PRECISION),
+				new BN(2000).mul(QUOTE_PRECISION),
+				new BN(1000).mul(QUOTE_PRECISION),
+				new BN(500).mul(QUOTE_PRECISION),
+			];
+
+			for (let i = 0; i < volumeTiers.length; i++) {
+				if (
+					total30dVolume.gte(volumeTiers[i]) ||
+					stakedQuoteAssetAmount.gte(stakedTiers[i])
+				) {
+					feeTierIndex = 5 - i;
+					break;
+				}
+			}
+
+			return state.perpFeeStructure.feeTiers[feeTierIndex];
+		}
+
+		return state.spotFeeStructure.feeTiers[feeTierIndex];
+	}
+
 	/**
-	 * Calculates how much fee will be taken for a given sized trade
+	 * Calculates how much perp fee will be taken for a given sized trade
 	 * @param quoteAmount
 	 * @returns feeForQuote : Precision QUOTE_PRECISION
 	 */
-	public calculateFeeForQuoteAmount(quoteAmount: BN): BN {
-		const feeTier =
-			this.driftClient.getStateAccount().perpFeeStructure.feeTiers[0];
-		return quoteAmount
-			.mul(new BN(feeTier.feeNumerator))
-			.div(new BN(feeTier.feeDenominator));
+	public calculateFeeForQuoteAmount(quoteAmount: BN, marketIndex?: number): BN {
+		if (marketIndex !== undefined) {
+			const takerFeeMultiplier = this.driftClient.getMarketFees(
+				MarketType.PERP,
+				marketIndex,
+				this
+			).takerFee;
+			const feeAmountNum =
+				BigNum.from(quoteAmount, QUOTE_PRECISION_EXP).toNum() *
+				takerFeeMultiplier;
+			return BigNum.fromPrint(feeAmountNum.toString(), QUOTE_PRECISION_EXP).val;
+		} else {
+			const feeTier = this.getUserFeeTier(MarketType.PERP);
+			return quoteAmount
+				.mul(new BN(feeTier.feeNumerator))
+				.div(new BN(feeTier.feeDenominator));
+		}
 	}
 
 	/**
@@ -2616,6 +3561,7 @@ export class User {
 		);
 
 		const freeCollateral = this.getFreeCollateral();
+		const initialMarginRequirement = this.getInitialMarginRequirement();
 		const oracleData = this.getOracleDataForSpotMarket(marketIndex);
 		const precisionIncrease = TEN.pow(new BN(spotMarket.decimals - 6));
 
@@ -2625,12 +3571,26 @@ export class User {
 			withdrawLimit = BN.max(withdrawLimit, userDepositAmount);
 		}
 
-		const amountWithdrawable = freeCollateral
-			.mul(MARGIN_PRECISION)
-			.div(new BN(spotMarket.initialAssetWeight))
-			.mul(PRICE_PRECISION)
-			.div(oracleData.price)
-			.mul(precisionIncrease);
+		const assetWeight = calculateAssetWeight(
+			userDepositAmount,
+			oracleData.price,
+			spotMarket,
+			'Initial'
+		);
+
+		let amountWithdrawable;
+		if (assetWeight.eq(ZERO)) {
+			amountWithdrawable = userDepositAmount;
+		} else if (initialMarginRequirement.eq(ZERO)) {
+			amountWithdrawable = userDepositAmount;
+		} else {
+			amountWithdrawable = divCeil(
+				divCeil(freeCollateral.mul(MARGIN_PRECISION), assetWeight).mul(
+					PRICE_PRECISION
+				),
+				oracleData.price
+			).mul(precisionIncrease);
+		}
 
 		const maxWithdrawValue = BN.min(
 			BN.min(amountWithdrawable, userDepositAmount),
@@ -2721,10 +3681,21 @@ export class User {
 		};
 	}
 
-	public canMakeIdle(slot: BN, slotsBeforeIdle: BN): boolean {
+	public canMakeIdle(slot: BN): boolean {
 		const userAccount = this.getUserAccount();
 		if (userAccount.idle) {
 			return false;
+		}
+
+		const { totalAssetValue, totalLiabilityValue } =
+			this.getSpotMarketAssetAndLiabilityValue();
+		const equity = totalAssetValue.sub(totalLiabilityValue);
+
+		let slotsBeforeIdle: BN;
+		if (equity.lt(QUOTE_PRECISION.muln(1000))) {
+			slotsBeforeIdle = new BN(9000); // 1 hour
+		} else {
+			slotsBeforeIdle = new BN(1512000); // 1 week
 		}
 
 		const userLastActiveSlot = userAccount.lastActiveSlot;
@@ -2797,6 +3768,269 @@ export class User {
 		};
 	}
 
+	public getPerpPositionHealth({
+		marginCategory,
+		perpPosition,
+		oraclePriceData,
+		quoteOraclePriceData,
+	}: {
+		marginCategory: MarginCategory;
+		perpPosition: PerpPosition;
+		oraclePriceData?: OraclePriceData;
+		quoteOraclePriceData?: OraclePriceData;
+	}): HealthComponent {
+		const settledLpPosition = this.getPerpPositionWithLPSettle(
+			perpPosition.marketIndex,
+			perpPosition
+		)[0];
+		const perpMarket = this.driftClient.getPerpMarketAccount(
+			perpPosition.marketIndex
+		);
+		const _oraclePriceData =
+			oraclePriceData ||
+			this.driftClient.getOracleDataForPerpMarket(perpMarket.marketIndex);
+		const oraclePrice = _oraclePriceData.price;
+		const {
+			worstCaseBaseAssetAmount: worstCaseBaseAmount,
+			worstCaseLiabilityValue,
+		} = calculateWorstCasePerpLiabilityValue(
+			settledLpPosition,
+			perpMarket,
+			oraclePrice
+		);
+
+		const marginRatio = new BN(
+			calculateMarketMarginRatio(
+				perpMarket,
+				worstCaseBaseAmount.abs(),
+				marginCategory,
+				this.getUserAccount().maxMarginRatio,
+				this.isHighLeverageMode()
+			)
+		);
+
+		const _quoteOraclePriceData =
+			quoteOraclePriceData ||
+			this.driftClient.getOracleDataForSpotMarket(QUOTE_SPOT_MARKET_INDEX);
+
+		let marginRequirement = worstCaseLiabilityValue
+			.mul(_quoteOraclePriceData.price)
+			.div(PRICE_PRECISION)
+			.mul(marginRatio)
+			.div(MARGIN_PRECISION);
+
+		marginRequirement = marginRequirement.add(
+			new BN(perpPosition.openOrders).mul(OPEN_ORDER_MARGIN_REQUIREMENT)
+		);
+
+		if (perpPosition.lpShares.gt(ZERO)) {
+			marginRequirement = marginRequirement.add(
+				BN.max(
+					QUOTE_PRECISION,
+					oraclePrice
+						.mul(perpMarket.amm.orderStepSize)
+						.mul(QUOTE_PRECISION)
+						.div(AMM_RESERVE_PRECISION)
+						.div(PRICE_PRECISION)
+				)
+			);
+		}
+
+		return {
+			marketIndex: perpMarket.marketIndex,
+			size: worstCaseBaseAmount,
+			value: worstCaseLiabilityValue,
+			weight: marginRatio,
+			weightedValue: marginRequirement,
+		};
+	}
+
+	public getHealthComponents({
+		marginCategory,
+	}: {
+		marginCategory: MarginCategory;
+	}): HealthComponents {
+		const healthComponents: HealthComponents = {
+			deposits: [],
+			borrows: [],
+			perpPositions: [],
+			perpPnl: [],
+		};
+
+		for (const perpPosition of this.getActivePerpPositions()) {
+			const perpMarket = this.driftClient.getPerpMarketAccount(
+				perpPosition.marketIndex
+			);
+
+			const oraclePriceData = this.driftClient.getOracleDataForPerpMarket(
+				perpMarket.marketIndex
+			);
+
+			const quoteOraclePriceData = this.driftClient.getOracleDataForSpotMarket(
+				QUOTE_SPOT_MARKET_INDEX
+			);
+
+			healthComponents.perpPositions.push(
+				this.getPerpPositionHealth({
+					marginCategory,
+					perpPosition,
+					oraclePriceData,
+					quoteOraclePriceData,
+				})
+			);
+
+			const quoteSpotMarket = this.driftClient.getSpotMarketAccount(
+				perpMarket.quoteSpotMarketIndex
+			);
+
+			const settledPerpPosition = this.getPerpPositionWithLPSettle(
+				perpPosition.marketIndex,
+				perpPosition
+			)[0];
+
+			const positionUnrealizedPnl = calculatePositionPNL(
+				perpMarket,
+				settledPerpPosition,
+				true,
+				oraclePriceData
+			);
+
+			let pnlWeight;
+			if (positionUnrealizedPnl.gt(ZERO)) {
+				pnlWeight = calculateUnrealizedAssetWeight(
+					perpMarket,
+					quoteSpotMarket,
+					positionUnrealizedPnl,
+					marginCategory,
+					oraclePriceData
+				);
+			} else {
+				pnlWeight = SPOT_MARKET_WEIGHT_PRECISION;
+			}
+
+			const pnlValue = positionUnrealizedPnl
+				.mul(quoteOraclePriceData.price)
+				.div(PRICE_PRECISION);
+
+			const wegithedPnlValue = pnlValue
+				.mul(pnlWeight)
+				.div(SPOT_MARKET_WEIGHT_PRECISION);
+
+			healthComponents.perpPnl.push({
+				marketIndex: perpMarket.marketIndex,
+				size: positionUnrealizedPnl,
+				value: pnlValue,
+				weight: pnlWeight,
+				weightedValue: wegithedPnlValue,
+			});
+		}
+
+		let netQuoteValue = ZERO;
+		for (const spotPosition of this.getActiveSpotPositions()) {
+			const spotMarketAccount: SpotMarketAccount =
+				this.driftClient.getSpotMarketAccount(spotPosition.marketIndex);
+
+			const oraclePriceData = this.getOracleDataForSpotMarket(
+				spotPosition.marketIndex
+			);
+
+			const strictOraclePrice = new StrictOraclePrice(oraclePriceData.price);
+
+			if (spotPosition.marketIndex === QUOTE_SPOT_MARKET_INDEX) {
+				const tokenAmount = getSignedTokenAmount(
+					getTokenAmount(
+						spotPosition.scaledBalance,
+						spotMarketAccount,
+						spotPosition.balanceType
+					),
+					spotPosition.balanceType
+				);
+
+				netQuoteValue = netQuoteValue.add(tokenAmount);
+				continue;
+			}
+
+			const {
+				tokenAmount: worstCaseTokenAmount,
+				tokenValue: tokenValue,
+				weight,
+				weightedTokenValue: weightedTokenValue,
+				ordersValue: ordersValue,
+			} = getWorstCaseTokenAmounts(
+				spotPosition,
+				spotMarketAccount,
+				strictOraclePrice,
+				marginCategory,
+				this.getUserAccount().maxMarginRatio
+			);
+
+			netQuoteValue = netQuoteValue.add(ordersValue);
+
+			const baseAssetValue = tokenValue.abs();
+			const weightedValue = weightedTokenValue.abs();
+
+			if (weightedTokenValue.lt(ZERO)) {
+				healthComponents.borrows.push({
+					marketIndex: spotMarketAccount.marketIndex,
+					size: worstCaseTokenAmount,
+					value: baseAssetValue,
+					weight: weight,
+					weightedValue: weightedValue,
+				});
+			} else {
+				healthComponents.deposits.push({
+					marketIndex: spotMarketAccount.marketIndex,
+					size: worstCaseTokenAmount,
+					value: baseAssetValue,
+					weight: weight,
+					weightedValue: weightedValue,
+				});
+			}
+		}
+
+		if (!netQuoteValue.eq(ZERO)) {
+			const spotMarketAccount = this.driftClient.getQuoteSpotMarketAccount();
+			const oraclePriceData = this.getOracleDataForSpotMarket(
+				QUOTE_SPOT_MARKET_INDEX
+			);
+
+			const baseAssetValue = getTokenValue(
+				netQuoteValue,
+				spotMarketAccount.decimals,
+				oraclePriceData
+			);
+
+			const { weight, weightedTokenValue } = calculateWeightedTokenValue(
+				netQuoteValue,
+				baseAssetValue,
+				oraclePriceData.price,
+				spotMarketAccount,
+				marginCategory,
+				this.getUserAccount().maxMarginRatio
+			);
+
+			if (netQuoteValue.lt(ZERO)) {
+				healthComponents.borrows.push({
+					marketIndex: spotMarketAccount.marketIndex,
+					size: netQuoteValue,
+					value: baseAssetValue.abs(),
+					weight: weight,
+					weightedValue: weightedTokenValue.abs(),
+				});
+			} else {
+				healthComponents.deposits.push({
+					marketIndex: spotMarketAccount.marketIndex,
+					size: netQuoteValue,
+					value: baseAssetValue,
+					weight: weight,
+					weightedValue: weightedTokenValue,
+				});
+			}
+		}
+
+		return healthComponents;
+	}
+
 	/**
 	 * Get the total position value, excluding any position coming from the given target market
 	 * @param marketToIgnore
@@ -2809,21 +4043,24 @@ export class User {
 		includeOpenOrders?: boolean
 	): BN {
 		const currentPerpPosition =
-			this.getPerpPosition(marketToIgnore) ||
-			this.getEmptyPosition(marketToIgnore);
+			this.getPerpPositionWithLPSettle(
+				marketToIgnore,
+				undefined,
+				!!marginCategory
+			)[0] || this.getEmptyPosition(marketToIgnore);
 
 		const oracleData = this.getOracleDataForPerpMarket(marketToIgnore);
 
 		let currentPerpPositionValueUSDC = ZERO;
 		if (currentPerpPosition) {
-			currentPerpPositionValueUSDC = this.getPerpPositionValue(
+			currentPerpPositionValueUSDC = this.getPerpLiabilityValue(
 				marketToIgnore,
 				oracleData,
 				includeOpenOrders
 			);
 		}
 
-		return this.getTotalPerpPositionValue(
+		return this.getTotalPerpPositionLiability(
 			marginCategory,
 			liquidationBuffer,
 			includeOpenOrders
@@ -2831,20 +4068,10 @@ export class User {
 	}
 
 	private getOracleDataForPerpMarket(marketIndex: number): OraclePriceData {
-		const oracleKey =
-			this.driftClient.getPerpMarketAccount(marketIndex).amm.oracle;
-		const oracleData =
-			this.driftClient.getOraclePriceDataAndSlot(oracleKey).data;
-
-		return oracleData;
+		return this.driftClient.getOracleDataForPerpMarket(marketIndex);
 	}
 
 	private getOracleDataForSpotMarket(marketIndex: number): OraclePriceData {
-		const oracleKey = this.driftClient.getSpotMarketAccount(marketIndex).oracle;
-
-		const oracleData =
-			this.driftClient.getOraclePriceDataAndSlot(oracleKey).data;
-
-		return oracleData;
+		return this.driftClient.getOracleDataForSpotMarket(marketIndex);
 	}
 }

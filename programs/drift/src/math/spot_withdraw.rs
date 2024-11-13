@@ -30,6 +30,7 @@ pub fn calculate_max_borrow_token_amount(
     deposit_token_twap: u128,
     borrow_token_twap: u128,
     withdraw_guard_threshold: u128,
+    max_token_borrows: u128,
 ) -> DriftResult<u128> {
     // maximum permitted borrows after withdrawal
     // allows at least up to the withdraw_guard_threshold
@@ -37,11 +38,13 @@ pub fn calculate_max_borrow_token_amount(
 
     let lesser_deposit_amount = deposit_token_amount.min(deposit_token_twap);
 
-    let max_borrow_token = withdraw_guard_threshold.max(
-        (lesser_deposit_amount / 6)
-            .max(borrow_token_twap.safe_add(lesser_deposit_amount / 10)?)
-            .min(lesser_deposit_amount.safe_sub(lesser_deposit_amount / 5)?),
-    );
+    let max_borrow_token = withdraw_guard_threshold
+        .max(
+            (lesser_deposit_amount / 6)
+                .max(borrow_token_twap.safe_add(lesser_deposit_amount / 10)?)
+                .min(lesser_deposit_amount.safe_sub(lesser_deposit_amount / 5)?),
+        )
+        .min(max_token_borrows);
 
     Ok(max_borrow_token)
 }
@@ -103,9 +106,7 @@ pub fn calculate_token_utilization_limits(
 
     let max_withdraw_utilization: u128 = spot_market.optimal_utilization.cast::<u128>()?.max(
         spot_market.utilization_twap.cast::<u128>()?.safe_add(
-            SPOT_UTILIZATION_PRECISION
-                .safe_sub(spot_market.utilization_twap.cast()?)?
-                .safe_div(2)?,
+            SPOT_UTILIZATION_PRECISION.saturating_sub(spot_market.utilization_twap.cast()?) / 2,
         )?,
     );
 
@@ -149,11 +150,22 @@ pub fn check_withdraw_limits(
         &SpotBalanceType::Borrow,
     )?;
 
+    let max_token_borrows: u128 = if spot_market.max_token_borrows_fraction > 0 {
+        spot_market
+            .max_token_deposits
+            .safe_mul(spot_market.max_token_borrows_fraction.cast()?)?
+            .safe_div(10000)?
+            .cast()?
+    } else {
+        u128::MAX
+    };
+
     let max_borrow_token_for_twap = calculate_max_borrow_token_amount(
         deposit_token_amount,
         spot_market.deposit_token_twap.cast()?,
         spot_market.borrow_token_twap.cast()?,
         spot_market.withdraw_guard_threshold.cast()?,
+        max_token_borrows,
     )?;
 
     let (min_deposit_token_for_utilization, max_borrow_token_for_utilization) =
@@ -202,7 +214,7 @@ pub fn check_withdraw_limits(
 pub fn get_max_withdraw_for_market_with_token_amount(
     spot_market: &SpotMarket,
     token_amount: i128,
-    is_pool_transfer: bool,
+    is_leaving_drift: bool,
 ) -> DriftResult<u128> {
     let deposit_token_amount = get_token_amount(
         spot_market.deposit_balance,
@@ -216,8 +228,13 @@ pub fn get_max_withdraw_for_market_with_token_amount(
         &SpotBalanceType::Borrow,
     )?;
 
-    let (min_deposit_token_for_utilization, max_borrow_token_for_utilization) =
-        calculate_token_utilization_limits(deposit_token_amount, borrow_token_amount, spot_market)?;
+    // if leaving drift, need to consider utilization limits
+    let (min_deposit_token_for_utilization, max_borrow_token_for_utilization) = if is_leaving_drift
+    {
+        calculate_token_utilization_limits(deposit_token_amount, borrow_token_amount, spot_market)?
+    } else {
+        (0, u128::MAX)
+    };
 
     let mut max_withdraw_amount = 0_u128;
     if token_amount > 0 {
@@ -229,30 +246,52 @@ pub fn get_max_withdraw_for_market_with_token_amount(
         let withdraw_limit = deposit_token_amount.saturating_sub(min_deposit_token);
 
         let token_amount = token_amount.unsigned_abs();
-        if withdraw_limit <= token_amount && !is_pool_transfer {
+        if withdraw_limit <= token_amount && is_leaving_drift {
             return Ok(withdraw_limit);
         }
 
         max_withdraw_amount = token_amount;
     }
 
+    let max_token_borrows: u128 = if spot_market.max_token_borrows_fraction > 0 {
+        spot_market
+            .max_token_deposits
+            .safe_mul(spot_market.max_token_borrows_fraction.cast()?)?
+            .safe_div(10000)?
+            .cast()?
+    } else {
+        u128::MAX
+    };
+
     let max_borrow_token_for_twap = calculate_max_borrow_token_amount(
         deposit_token_amount,
         spot_market.deposit_token_twap.cast()?,
         spot_market.borrow_token_twap.cast()?,
         spot_market.withdraw_guard_threshold.cast()?,
+        max_token_borrows,
     )?;
 
     let max_borrow_token = max_borrow_token_for_twap.min(max_borrow_token_for_utilization);
 
-    let borrow_limit = max_borrow_token
+    let mut borrow_limit = max_borrow_token
         .saturating_sub(borrow_token_amount)
         .min(deposit_token_amount.saturating_sub(borrow_token_amount));
+
+    if spot_market.max_token_borrows_fraction > 0 {
+        // min with max allowed borrows
+        let borrows = spot_market.get_borrows()?;
+        let max_token_borrows = spot_market
+            .max_token_deposits
+            .safe_mul(spot_market.max_token_borrows_fraction.cast()?)?
+            .safe_div(10000)?
+            .cast::<u128>()?;
+        borrow_limit = borrow_limit.min(max_token_borrows.saturating_sub(borrows));
+    }
 
     max_withdraw_amount.safe_add(borrow_limit)
 }
 
-pub fn validate_spot_balances(spot_market: &SpotMarket) -> DriftResult<u64> {
+pub fn validate_spot_balances(spot_market: &SpotMarket) -> DriftResult<i64> {
     let depositors_amount: u64 = get_token_amount(
         spot_market.deposit_balance,
         spot_market,
@@ -266,14 +305,6 @@ pub fn validate_spot_balances(spot_market: &SpotMarket) -> DriftResult<u64> {
     )?
     .cast()?;
 
-    validate!(
-        depositors_amount >= borrowers_amount,
-        ErrorCode::SpotMarketBalanceInvariantViolated,
-        "depositors_amount={} less than borrowers_amount={}",
-        depositors_amount,
-        borrowers_amount
-    )?;
-
     let revenue_amount: u64 = get_token_amount(
         spot_market.revenue_pool.scaled_balance,
         spot_market,
@@ -281,7 +312,9 @@ pub fn validate_spot_balances(spot_market: &SpotMarket) -> DriftResult<u64> {
     )?
     .cast()?;
 
-    let depositors_claim = depositors_amount - borrowers_amount;
+    let depositors_claim = depositors_amount
+        .cast::<i64>()?
+        .safe_sub(borrowers_amount.cast()?)?;
 
     validate!(
         revenue_amount <= depositors_amount,
@@ -299,11 +332,11 @@ pub fn validate_spot_balances(spot_market: &SpotMarket) -> DriftResult<u64> {
 pub fn validate_spot_market_vault_amount(
     spot_market: &SpotMarket,
     vault_amount: u64,
-) -> DriftResult<u64> {
+) -> DriftResult<i64> {
     let depositors_claim = validate_spot_balances(spot_market)?;
 
     validate!(
-        vault_amount >= depositors_claim,
+        vault_amount.cast::<i64>()? >= depositors_claim,
         ErrorCode::SpotMarketVaultInvariantViolated,
         "spot market vault ={} holds less than remaining depositor claims = {}",
         vault_amount,

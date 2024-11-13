@@ -9,6 +9,7 @@ use phoenix::{
     state::{OrderPacket, Side},
 };
 use solana_program::{msg, program::invoke_signed_unchecked};
+use std::convert::TryFrom;
 use std::{cell::Ref, convert::TryInto, mem::size_of, ops::Deref};
 
 use crate::{
@@ -89,7 +90,7 @@ pub fn compute_base_lot_size(
         ))
 }
 
-#[account(zero_copy)]
+#[account(zero_copy(unsafe))]
 #[derive(Default, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct PhoenixV1FulfillmentConfig {
@@ -184,7 +185,7 @@ pub struct PhoenixFulfillmentParams<'a, 'b> {
 /// Constructor for PhoenixFulfillmentParams
 impl<'a, 'b> PhoenixFulfillmentParams<'a, 'b> {
     #[allow(clippy::type_complexity)]
-    pub fn new<'c>(
+    pub fn new<'c: 'b>(
         account_info_iter: &'a mut std::iter::Peekable<std::slice::Iter<'c, AccountInfo<'b>>>,
         state: &State,
         base_market: &SpotMarket,
@@ -270,7 +271,7 @@ impl<'a, 'b> PhoenixFulfillmentParams<'a, 'b> {
                 ErrorCode::InvalidFulfillmentConfig
             })?);
 
-        let token_program: Program<Token> = Program::try_from(token_program).map_err(|e| {
+        let token_program: Program<Token> = Program::try_from(*token_program).map_err(|e| {
             msg!("{:?}", e);
             ErrorCode::InvalidFulfillmentConfig
         })?;
@@ -499,7 +500,7 @@ impl<'a, 'b> SpotFulfillmentParams for PhoenixFulfillmentParams<'a, 'b> {
         };
 
         if base_asset_amount_filled == 0 {
-            msg!("No base filled on serum");
+            msg!("No base filled on phoenix");
             return Ok(ExternalSpotFill::empty());
         }
 
@@ -543,6 +544,26 @@ impl<'a, 'b> SpotFulfillmentParams for PhoenixFulfillmentParams<'a, 'b> {
     ) -> DriftResult {
         validate_spot_market_vault_amount(base_market, self.base_market_vault.amount)?;
         validate_spot_market_vault_amount(quote_market, self.quote_market_vault.amount)?;
+        Ok(())
+    }
+
+    fn validate_markets(
+        &self,
+        base_market: &SpotMarket,
+        quote_market: &SpotMarket,
+    ) -> DriftResult<()> {
+        validate!(
+            self.base_market_vault.mint == base_market.mint,
+            ErrorCode::DefaultError,
+            "base mints dont match"
+        )?;
+
+        validate!(
+            self.quote_market_vault.mint == quote_market.mint,
+            ErrorCode::DefaultError,
+            "base mints dont match"
+        )?;
+
         Ok(())
     }
 }

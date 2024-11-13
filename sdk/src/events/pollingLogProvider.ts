@@ -10,7 +10,7 @@ import { fetchLogs } from './fetchLogs';
 
 export class PollingLogProvider implements LogProvider {
 	private finality: Finality;
-	private intervalId: NodeJS.Timer;
+	private intervalId: ReturnType<typeof setTimeout>;
 	private mostRecentSeenTx?: TransactionSignature;
 	private mutex: number;
 	private firstFetch = true;
@@ -19,15 +19,16 @@ export class PollingLogProvider implements LogProvider {
 		private connection: Connection,
 		private address: PublicKey,
 		commitment: Commitment,
-		private frequency = 15 * 1000
+		private frequency = 15 * 1000,
+		private batchSize?: number
 	) {
 		this.finality = commitment === 'finalized' ? 'finalized' : 'confirmed';
 	}
 
-	public subscribe(
+	public async subscribe(
 		callback: logProviderCallback,
 		skipHistory?: boolean
-	): boolean {
+	): Promise<boolean> {
 		if (this.intervalId) {
 			return true;
 		}
@@ -46,7 +47,8 @@ export class PollingLogProvider implements LogProvider {
 					undefined,
 					this.mostRecentSeenTx,
 					// If skipping history, only fetch one log back, not the maximum amount available
-					skipHistory && this.firstFetch ? 1 : undefined
+					skipHistory && this.firstFetch ? 1 : undefined,
+					this.batchSize
 				);
 
 				if (response === undefined) {
@@ -58,7 +60,7 @@ export class PollingLogProvider implements LogProvider {
 				const { mostRecentTx, transactionLogs } = response;
 
 				for (const { txSig, slot, logs } of transactionLogs) {
-					callback(txSig, slot, logs, response.mostRecentBlockTime);
+					callback(txSig, slot, logs, response.mostRecentBlockTime, undefined);
 				}
 
 				this.mostRecentSeenTx = mostRecentTx;

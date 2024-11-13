@@ -118,7 +118,7 @@ export function calculatePositionPNL(
 		.add(perpPosition.quoteAssetAmount);
 
 	if (withFunding) {
-		const fundingRatePnL = calculatePositionFundingPNL(market, perpPosition);
+		const fundingRatePnL = calculateUnsettledFundingPnl(market, perpPosition);
 
 		pnl = pnl.add(fundingRatePnL);
 	}
@@ -159,12 +159,44 @@ export function calculateClaimablePnl(
 }
 
 /**
+ * Returns total fees and funding pnl for a position
  *
  * @param market
  * @param PerpPosition
- * @returns // TODO-PRECISION
+ * @param includeUnsettled include unsettled funding in return value (default: true)
+ * @returns — // QUOTE_PRECISION
  */
-export function calculatePositionFundingPNL(
+export function calculateFeesAndFundingPnl(
+	market: PerpMarketAccount,
+	perpPosition: PerpPosition,
+	includeUnsettled = true
+): BN {
+	const settledFundingAndFeesPnl = perpPosition.quoteBreakEvenAmount.sub(
+		perpPosition.quoteEntryAmount
+	);
+
+	if (!includeUnsettled) {
+		return settledFundingAndFeesPnl;
+	}
+
+	const unsettledFundingPnl = calculateUnsettledFundingPnl(
+		market,
+		perpPosition
+	);
+
+	return settledFundingAndFeesPnl.add(unsettledFundingPnl);
+}
+
+/**
+ * Returns unsettled funding pnl for the position
+ *
+ * To calculate all fees and funding pnl including settled, use calculateFeesAndFundingPnl
+ *
+ * @param market
+ * @param PerpPosition
+ * @returns // QUOTE_PRECISION
+ */
+export function calculateUnsettledFundingPnl(
 	market: PerpMarketAccount,
 	perpPosition: PerpPosition
 ): BN {
@@ -187,6 +219,16 @@ export function calculatePositionFundingPNL(
 		.mul(new BN(-1));
 
 	return perPositionFundingRate;
+}
+
+/**
+ * @deprecated use calculateUnsettledFundingPnl or calculateFeesAndFundingPnl instead
+ */
+export function calculatePositionFundingPNL(
+	market: PerpMarketAccount,
+	perpPosition: PerpPosition
+): BN {
+	return calculateUnsettledFundingPnl(market, perpPosition);
 }
 
 export function positionIsAvailable(position: PerpPosition): boolean {
@@ -237,12 +279,16 @@ export function calculateEntryPrice(userPosition: PerpPosition): BN {
  * @param userPosition
  * @returns Precision: PRICE_PRECISION (10^10)
  */
-export function calculateCostBasis(userPosition: PerpPosition): BN {
+export function calculateCostBasis(
+	userPosition: PerpPosition,
+	includeSettledPnl = false
+): BN {
 	if (userPosition.baseAssetAmount.eq(ZERO)) {
 		return ZERO;
 	}
 
 	return userPosition.quoteAssetAmount
+		.add(includeSettledPnl ? userPosition.settledPnl : ZERO)
 		.mul(PRICE_PRECISION)
 		.mul(AMM_TO_QUOTE_PRECISION_RATIO)
 		.div(userPosition.baseAssetAmount)

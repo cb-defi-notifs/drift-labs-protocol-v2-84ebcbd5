@@ -6,16 +6,14 @@ use crate::controller;
 use crate::controller::amm::SwapDirection;
 use crate::error::{DriftResult, ErrorCode};
 use crate::math::casting::Cast;
-use crate::math::constants::{
-    AMM_RESERVE_PRECISION, AMM_RESERVE_PRECISION_I128, LP_FEE_SLICE_DENOMINATOR,
-    LP_FEE_SLICE_NUMERATOR, MAX_BASE_ASSET_AMOUNT_WITH_AMM, PERP_DECIMALS,
-};
-use crate::math::helpers::get_proportion_i128;
+use crate::math::constants::{MAX_BASE_ASSET_AMOUNT_WITH_AMM, PERP_DECIMALS};
 use crate::math::orders::{
     calculate_quote_asset_amount_for_maker_order, get_position_delta_for_fill,
     is_multiple_of_step_size,
 };
-use crate::math::position::{get_position_update_type, PositionUpdateType};
+use crate::math::position::{
+    get_new_position_amounts, get_position_update_type, PositionUpdateType,
+};
 use crate::math::safe_math::SafeMath;
 use crate::math_error;
 use crate::safe_increment;
@@ -26,17 +24,11 @@ use crate::validate;
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq, Default)]
 pub enum PositionDirection {
+    #[default]
     Long,
     Short,
-}
-
-impl Default for PositionDirection {
-    // UpOnly
-    fn default() -> Self {
-        PositionDirection::Long
-    }
 }
 
 impl PositionDirection {
@@ -82,6 +74,22 @@ pub fn get_position_index(user_positions: &PerpPositions, market_index: u16) -> 
 pub struct PositionDelta {
     pub quote_asset_amount: i64,
     pub base_asset_amount: i64,
+    pub remainder_base_asset_amount: Option<i64>,
+}
+
+impl PositionDelta {
+    pub fn get_delta_base_with_remainder_abs(&self) -> DriftResult<i128> {
+        let delta_base_i128 =
+            if let Some(remainder_base_asset_amount) = self.remainder_base_asset_amount {
+                self.base_asset_amount
+                    .safe_add(remainder_base_asset_amount.cast()?)?
+                    .abs()
+                    .cast::<i128>()?
+            } else {
+                self.base_asset_amount.abs().cast::<i128>()?
+            };
+        Ok(delta_base_i128)
+    }
 }
 
 pub fn update_position_and_market(
@@ -89,21 +97,22 @@ pub fn update_position_and_market(
     market: &mut PerpMarket,
     delta: &PositionDelta,
 ) -> DriftResult<i64> {
-    if delta.base_asset_amount == 0 {
+    if delta.base_asset_amount == 0 && delta.remainder_base_asset_amount.unwrap_or(0) == 0 {
         update_quote_asset_amount(position, market, delta.quote_asset_amount)?;
         return Ok(delta.quote_asset_amount);
     }
 
-    let update_type = get_position_update_type(position, delta);
+    let update_type = get_position_update_type(position, delta)?;
 
     // Update User
-    let new_quote_asset_amount = position
-        .quote_asset_amount
-        .safe_add(delta.quote_asset_amount)?;
+    let (
+        new_base_asset_amount,
+        new_settled_base_asset_amount,
+        new_quote_asset_amount,
+        new_remainder_base_asset_amount,
+    ) = get_new_position_amounts(position, delta, market)?;
 
-    let new_base_asset_amount = position
-        .base_asset_amount
-        .safe_add(delta.base_asset_amount)?;
+    market.update_market_with_counterparty(delta, new_settled_base_asset_amount)?;
 
     let (new_quote_entry_amount, new_quote_break_even_amount, pnl) = match update_type {
         PositionUpdateType::Open | PositionUpdateType::Increase => {
@@ -118,12 +127,15 @@ pub fn update_position_and_market(
             (new_quote_entry_amount, new_quote_break_even_amount, 0_i64)
         }
         PositionUpdateType::Reduce | PositionUpdateType::Close => {
+            let current_base_i128 = position.get_base_asset_amount_with_remainder_abs()?;
+            let delta_base_i128 = delta.get_delta_base_with_remainder_abs()?;
+
             let new_quote_entry_amount = position.quote_entry_amount.safe_sub(
                 position
                     .quote_entry_amount
                     .cast::<i128>()?
-                    .safe_mul(delta.base_asset_amount.abs().cast()?)?
-                    .safe_div(position.base_asset_amount.abs().cast()?)?
+                    .safe_mul(delta_base_i128)?
+                    .safe_div(current_base_i128)?
                     .cast()?,
             )?;
 
@@ -131,8 +143,8 @@ pub fn update_position_and_market(
                 position
                     .quote_break_even_amount
                     .cast::<i128>()?
-                    .safe_mul(delta.base_asset_amount.abs().cast()?)?
-                    .safe_div(position.base_asset_amount.abs().cast()?)?
+                    .safe_mul(delta_base_i128)?
+                    .safe_div(current_base_i128)?
                     .cast()?,
             )?;
 
@@ -144,13 +156,16 @@ pub fn update_position_and_market(
             (new_quote_entry_amount, new_quote_break_even_amount, pnl)
         }
         PositionUpdateType::Flip => {
+            let current_base_i128 = position.get_base_asset_amount_with_remainder_abs()?;
+            let delta_base_i128 = delta.get_delta_base_with_remainder_abs()?;
+
             // same calculation for new_quote_entry_amount
             let new_quote_break_even_amount = delta.quote_asset_amount.safe_sub(
                 delta
                     .quote_asset_amount
                     .cast::<i128>()?
-                    .safe_mul(position.base_asset_amount.abs().cast()?)?
-                    .safe_div(delta.base_asset_amount.abs().cast()?)?
+                    .safe_mul(current_base_i128)?
+                    .safe_div(delta_base_i128)?
                     .cast()?,
             )?;
 
@@ -194,7 +209,7 @@ pub fn update_position_and_market(
                 market.amm.base_asset_amount_long = market
                     .amm
                     .base_asset_amount_long
-                    .safe_add(delta.base_asset_amount.cast()?)?;
+                    .safe_add(new_settled_base_asset_amount.cast()?)?;
                 market.amm.quote_entry_amount_long = market
                     .amm
                     .quote_entry_amount_long
@@ -208,7 +223,7 @@ pub fn update_position_and_market(
                 market.amm.base_asset_amount_short = market
                     .amm
                     .base_asset_amount_short
-                    .safe_add(delta.base_asset_amount.cast()?)?;
+                    .safe_add(new_settled_base_asset_amount.cast()?)?;
                 market.amm.quote_entry_amount_short = market
                     .amm
                     .quote_entry_amount_short
@@ -224,7 +239,7 @@ pub fn update_position_and_market(
                 market.amm.base_asset_amount_long = market
                     .amm
                     .base_asset_amount_long
-                    .safe_add(delta.base_asset_amount.cast()?)?;
+                    .safe_add(new_settled_base_asset_amount.cast()?)?;
                 market.amm.quote_entry_amount_long = market.amm.quote_entry_amount_long.safe_sub(
                     position
                         .quote_entry_amount
@@ -242,7 +257,7 @@ pub fn update_position_and_market(
                 market.amm.base_asset_amount_short = market
                     .amm
                     .base_asset_amount_short
-                    .safe_add(delta.base_asset_amount.cast()?)?;
+                    .safe_add(new_settled_base_asset_amount.cast()?)?;
                 market.amm.quote_entry_amount_short =
                     market.amm.quote_entry_amount_short.safe_sub(
                         position
@@ -343,14 +358,17 @@ pub fn update_position_and_market(
         _ => {}
     }
 
+    let new_position_base_with_remainder =
+        new_base_asset_amount.safe_add(new_remainder_base_asset_amount)?;
+
     // Update user position
     if let PositionUpdateType::Close = update_type {
         position.last_cumulative_funding_rate = 0;
     } else if matches!(
         update_type,
-        PositionUpdateType::Open | PositionUpdateType::Flip
+        PositionUpdateType::Open | PositionUpdateType::Increase | PositionUpdateType::Flip
     ) {
-        if new_base_asset_amount > 0 {
+        if new_position_base_with_remainder > 0 {
             position.last_cumulative_funding_rate =
                 market.amm.cumulative_funding_rate_long.cast()?;
         } else {
@@ -370,10 +388,12 @@ pub fn update_position_and_market(
         new_base_asset_amount
     )?;
 
+    position.remainder_base_asset_amount = new_remainder_base_asset_amount.cast::<i32>()?;
+    position.base_asset_amount = new_base_asset_amount;
+
     position.quote_asset_amount = new_quote_asset_amount;
     position.quote_entry_amount = new_quote_entry_amount;
     position.quote_break_even_amount = new_quote_break_even_amount;
-    position.base_asset_amount = new_base_asset_amount;
 
     Ok(pnl)
 }
@@ -383,36 +403,17 @@ pub fn update_lp_market_position(
     delta: &PositionDelta,
     fee_to_market: i128,
     liquidity_split: AMMLiquiditySplit,
-) -> DriftResult<(i128, i128, i128)> {
-    let user_lp_shares = market.amm.user_lp_shares;
-
-    if user_lp_shares == 0 || liquidity_split == AMMLiquiditySplit::ProtocolOwned {
-        return Ok((0, 0, 0)); // no need to split with LP
+) -> DriftResult<i128> {
+    if market.amm.user_lp_shares == 0 || liquidity_split == AMMLiquiditySplit::ProtocolOwned {
+        return Ok(0); // no need to split with LP
     }
 
-    let total_lp_shares = if liquidity_split == AMMLiquiditySplit::LPOwned {
-        market.amm.user_lp_shares
-    } else {
-        market.amm.sqrt_k
-    };
+    let base_unit: i128 = market.amm.get_per_lp_base_unit()?;
 
-    // update Market per lp position
-    let per_lp_delta_base = get_proportion_i128(
-        delta.base_asset_amount.cast()?,
-        AMM_RESERVE_PRECISION,
-        total_lp_shares,
-    )?;
-
-    let per_lp_delta_quote = get_proportion_i128(
-        delta.quote_asset_amount.cast()?,
-        AMM_RESERVE_PRECISION,
-        total_lp_shares,
-    )?;
-
-    let lp_delta_base =
-        get_proportion_i128(per_lp_delta_base, user_lp_shares, AMM_RESERVE_PRECISION)?;
-    let lp_delta_quote =
-        get_proportion_i128(per_lp_delta_quote, user_lp_shares, AMM_RESERVE_PRECISION)?;
+    let (per_lp_delta_base, per_lp_delta_quote, per_lp_fee) =
+        market
+            .amm
+            .calculate_per_lp_delta(delta, fee_to_market, liquidity_split, base_unit)?;
 
     market.amm.base_asset_amount_per_lp = market
         .amm
@@ -424,29 +425,22 @@ pub fn update_lp_market_position(
         .quote_asset_amount_per_lp
         .safe_add(-per_lp_delta_quote)?;
 
-    // 1/5 of fee auto goes to market
-    // the rest goes to lps/market proportional
-    let lp_fee = get_proportion_i128(
-        fee_to_market,
-        LP_FEE_SLICE_NUMERATOR,
-        LP_FEE_SLICE_DENOMINATOR,
-    )?
-    .safe_mul(user_lp_shares.cast::<i128>()?)?
-    .safe_div(total_lp_shares.cast::<i128>()?)?;
-
-    let per_lp_fee = if lp_fee > 0 {
-        lp_fee
-            .safe_mul(AMM_RESERVE_PRECISION_I128)?
-            .safe_div(user_lp_shares.cast::<i128>()?)?
-    } else {
-        0
-    };
+    // track total fee earned by lps (to attribute breakdown of IL)
+    market.amm.total_fee_earned_per_lp = market
+        .amm
+        .total_fee_earned_per_lp
+        .saturating_add(per_lp_fee.cast()?);
 
     // update per lp position
-    market.amm.quote_asset_amount_per_lp = market
+    market.amm.quote_asset_amount_per_lp =
+        market.amm.quote_asset_amount_per_lp.safe_add(per_lp_fee)?;
+
+    let lp_delta_base = market
         .amm
-        .quote_asset_amount_per_lp
-        .safe_add(per_lp_fee.cast()?)?;
+        .calculate_lp_base_delta(per_lp_delta_base, base_unit)?;
+    let lp_delta_quote = market
+        .amm
+        .calculate_lp_base_delta(per_lp_delta_quote, base_unit)?;
 
     market.amm.base_asset_amount_with_amm = market
         .amm
@@ -458,7 +452,12 @@ pub fn update_lp_market_position(
         .base_asset_amount_with_unsettled_lp
         .safe_add(lp_delta_base)?;
 
-    Ok((lp_delta_base, lp_delta_quote, lp_fee))
+    market.amm.quote_asset_amount_with_unsettled_lp = market
+        .amm
+        .quote_asset_amount_with_unsettled_lp
+        .safe_add(lp_delta_quote.cast()?)?;
+
+    Ok(lp_delta_base)
 }
 
 pub fn update_position_with_base_asset_amount(
@@ -508,7 +507,7 @@ pub fn update_position_with_base_asset_amount(
         market.amm.base_asset_amount_with_amm
     )?;
 
-    controller::amm::update_spread_reserves(&mut market.amm)?;
+    controller::amm::update_spread_reserves(market)?;
 
     Ok((quote_asset_amount, quote_asset_amount_surplus, pnl))
 }
@@ -556,7 +555,10 @@ pub fn update_quote_asset_amount(
         return Ok(());
     }
 
-    if position.quote_asset_amount == 0 && position.base_asset_amount == 0 {
+    if position.quote_asset_amount == 0
+        && position.base_asset_amount == 0
+        && position.remainder_base_asset_amount == 0
+    {
         market.number_of_users = market.number_of_users.safe_add(1)?;
     }
 
@@ -564,8 +566,11 @@ pub fn update_quote_asset_amount(
 
     market.amm.quote_asset_amount = market.amm.quote_asset_amount.safe_add(delta.cast()?)?;
 
-    if position.quote_asset_amount == 0 && position.base_asset_amount == 0 {
-        market.number_of_users = market.number_of_users.safe_sub(1)?;
+    if position.quote_asset_amount == 0
+        && position.base_asset_amount == 0
+        && position.remainder_base_asset_amount == 0
+    {
+        market.number_of_users = market.number_of_users.saturating_sub(1);
     }
 
     Ok(())

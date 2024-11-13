@@ -1,9 +1,10 @@
-import { Commitment, Connection, PublicKey } from '@solana/web3.js';
+import { Commitment, PublicKey } from '@solana/web3.js';
 import { v4 as uuidv4 } from 'uuid';
 import { BufferAndSlot } from './types';
 import { promiseTimeout } from '../util/promiseTimeout';
+import { Connection } from '../bankrun/bankrunConnection';
 
-type AccountToLoad = {
+export type AccountToLoad = {
 	publicKey: PublicKey;
 	callbacks: Map<string, (buffer: Buffer, slot: number) => void>;
 };
@@ -19,7 +20,7 @@ export class BulkAccountLoader {
 	accountsToLoad = new Map<string, AccountToLoad>();
 	bufferAndSlotMap = new Map<string, BufferAndSlot>();
 	errorCallbacks = new Map<string, (e) => void>();
-	intervalId?: NodeJS.Timer;
+	intervalId?: ReturnType<typeof setTimeout>;
 	// to handle clients spamming load
 	loadPromise?: Promise<void>;
 	loadPromiseResolver: () => void;
@@ -40,6 +41,10 @@ export class BulkAccountLoader {
 		publicKey: PublicKey,
 		callback: (buffer: Buffer, slot: number) => void
 	): Promise<string> {
+		if (!publicKey) {
+			console.trace(`Caught adding blank publickey to bulkAccountLoader`);
+		}
+
 		const existingSize = this.accountsToLoad.size;
 
 		const callbackId = uuidv4();
@@ -74,6 +79,7 @@ export class BulkAccountLoader {
 		if (existingAccountToLoad) {
 			existingAccountToLoad.callbacks.delete(callbackId);
 			if (existingAccountToLoad.callbacks.size === 0) {
+				this.bufferAndSlotMap.delete(publicKey.toString());
 				this.accountsToLoad.delete(existingAccountToLoad.publicKey.toString());
 			}
 		}
@@ -149,9 +155,11 @@ export class BulkAccountLoader {
 		const requests = new Array<{ methodName: string; args: any }>();
 		for (const accountsToLoadChunk of accountsToLoadChunks) {
 			const args = [
-				accountsToLoadChunk.map((accountToLoad) => {
-					return accountToLoad.publicKey.toBase58();
-				}),
+				accountsToLoadChunk
+					.filter((accountToLoad) => accountToLoad.callbacks.size > 0)
+					.map((accountToLoad) => {
+						return accountToLoad.publicKey.toBase58();
+					}),
 				{ commitment: this.commitment },
 			];
 
@@ -172,12 +180,11 @@ export class BulkAccountLoader {
 			return;
 		}
 
-		for (const i in rpcResponses) {
-			const rpcResponse = rpcResponses[i];
+		rpcResponses.forEach((rpcResponse, i) => {
 			if (!rpcResponse.result) {
 				console.error('rpc response missing result:');
 				console.log(JSON.stringify(rpcResponse));
-				continue;
+				return;
 			}
 			const newSlot = rpcResponse.result.context.slot;
 
@@ -186,13 +193,16 @@ export class BulkAccountLoader {
 			}
 
 			const accountsToLoad = accountsToLoadChunks[i];
-			for (const j in accountsToLoad) {
-				const accountToLoad = accountsToLoad[j];
+			accountsToLoad.forEach((accountToLoad, j) => {
+				if (accountToLoad.callbacks.size === 0) {
+					return;
+				}
+
 				const key = accountToLoad.publicKey.toBase58();
 				const oldRPCResponse = this.bufferAndSlotMap.get(key);
 
-				if (oldRPCResponse && newSlot <= oldRPCResponse.slot) {
-					continue;
+				if (oldRPCResponse && newSlot < oldRPCResponse.slot) {
+					return;
 				}
 
 				let newBuffer: Buffer | undefined = undefined;
@@ -208,7 +218,7 @@ export class BulkAccountLoader {
 						buffer: newBuffer,
 					});
 					this.handleAccountCallbacks(accountToLoad, newBuffer, newSlot);
-					continue;
+					return;
 				}
 
 				const oldBuffer = oldRPCResponse.buffer;
@@ -219,8 +229,8 @@ export class BulkAccountLoader {
 					});
 					this.handleAccountCallbacks(accountToLoad, newBuffer, newSlot);
 				}
-			}
-		}
+			});
+		});
 	}
 
 	handleAccountCallbacks(
@@ -229,12 +239,26 @@ export class BulkAccountLoader {
 		slot: number
 	): void {
 		for (const [_, callback] of accountToLoad.callbacks) {
-			callback(buffer, slot);
+			try {
+				callback(buffer, slot);
+			} catch (e) {
+				console.log('Bulk account load: error in account callback');
+				console.log('accounto to load', accountToLoad.publicKey.toString());
+				console.log('buffer', buffer.toString('base64'));
+				for (const callback of accountToLoad.callbacks.values()) {
+					console.log('account to load cb', callback);
+				}
+				throw e;
+			}
 		}
 	}
 
 	public getBufferAndSlot(publicKey: PublicKey): BufferAndSlot | undefined {
 		return this.bufferAndSlotMap.get(publicKey.toString());
+	}
+
+	public getSlot(): number {
+		return this.mostRecentSlot;
 	}
 
 	public startPolling(): void {

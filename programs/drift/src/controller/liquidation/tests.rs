@@ -19,9 +19,10 @@ pub mod liquidate_perp {
     };
     use crate::math::liquidation::is_user_being_liquidated;
     use crate::math::margin::{
-        calculate_margin_requirement_and_total_collateral, MarginRequirementType,
+        calculate_margin_requirement_and_total_collateral_and_liability_info, MarginRequirementType,
     };
     use crate::math::position::calculate_base_asset_value_with_oracle_price;
+    use crate::state::margin_calculation::{MarginCalculation, MarginContext};
     use crate::state::oracle::{HistoricalOracleData, OracleSource};
     use crate::state::oracle_map::OracleMap;
     use crate::state::perp_market::{MarketStatus, PerpMarket, AMM};
@@ -29,7 +30,7 @@ pub mod liquidate_perp {
     use crate::state::spot_market::{SpotBalanceType, SpotMarket};
     use crate::state::spot_market_map::SpotMarketMap;
     use crate::state::user::{
-        Order, OrderStatus, OrderType, PerpPosition, SpotPosition, User, UserStats, UserStatus,
+        MarginMode, Order, OrderStatus, OrderType, PerpPosition, SpotPosition, User, UserStats,
     };
     use crate::test_utils::*;
     use crate::test_utils::{get_orders, get_positions, get_pyth_price, get_spot_positions};
@@ -166,7 +167,7 @@ pub mod liquidate_perp {
         assert_eq!(user.perp_positions[0].base_asset_amount, 0);
         assert_eq!(
             user.perp_positions[0].quote_asset_amount,
-            -52 * QUOTE_PRECISION_I64
+            -51 * QUOTE_PRECISION_I64
         );
         assert_eq!(user.perp_positions[0].open_orders, 0);
         assert_eq!(user.perp_positions[0].open_bids, 0);
@@ -181,7 +182,7 @@ pub mod liquidate_perp {
         );
 
         let market_after = perp_market_map.get_ref(&0).unwrap();
-        assert_eq!(market_after.amm.total_liquidation_fee, QUOTE_PRECISION);
+        assert_eq!(market_after.amm.total_liquidation_fee, 0);
     }
 
     #[test]
@@ -316,7 +317,7 @@ pub mod liquidate_perp {
         assert_eq!(user.perp_positions[0].base_asset_amount, 0);
         assert_eq!(
             user.perp_positions[0].quote_asset_amount,
-            -52 * QUOTE_PRECISION_I64
+            -51 * QUOTE_PRECISION_I64
         );
         assert_eq!(user.perp_positions[0].open_orders, 0);
         assert_eq!(user.perp_positions[0].open_bids, 0);
@@ -331,7 +332,7 @@ pub mod liquidate_perp {
         );
 
         let market_after = perp_market_map.get_ref(&0).unwrap();
-        assert_eq!(market_after.amm.total_liquidation_fee, QUOTE_PRECISION);
+        assert_eq!(market_after.amm.total_liquidation_fee, 0);
     }
 
     #[test]
@@ -573,7 +574,7 @@ pub mod liquidate_perp {
         let mut user_stats = UserStats::default();
         let mut liquidator_stats = UserStats::default();
         let state = State {
-            liquidation_margin_buffer_ratio: MARGIN_PRECISION as u32 / 50,
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
             initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
             liquidation_duration: 150,
             ..Default::default()
@@ -601,9 +602,9 @@ pub mod liquidate_perp {
             user.perp_positions[0].base_asset_amount,
             BASE_PRECISION_I64 / 2
         );
-        assert_eq!(user.perp_positions[0].quote_asset_amount, -101000000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -100500000);
         assert_eq!(user.perp_positions[0].quote_entry_amount, -75000000);
-        assert_eq!(user.perp_positions[0].quote_break_even_amount, -76000000);
+        assert_eq!(user.perp_positions[0].quote_break_even_amount, -75500000);
         assert_eq!(user.perp_positions[0].open_orders, 0);
         assert_eq!(user.perp_positions[0].open_bids, 0);
 
@@ -614,7 +615,7 @@ pub mod liquidate_perp {
         assert_eq!(liquidator.perp_positions[0].quote_asset_amount, -49500000);
 
         let market_after = perp_market_map.get_ref(&0).unwrap();
-        assert_eq!(market_after.amm.total_liquidation_fee, 500000)
+        assert_eq!(market_after.amm.total_liquidation_fee, 0)
     }
 
     #[test]
@@ -724,7 +725,7 @@ pub mod liquidate_perp {
         let mut user_stats = UserStats::default();
         let mut liquidator_stats = UserStats::default();
         let state = State {
-            liquidation_margin_buffer_ratio: MARGIN_PRECISION as u32 / 50,
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
             initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
             liquidation_duration: 150,
             ..Default::default()
@@ -755,16 +756,18 @@ pub mod liquidate_perp {
         assert_eq!(user.perp_positions[0].open_orders, 0);
         assert_eq!(user.perp_positions[0].open_bids, 0);
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &perp_market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(state.liquidation_margin_buffer_ratio as u128),
-            )
-            .unwrap();
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(state.liquidation_margin_buffer_ratio),
+        )
+        .unwrap();
 
         // user out of liq territory
         assert_eq!(
@@ -886,13 +889,15 @@ pub mod liquidate_perp {
             ..User::default()
         };
 
-        let (margin_req, _, _, _) = calculate_margin_requirement_and_total_collateral(
+        let MarginCalculation {
+            margin_requirement: margin_req,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
             &user,
             &perp_market_map,
-            MarginRequirementType::Maintenance,
             &spot_market_map,
             &mut oracle_map,
-            None,
+            MarginContext::standard(MarginRequirementType::Maintenance),
         )
         .unwrap();
         assert_eq!(margin_req, 140014010000);
@@ -910,13 +915,15 @@ pub mod liquidate_perp {
             market_to_edit.imf_factor *= 10;
         }
 
-        let (margin_req2, _, _, _) = calculate_margin_requirement_and_total_collateral(
+        let MarginCalculation {
+            margin_requirement: margin_req2,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
             &user,
             &perp_market_map,
-            MarginRequirementType::Maintenance,
             &spot_market_map,
             &mut oracle_map,
-            None,
+            MarginContext::standard(MarginRequirementType::Maintenance),
         )
         .unwrap();
         assert_eq!(margin_req2, 1040104010000);
@@ -925,7 +932,7 @@ pub mod liquidate_perp {
             &perp_market_map,
             &spot_market_map,
             &mut oracle_map,
-            0
+            MARGIN_PRECISION / 50
         )
         .unwrap());
 
@@ -1464,6 +1471,283 @@ pub mod liquidate_perp {
                 status: OrderStatus::Open,
                 order_type: OrderType::Limit,
                 direction: PositionDirection::Long,
+                base_asset_amount: 10 * BASE_PRECISION_U64,
+                slot: 0,
+                ..Order::default()
+            }),
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: 20 * BASE_PRECISION_I64,
+                quote_asset_amount: -2000 * QUOTE_PRECISION_I64,
+                quote_entry_amount: -2000 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: -2000 * QUOTE_PRECISION_I64,
+                open_orders: 1,
+                open_bids: 10 * BASE_PRECISION_I64,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+
+            ..User::default()
+        };
+
+        let mut liquidator = User {
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 500 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let user_key = Pubkey::default();
+        let liquidator_key = Pubkey::default();
+
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: (LIQUIDATION_PCT_PRECISION / 10) as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+        liquidate_perp(
+            0,
+            10 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 70010000);
+        assert_eq!(user.perp_positions[0].base_asset_amount, 20000000000);
+
+        // ~60% of liquidation finished
+        let slot = 76_u64;
+        liquidate_perp(
+            0,
+            10 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 96010000);
+        assert_eq!(user.perp_positions[0].base_asset_amount, 14800000000);
+
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(state.liquidation_margin_buffer_ratio),
+        )
+        .unwrap();
+
+        let margin_shortage =
+            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
+
+        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
+            / (margin_shortage + user.liquidation_margin_freed as u128);
+        assert_eq!(pct_margin_freed, 600024); // ~60%
+
+        // dont change slot, still ~60% done
+        let slot = 76_u64;
+        liquidate_perp(
+            0,
+            100 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 96010000); // no new margin freed
+        assert_eq!(user.perp_positions[0].base_asset_amount, 14800000000);
+
+        // ~76% of liquidation finished
+        let slot = 101_u64;
+        liquidate_perp(
+            0,
+            100 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 122660000);
+        assert_eq!(user.perp_positions[0].base_asset_amount, 9470000000);
+
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(state.liquidation_margin_buffer_ratio),
+        )
+        .unwrap();
+
+        let margin_shortage =
+            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
+
+        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
+            / (margin_shortage + user.liquidation_margin_freed as u128);
+        assert_eq!(pct_margin_freed, 766577); // ~76%
+
+        // ~100% of liquidation finished
+        let slot = 136_u64;
+        liquidate_perp(
+            0,
+            100 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.status, 0);
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 0);
+        assert_eq!(user.perp_positions[0].base_asset_amount, 2000000000);
+    }
+
+    #[test]
+    pub fn liquidation_accelerated() {
+        let now = 1_i64;
+        let slot = 1_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: BASE_PRECISION_I128,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                funding_period: ONE_HOUR,
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Initialized,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            maintenance_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData::default_price(QUOTE_PRECISION_I64),
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut user = User {
+            orders: get_orders(Order {
+                market_index: 0,
+                status: OrderStatus::Open,
+                order_type: OrderType::Limit,
+                direction: PositionDirection::Long,
                 base_asset_amount: BASE_PRECISION_U64,
                 slot: 0,
                 ..Order::default()
@@ -1504,7 +1788,7 @@ pub mod liquidate_perp {
         let mut user_stats = UserStats::default();
         let mut liquidator_stats = UserStats::default();
         let state = State {
-            liquidation_margin_buffer_ratio: MARGIN_PRECISION as u32 / 50,
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
             initial_pct_to_liquidate: (LIQUIDATION_PCT_PRECISION / 10) as u16,
             liquidation_duration: 150,
             ..Default::default()
@@ -1528,143 +1812,7 @@ pub mod liquidate_perp {
         )
         .unwrap();
 
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 7010000);
-        assert_eq!(user.perp_positions[0].base_asset_amount, 2000000000);
-
-        // ~60% of liquidation finished
-        let slot = 76_u64;
-        liquidate_perp(
-            0,
-            10 * BASE_PRECISION_U64,
-            None,
-            &mut user,
-            &user_key,
-            &mut user_stats,
-            &mut liquidator,
-            &liquidator_key,
-            &mut liquidator_stats,
-            &perp_market_map,
-            &spot_market_map,
-            &mut oracle_map,
-            slot,
-            now,
-            &state,
-        )
-        .unwrap();
-
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 9610000);
-        assert_eq!(user.perp_positions[0].base_asset_amount, 1480000000);
-
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &perp_market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(state.liquidation_margin_buffer_ratio as u128),
-            )
-            .unwrap();
-
-        let margin_shortage =
-            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
-
-        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
-            / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 600249); // ~60%
-
-        // dont change slot, still ~60% done
-        let slot = 76_u64;
-        liquidate_perp(
-            0,
-            10 * BASE_PRECISION_U64,
-            None,
-            &mut user,
-            &user_key,
-            &mut user_stats,
-            &mut liquidator,
-            &liquidator_key,
-            &mut liquidator_stats,
-            &perp_market_map,
-            &spot_market_map,
-            &mut oracle_map,
-            slot,
-            now,
-            &state,
-        )
-        .unwrap();
-
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 9610000); // no new margin freed
-        assert_eq!(user.perp_positions[0].base_asset_amount, 1480000000);
-
-        // ~76% of liquidation finished
-        let slot = 101_u64;
-        liquidate_perp(
-            0,
-            10 * BASE_PRECISION_U64,
-            None,
-            &mut user,
-            &user_key,
-            &mut user_stats,
-            &mut liquidator,
-            &liquidator_key,
-            &mut liquidator_stats,
-            &perp_market_map,
-            &spot_market_map,
-            &mut oracle_map,
-            slot,
-            now,
-            &state,
-        )
-        .unwrap();
-
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 12310000);
-        assert_eq!(user.perp_positions[0].base_asset_amount, 940000000);
-
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &perp_market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(state.liquidation_margin_buffer_ratio as u128),
-            )
-            .unwrap();
-
-        let margin_shortage =
-            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
-
-        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
-            / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 768894); // ~76%
-
-        // ~100% of liquidation finished
-        let slot = 136_u64;
-        liquidate_perp(
-            0,
-            10 * BASE_PRECISION_U64,
-            None,
-            &mut user,
-            &user_key,
-            &mut user_stats,
-            &mut liquidator,
-            &liquidator_key,
-            &mut liquidator_stats,
-            &perp_market_map,
-            &spot_market_map,
-            &mut oracle_map,
-            slot,
-            now,
-            &state,
-        )
-        .unwrap();
-
-        assert_eq!(user.status, UserStatus::Active);
+        assert_eq!(user.status, 0);
         assert_eq!(user.last_active_slot, 1);
         assert_eq!(user.liquidation_margin_freed, 0);
         assert_eq!(user.perp_positions[0].base_asset_amount, 200000000);
@@ -1765,7 +1913,7 @@ pub mod liquidate_perp {
         let mut user_stats = UserStats::default();
         let mut liquidator_stats = UserStats::default();
         let state = State {
-            liquidation_margin_buffer_ratio: MARGIN_PRECISION as u32 / 50,
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
             initial_pct_to_liquidate: (LIQUIDATION_PCT_PRECISION / 10) as u16,
             liquidation_duration: 150,
             ..Default::default()
@@ -1790,12 +1938,1243 @@ pub mod liquidate_perp {
         .unwrap();
 
         assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 1560000);
-        assert_eq!(user.perp_positions[0].base_asset_amount, 610000000);
+        assert_eq!(user.liquidation_margin_freed, 4800000);
+        assert_eq!(user.perp_positions[0].base_asset_amount, 0);
+    }
+
+    #[test]
+    pub fn successful_liquidation_half_of_if_fee() {
+        let now = 0_i64;
+        let slot = 0_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                quote_asset_amount: 50 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: BASE_PRECISION_I128,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                funding_period: 3600,
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            number_of_users: 1,
+            status: MarketStatus::Initialized,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut user = User {
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: -BASE_PRECISION_I64,
+                quote_asset_amount: 100 * QUOTE_PRECISION_I64,
+                quote_entry_amount: 100 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: 100 * QUOTE_PRECISION_I64,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 15 * SPOT_BALANCE_PRECISION_U64 / 10, // $1.5
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let mut liquidator = User {
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let user_key = Pubkey::default();
+        let liquidator_key = Pubkey::default();
+
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+        liquidate_perp(
+            0,
+            BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        // .5% * 100 * .95 =$0.475
+        assert_eq!(market_after.amm.total_liquidation_fee, 475000);
+    }
+
+    #[test]
+    pub fn successful_liquidation_portion_of_if_fee() {
+        let now = 0_i64;
+        let slot = 0_u64;
+
+        let mut oracle_price = get_hardcoded_pyth_price(23244136, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                quote_asset_amount: 50 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: BASE_PRECISION_I128,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                funding_period: 3600,
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            number_of_users: 1,
+            status: MarketStatus::Initialized,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut user = User {
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: -299400000000,
+                quote_asset_amount: 6959294318,
+                quote_entry_amount: 6959294318,
+                quote_break_even_amount: 6959294318,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 113838792 * 1000,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let mut liquidator = User {
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50000 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let user_key = Pubkey::default();
+        let liquidator_key = Pubkey::default();
+
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+        let state = State {
+            liquidation_margin_buffer_ratio: 200,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+        liquidate_perp(
+            0,
+            300 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        assert!(!user.is_being_liquidated());
+        assert_eq!(market_after.amm.total_liquidation_fee, 41787043);
+    }
+
+    #[test]
+    pub fn successful_liquidate_perp_with_fill_long_high_leverage() {
+        let now = 0_i64;
+        let slot = 0_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: BASE_PRECISION_I128,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                funding_period: ONE_HOUR,
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            high_leverage_margin_ratio_initial: 200,
+            high_leverage_margin_ratio_maintenance: 100,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Initialized,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 200,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 200,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            maintenance_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData::default_price(QUOTE_PRECISION_I64),
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut user = User {
+            orders: get_orders(Order {
+                market_index: 0,
+                status: OrderStatus::Open,
+                order_type: OrderType::Limit,
+                direction: PositionDirection::Long,
+                base_asset_amount: BASE_PRECISION_U64,
+                slot: 0,
+                ..Order::default()
+            }),
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: 2 * BASE_PRECISION_I64,
+                quote_asset_amount: -200 * QUOTE_PRECISION_I64,
+                quote_entry_amount: -200 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: -200 * QUOTE_PRECISION_I64,
+                open_orders: 1,
+                open_bids: BASE_PRECISION_I64,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 3 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            margin_mode: MarginMode::HighLeverage,
+            ..User::default()
+        };
+
+        let mut liquidator = User {
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let user_key = Pubkey::default();
+        let liquidator_key = Pubkey::default();
+
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+        liquidate_perp(
+            0,
+            10 * BASE_PRECISION_U64,
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            now,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.perp_positions[0].base_asset_amount, 500000000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -51500000);
+        assert_eq!(user.perp_positions[0].quote_entry_amount, -50000000);
+        assert_eq!(user.perp_positions[0].quote_break_even_amount, -51500000);
+        assert_eq!(user.perp_positions[0].open_orders, 0);
+        assert_eq!(user.perp_positions[0].open_bids, 0);
+
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(state.liquidation_margin_buffer_ratio),
+        )
+        .unwrap();
+
+        // user out of liq territory
+        assert_eq!(
+            total_collateral.unsigned_abs(),
+            margin_requirement_plus_buffer
+        );
+
+        let oracle_price = oracle_map.get_price_data(&oracle_price_key).unwrap().price;
+
+        let perp_value = calculate_base_asset_value_with_oracle_price(
+            user.perp_positions[0].base_asset_amount as i128,
+            oracle_price,
+        )
+        .unwrap();
+
+        let margin_ratio = total_collateral.unsigned_abs() * MARGIN_PRECISION_U128 / perp_value;
+
+        assert_eq!(margin_ratio, 300);
+
+        assert_eq!(liquidator.perp_positions[0].base_asset_amount, 1500000000);
+        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, -149250000);
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        assert_eq!(market_after.amm.total_liquidation_fee, 750000)
+    }
+}
+
+pub mod liquidate_perp_with_fill {
+
+    use crate::state::state::State;
+    use std::str::FromStr;
+
+    use anchor_lang::prelude::AccountLoader;
+    use anchor_lang::Owner;
+    use solana_program::clock::Clock;
+    use solana_program::pubkey::Pubkey;
+
+    use crate::controller::liquidation::liquidate_perp_with_fill;
+    use crate::controller::position::PositionDirection;
+    use crate::create_anchor_account_info;
+
+    use crate::math::constants::{
+        AMM_RESERVE_PRECISION, BASE_PRECISION_I64, BASE_PRECISION_U64, LIQUIDATION_FEE_PRECISION,
+        LIQUIDATION_PCT_PRECISION, PEG_PRECISION, PRICE_PRECISION_U64, QUOTE_PRECISION_I128,
+        QUOTE_PRECISION_I64, SPOT_BALANCE_PRECISION_U64, SPOT_CUMULATIVE_INTEREST_PRECISION,
+        SPOT_WEIGHT_PRECISION,
+    };
+
+    use crate::state::oracle::{HistoricalOracleData, OracleSource};
+    use crate::state::oracle_map::OracleMap;
+    use crate::state::perp_market::{MarketStatus, PerpMarket, AMM};
+    use crate::state::perp_market_map::PerpMarketMap;
+    use crate::state::spot_market::{SpotBalanceType, SpotMarket};
+    use crate::state::spot_market_map::SpotMarketMap;
+    use crate::state::user::{
+        Order, OrderStatus, OrderType, PerpPosition, SpotPosition, User, UserStats,
+    };
+    use crate::state::user_map::{UserMap, UserStatsMap};
+    use crate::test_utils::*;
+    use crate::test_utils::{get_orders, get_positions, get_pyth_price, get_spot_positions};
+    use crate::{create_account_info, PRICE_PRECISION_I64};
+
+    #[test]
+    pub fn successful_liquidate_perp_with_fill_long() {
+        let now = 0_i64;
+        let slot = 100_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                terminal_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                order_tick_size: 1,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: 0,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Active,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let user_key = Pubkey::new_unique();
+        let liquidator_key = Pubkey::new_unique();
+
+        let mut user = User {
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: BASE_PRECISION_I64,
+                quote_asset_amount: -100 * QUOTE_PRECISION_I64,
+                quote_entry_amount: -100 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: -100 * QUOTE_PRECISION_I64,
+                open_orders: 0,
+                open_bids: 0,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 4 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+
+            ..User::default()
+        };
+
+        create_anchor_account_info!(user, &user_key, User, user_account_info);
+        let user_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&user_account_info).unwrap();
+
+        let liquidator_authority = Pubkey::new_unique();
+        let mut liquidator = User {
+            authority: liquidator_authority,
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        create_anchor_account_info!(liquidator, &liquidator_key, User, liquidator_account_info);
+        let liquidator_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&liquidator_account_info).unwrap();
+
+        let mut user_stats = UserStats::default();
+
+        create_anchor_account_info!(user_stats, UserStats, user_stats_account_info);
+        let user_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&user_stats_account_info).unwrap();
+
+        let mut liquidator_stats = UserStats::default();
+
+        create_anchor_account_info!(liquidator_stats, UserStats, liquidator_stats_account_info);
+        let liquidator_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&liquidator_stats_account_info).unwrap();
+
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let maker_key = Pubkey::new_unique();
+        let maker_authority = Pubkey::new_unique();
+        let mut maker = User {
+            authority: maker_authority,
+            orders: get_orders(Order {
+                status: OrderStatus::Open,
+                market_index: 0,
+                post_only: true,
+                order_type: OrderType::Limit,
+                direction: PositionDirection::Long,
+                base_asset_amount: BASE_PRECISION_U64 / 2,
+                price: 100 * PRICE_PRECISION_U64,
+                slot: slot - 1,
+                ..Order::default()
+            }),
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                open_orders: 1,
+                open_bids: BASE_PRECISION_I64 / 2,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 100 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+        create_anchor_account_info!(maker, &maker_key, User, maker_account_info);
+        let makers_and_referrers = UserMap::load_one(&maker_account_info).unwrap();
+
+        let mut maker_stats = UserStats {
+            authority: maker_authority,
+            ..UserStats::default()
+        };
+        create_anchor_account_info!(maker_stats, UserStats, maker_stats_account_info);
+        let maker_and_referrer_stats = UserStatsMap::load_one(&maker_stats_account_info).unwrap();
+
+        let clock = Clock {
+            slot,
+            unix_timestamp: now,
+            ..Clock::default()
+        };
+
+        liquidate_perp_with_fill(
+            0,
+            &user_account_loader,
+            &user_key,
+            &user_stats_account_loader,
+            &liquidator_account_loader,
+            &liquidator_key,
+            &liquidator_stats_account_loader,
+            &makers_and_referrers,
+            &maker_and_referrer_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            &clock,
+            &state,
+        )
+        .unwrap();
+
+        let user = user_account_loader.load().unwrap();
+        assert_eq!(user.perp_positions[0].base_asset_amount, 640000000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -64396000);
+        assert_eq!(user.perp_positions[0].open_orders, 0);
+        assert_eq!(user.perp_positions[0].open_bids, 0);
+
+        let maker = makers_and_referrers.get_ref(&maker_key).unwrap();
+        assert_eq!(maker.perp_positions[0].base_asset_amount, 360000000);
+        assert_eq!(maker.perp_positions[0].quote_asset_amount, -35992800);
+
+        let liquidator = liquidator_account_loader.load().unwrap();
+        assert_eq!(liquidator.perp_positions[0].base_asset_amount, 0);
+        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, 3600);
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        assert_eq!(market_after.amm.total_liquidation_fee, 360000);
+    }
+
+    #[test]
+    pub fn successful_liquidate_perp_with_fill_short() {
+        let now = 0_i64;
+        let slot = 100_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                terminal_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                order_tick_size: 1,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: 0,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Active,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let user_key = Pubkey::new_unique();
+        let liquidator_key = Pubkey::new_unique();
+
+        let mut user = User {
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: -BASE_PRECISION_I64,
+                quote_asset_amount: 100 * QUOTE_PRECISION_I64,
+                quote_entry_amount: 100 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: 100 * QUOTE_PRECISION_I64,
+                open_orders: 0,
+                open_bids: 0,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 4 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+
+            ..User::default()
+        };
+
+        create_anchor_account_info!(user, &user_key, User, user_account_info);
+        let user_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&user_account_info).unwrap();
+
+        let liquidator_authority = Pubkey::new_unique();
+        let mut liquidator = User {
+            authority: liquidator_authority,
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        create_anchor_account_info!(liquidator, &liquidator_key, User, liquidator_account_info);
+        let liquidator_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&liquidator_account_info).unwrap();
+
+        let mut user_stats = UserStats::default();
+
+        create_anchor_account_info!(user_stats, UserStats, user_stats_account_info);
+        let user_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&user_stats_account_info).unwrap();
+
+        let mut liquidator_stats = UserStats::default();
+
+        create_anchor_account_info!(liquidator_stats, UserStats, liquidator_stats_account_info);
+        let liquidator_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&liquidator_stats_account_info).unwrap();
+
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let maker_key = Pubkey::new_unique();
+        let maker_authority = Pubkey::new_unique();
+        let mut maker = User {
+            authority: maker_authority,
+            orders: get_orders(Order {
+                status: OrderStatus::Open,
+                market_index: 0,
+                post_only: true,
+                order_type: OrderType::Limit,
+                direction: PositionDirection::Short,
+                base_asset_amount: BASE_PRECISION_U64 / 2,
+                price: 100 * PRICE_PRECISION_U64,
+                slot: slot - 1,
+                ..Order::default()
+            }),
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                open_orders: 1,
+                open_asks: -BASE_PRECISION_I64 / 2,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 100 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+        create_anchor_account_info!(maker, &maker_key, User, maker_account_info);
+        let makers_and_referrers = UserMap::load_one(&maker_account_info).unwrap();
+
+        let mut maker_stats = UserStats {
+            authority: maker_authority,
+            ..UserStats::default()
+        };
+        create_anchor_account_info!(maker_stats, UserStats, maker_stats_account_info);
+        let maker_and_referrer_stats = UserStatsMap::load_one(&maker_stats_account_info).unwrap();
+
+        let clock = Clock {
+            slot,
+            unix_timestamp: now,
+            ..Clock::default()
+        };
+
+        liquidate_perp_with_fill(
+            0,
+            &user_account_loader,
+            &user_key,
+            &user_stats_account_loader,
+            &liquidator_account_loader,
+            &liquidator_key,
+            &liquidator_stats_account_loader,
+            &makers_and_referrers,
+            &maker_and_referrer_stats,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            &clock,
+            &state,
+        )
+        .unwrap();
+
+        let user = user_account_loader.load().unwrap();
+        assert_eq!(user.perp_positions[0].base_asset_amount, -640000000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, 63604000);
+        assert_eq!(user.perp_positions[0].open_orders, 0);
+        assert_eq!(user.perp_positions[0].open_bids, 0);
+
+        let maker = makers_and_referrers.get_ref(&maker_key).unwrap();
+        assert_eq!(maker.perp_positions[0].base_asset_amount, -360000000);
+        assert_eq!(maker.perp_positions[0].quote_asset_amount, 36007200);
+
+        let liquidator = liquidator_account_loader.load().unwrap();
+        assert_eq!(liquidator.perp_positions[0].base_asset_amount, 0);
+        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, 3600);
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        assert_eq!(market_after.amm.total_liquidation_fee, 360000);
+    }
+
+    #[test]
+    pub fn successful_liquidate_perp_with_fill_long_with_amm() {
+        let now = 0_i64;
+        let slot = 100_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        oracle_price.curr_slot = slot;
+        oracle_price.valid_slot = slot;
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                terminal_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                order_tick_size: 1,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: 0,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Active,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        market.amm.max_fill_reserve_fraction = 1;
+        market.amm.max_base_asset_reserve = u64::MAX as u128;
+        market.amm.min_base_asset_reserve = 0;
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let user_key = Pubkey::new_unique();
+        let liquidator_key = Pubkey::new_unique();
+
+        let mut user = User {
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: BASE_PRECISION_I64,
+                quote_asset_amount: -100 * QUOTE_PRECISION_I64,
+                quote_entry_amount: -100 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: -100 * QUOTE_PRECISION_I64,
+                open_orders: 0,
+                open_bids: 0,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 4 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+
+            ..User::default()
+        };
+
+        create_anchor_account_info!(user, &user_key, User, user_account_info);
+        let user_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&user_account_info).unwrap();
+
+        let liquidator_authority = Pubkey::new_unique();
+        let mut liquidator = User {
+            authority: liquidator_authority,
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        create_anchor_account_info!(liquidator, &liquidator_key, User, liquidator_account_info);
+        let liquidator_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&liquidator_account_info).unwrap();
+
+        let mut user_stats = UserStats::default();
+
+        create_anchor_account_info!(user_stats, UserStats, user_stats_account_info);
+        let user_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&user_stats_account_info).unwrap();
+
+        let mut liquidator_stats = UserStats::default();
+
+        create_anchor_account_info!(liquidator_stats, UserStats, liquidator_stats_account_info);
+        let liquidator_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&liquidator_stats_account_info).unwrap();
+
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let clock = Clock {
+            slot,
+            unix_timestamp: now,
+            ..Clock::default()
+        };
+
+        liquidate_perp_with_fill(
+            0,
+            &user_account_loader,
+            &user_key,
+            &user_stats_account_loader,
+            &liquidator_account_loader,
+            &liquidator_key,
+            &liquidator_stats_account_loader,
+            &UserMap::empty(),
+            &UserStatsMap::empty(),
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            &clock,
+            &state,
+        )
+        .unwrap();
+
+        let user = user_account_loader.load().unwrap();
+        assert_eq!(user.perp_positions[0].base_asset_amount, 640000000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -64523715);
+        assert_eq!(user.perp_positions[0].open_orders, 0);
+        assert_eq!(user.perp_positions[0].open_bids, 0);
+
+        let liquidator = liquidator_account_loader.load().unwrap();
+        assert_eq!(liquidator.perp_positions[0].base_asset_amount, 0);
+        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, 3587);
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        assert_eq!(market_after.amm.total_liquidation_fee, 358708);
+    }
+
+    #[test]
+    pub fn successful_liquidate_perp_with_fill_short_with_amm() {
+        let now = 0_i64;
+        let slot = 100_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        oracle_price.curr_slot = slot;
+        oracle_price.valid_slot = slot;
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                terminal_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                order_tick_size: 1,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: 0,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Active,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        market.amm.max_fill_reserve_fraction = 1;
+        market.amm.max_base_asset_reserve = u64::MAX as u128;
+        market.amm.min_base_asset_reserve = 0;
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let user_key = Pubkey::new_unique();
+        let liquidator_key = Pubkey::new_unique();
+
+        let mut user = User {
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: -BASE_PRECISION_I64,
+                quote_asset_amount: 100 * QUOTE_PRECISION_I64,
+                quote_entry_amount: 100 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: 100 * QUOTE_PRECISION_I64,
+                open_orders: 0,
+                open_bids: 0,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 4 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+
+            ..User::default()
+        };
+
+        create_anchor_account_info!(user, &user_key, User, user_account_info);
+        let user_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&user_account_info).unwrap();
+
+        let liquidator_authority = Pubkey::new_unique();
+        let mut liquidator = User {
+            authority: liquidator_authority,
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 50 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        create_anchor_account_info!(liquidator, &liquidator_key, User, liquidator_account_info);
+        let liquidator_account_loader: AccountLoader<User> =
+            AccountLoader::try_from(&liquidator_account_info).unwrap();
+
+        let mut user_stats = UserStats::default();
+
+        create_anchor_account_info!(user_stats, UserStats, user_stats_account_info);
+        let user_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&user_stats_account_info).unwrap();
+
+        let mut liquidator_stats = UserStats::default();
+
+        create_anchor_account_info!(liquidator_stats, UserStats, liquidator_stats_account_info);
+        let liquidator_stats_account_loader: AccountLoader<UserStats> =
+            AccountLoader::try_from(&liquidator_stats_account_info).unwrap();
+
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let clock = Clock {
+            slot,
+            unix_timestamp: now,
+            ..Clock::default()
+        };
+
+        liquidate_perp_with_fill(
+            0,
+            &user_account_loader,
+            &user_key,
+            &user_stats_account_loader,
+            &liquidator_account_loader,
+            &liquidator_key,
+            &liquidator_stats_account_loader,
+            &UserMap::empty(),
+            &UserStatsMap::empty(),
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            &clock,
+            &state,
+        )
+        .unwrap();
+
+        let user = user_account_loader.load().unwrap();
+        assert_eq!(user.perp_positions[0].base_asset_amount, -640000000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, 63472500);
+        assert_eq!(user.perp_positions[0].open_orders, 0);
+        assert_eq!(user.perp_positions[0].open_bids, 0);
+
+        let liquidator = liquidator_account_loader.load().unwrap();
+        assert_eq!(liquidator.perp_positions[0].base_asset_amount, 0);
+        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, 3613);
+
+        let market_after = perp_market_map.get_ref(&0).unwrap();
+        assert_eq!(market_after.amm.total_liquidation_fee, 361300);
     }
 }
 
 pub mod liquidate_spot {
+    use crate::state::state::State;
     use std::ops::Deref;
     use std::str::FromStr;
 
@@ -1807,20 +3186,19 @@ pub mod liquidate_spot {
     use crate::error::ErrorCode;
     use crate::math::constants::{
         LIQUIDATION_FEE_PRECISION, LIQUIDATION_PCT_PRECISION, MARGIN_PRECISION,
-        MARGIN_PRECISION_U128, PERCENTAGE_PRECISION, PRICE_PRECISION, PRICE_PRECISION_U64,
-        SPOT_BALANCE_PRECISION, SPOT_BALANCE_PRECISION_U64, SPOT_CUMULATIVE_INTEREST_PRECISION,
-        SPOT_WEIGHT_PRECISION,
+        MARGIN_PRECISION_U128, PRICE_PRECISION, PRICE_PRECISION_U64, SPOT_BALANCE_PRECISION,
+        SPOT_BALANCE_PRECISION_U64, SPOT_CUMULATIVE_INTEREST_PRECISION, SPOT_WEIGHT_PRECISION,
     };
-    use crate::math::margin::{
-        calculate_margin_requirement_and_total_collateral, MarginRequirementType,
-    };
+    use crate::math::margin::calculate_margin_requirement_and_total_collateral_and_liability_info;
     use crate::math::spot_balance::{get_strict_token_value, get_token_amount, get_token_value};
-    use crate::state::oracle::HistoricalOracleData;
+    use crate::state::margin_calculation::{MarginCalculation, MarginContext};
     use crate::state::oracle::OracleSource;
+    use crate::state::oracle::{HistoricalOracleData, StrictOraclePrice};
     use crate::state::oracle_map::OracleMap;
     use crate::state::perp_market_map::PerpMarketMap;
     use crate::state::spot_market::{SpotBalanceType, SpotMarket};
     use crate::state::spot_market_map::SpotMarketMap;
+    use crate::state::user::UserStats;
     use crate::state::user::{Order, PerpPosition, SpotPosition, User};
     use crate::test_utils::*;
     use crate::test_utils::{get_pyth_price, get_spot_positions};
@@ -1878,6 +3256,7 @@ pub mod liquidate_spot {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -1923,6 +3302,16 @@ pub mod liquidate_spot {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
         liquidate_spot(
             0,
             1,
@@ -1930,16 +3319,16 @@ pub mod liquidate_spot {
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &perp_market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            10,
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         )
         .unwrap();
 
@@ -2010,6 +3399,7 @@ pub mod liquidate_spot {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 1442 / 10000),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 999 / 1000),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -2055,6 +3445,15 @@ pub mod liquidate_spot {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+
+        let state = State {
+            liquidation_margin_buffer_ratio: 10,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
         // oracle twap too volatile to liq rn
         assert!(liquidate_spot(
             0,
@@ -2063,16 +3462,16 @@ pub mod liquidate_spot {
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &perp_market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            10,
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         )
         .is_err());
 
@@ -2091,16 +3490,16 @@ pub mod liquidate_spot {
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &perp_market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            10,
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         )
         .unwrap();
 
@@ -2123,6 +3522,9 @@ pub mod liquidate_spot {
     pub fn successful_liquidation_liability_transfer_to_cover_margin_shortage() {
         let now = 0_i64;
         let slot = 0_u64;
+
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
 
         let mut sol_oracle_price = get_pyth_price(100, 6);
         let sol_oracle_price_key =
@@ -2172,6 +3574,7 @@ pub mod liquidate_spot {
             if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -2217,8 +3620,12 @@ pub mod liquidate_spot {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
-
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
         liquidate_spot(
             0,
             1,
@@ -2226,32 +3633,36 @@ pub mod liquidate_spot {
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            liquidation_buffer, // 2%
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         )
         .unwrap();
 
         assert_eq!(user.spot_positions[0].scaled_balance, 45558159000);
         assert_eq!(user.spot_positions[1].scaled_balance, 406768999);
 
-        let (margin_requirement, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        let liquidation_buffer = state.liquidation_margin_buffer_ratio;
+        let MarginCalculation {
+            margin_requirement,
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
 
         assert_eq!(margin_requirement, 44744590);
         assert_eq!(total_collateral, 45558159);
@@ -2267,27 +3678,26 @@ pub mod liquidate_spot {
         let token_value =
             get_token_value(token_amount as i128, 6, oracle_price_data.price).unwrap();
 
-        let strict_token_value_1 = get_strict_token_value(
-            token_amount as i128,
-            6,
-            oracle_price_data,
-            oracle_price_data.price / 10,
-        )
-        .unwrap();
-        let strict_token_value_2 = get_strict_token_value(
-            token_amount as i128,
-            6,
-            oracle_price_data,
-            oracle_price_data.price * 2,
-        )
-        .unwrap();
-        let strict_token_value_3 = get_strict_token_value(
-            -(token_amount as i128),
-            6,
-            oracle_price_data,
-            oracle_price_data.price * 2,
-        )
-        .unwrap();
+        let strict_price_1 = StrictOraclePrice {
+            current: oracle_price_data.price,
+            twap_5min: Some(oracle_price_data.price / 10),
+        };
+        let strict_token_value_1 =
+            get_strict_token_value(token_amount as i128, 6, &strict_price_1).unwrap();
+
+        let strict_price_2 = StrictOraclePrice {
+            current: oracle_price_data.price,
+            twap_5min: Some(oracle_price_data.price * 2),
+        };
+        let strict_token_value_2 =
+            get_strict_token_value(token_amount as i128, 6, &strict_price_2).unwrap();
+
+        let strict_price_3 = StrictOraclePrice {
+            current: oracle_price_data.price,
+            twap_5min: Some(oracle_price_data.price * 2),
+        };
+        let strict_token_value_3 =
+            get_strict_token_value(-(token_amount as i128), 6, &strict_price_3).unwrap();
 
         assert_eq!(token_amount, 406769);
         assert_eq!(token_value, 40676900);
@@ -2331,7 +3741,8 @@ pub mod liquidate_spot {
     pub fn failure_due_to_limit_price() {
         let now = 0_i64;
         let slot = 0_u64;
-
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
         let mut sol_oracle_price = get_pyth_price(100, 6);
         let sol_oracle_price_key =
             Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
@@ -2379,6 +3790,7 @@ pub mod liquidate_spot {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -2423,7 +3835,12 @@ pub mod liquidate_spot {
 
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
-
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
         let limit_price = (100000000 * PRICE_PRECISION_U64 / 999000) + 1;
         let result = liquidate_spot(
             0,
@@ -2432,16 +3849,16 @@ pub mod liquidate_spot {
             Some(limit_price),
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &perp_market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            10,
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         );
 
         assert_eq!(result, Err(ErrorCode::LiquidationDoesntSatisfyLimitPrice));
@@ -2451,7 +3868,8 @@ pub mod liquidate_spot {
     pub fn success_with_to_limit_price() {
         let now = 0_i64;
         let slot = 0_u64;
-
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
         let mut sol_oracle_price = get_pyth_price(100, 6);
         let sol_oracle_price_key =
             Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
@@ -2499,6 +3917,7 @@ pub mod liquidate_spot {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -2543,7 +3962,12 @@ pub mod liquidate_spot {
 
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
-
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
         let limit_price = (100000000 * PRICE_PRECISION_U64 / 999000) - 1;
         let result = liquidate_spot(
             0,
@@ -2552,16 +3976,16 @@ pub mod liquidate_spot {
             Some(limit_price),
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &perp_market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            10,
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         );
 
         assert_eq!(result, Ok(()));
@@ -2571,7 +3995,8 @@ pub mod liquidate_spot {
     pub fn successful_liquidation_dust_borrow() {
         let now = 0_i64;
         let slot = 0_u64;
-
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
         let mut sol_oracle_price = get_pyth_price(100, 6);
         let sol_oracle_price_key =
             Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
@@ -2620,6 +4045,7 @@ pub mod liquidate_spot {
             if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -2665,8 +4091,12 @@ pub mod liquidate_spot {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
-
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
         liquidate_spot(
             0,
             1,
@@ -2674,16 +4104,16 @@ pub mod liquidate_spot {
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            liquidation_buffer, // 2%
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         )
         .unwrap();
 
@@ -2741,12 +4171,13 @@ pub mod liquidate_spot {
             maintenance_asset_weight: 9 * SPOT_WEIGHT_PRECISION / 10,
             initial_liability_weight: 12 * SPOT_WEIGHT_PRECISION / 10,
             maintenance_liability_weight: 11 * SPOT_WEIGHT_PRECISION / 10,
-            deposit_balance: SPOT_BALANCE_PRECISION,
-            borrow_balance: SPOT_BALANCE_PRECISION,
+            deposit_balance: 10 * SPOT_BALANCE_PRECISION,
+            borrow_balance: 10 * SPOT_BALANCE_PRECISION,
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -2763,13 +4194,261 @@ pub mod liquidate_spot {
         spot_positions[0] = SpotPosition {
             market_index: 0,
             balance_type: SpotBalanceType::Deposit,
-            scaled_balance: 105 * SPOT_BALANCE_PRECISION_U64,
+            scaled_balance: 1050 * SPOT_BALANCE_PRECISION_U64,
             ..SpotPosition::default()
         };
         spot_positions[1] = SpotPosition {
             market_index: 1,
             balance_type: SpotBalanceType::Borrow,
+            scaled_balance: 10 * SPOT_BALANCE_PRECISION_U64,
+            ..SpotPosition::default()
+        };
+        let mut user = User {
+            orders: [Order::default(); 32],
+            perp_positions: [PerpPosition::default(); 8],
+            spot_positions,
+            ..User::default()
+        };
+
+        let mut liquidator = User {
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                balance_type: SpotBalanceType::Deposit,
+                scaled_balance: 1000 * SPOT_BALANCE_PRECISION_U64,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let user_key = Pubkey::default();
+        let liquidator_key = Pubkey::default();
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: (LIQUIDATION_PCT_PRECISION / 10) as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let liquidation_buffer = state.liquidation_margin_buffer_ratio;
+
+        liquidate_spot(
+            0,
+            1,
+            10 * 10_u128.pow(6),
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            now,
+            slot,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.is_being_liquidated(), true);
+        assert_eq!(user.liquidation_margin_freed, 7000031);
+        assert_eq!(user.spot_positions[0].scaled_balance, 990558159000);
+        assert_eq!(user.spot_positions[1].scaled_balance, 9406768999);
+
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
+
+        let margin_shortage =
+            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
+
+        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
+            / (margin_shortage + user.liquidation_margin_freed as u128);
+        assert_eq!(pct_margin_freed, 100000); // ~10%
+
+        let slot = 51_u64;
+        liquidate_spot(
+            0,
+            1,
+            10 * 10_u128.pow(6),
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            now,
+            slot,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 30328714);
+        assert_eq!(user.spot_positions[0].scaled_balance, 792456458000);
+        assert_eq!(user.spot_positions[1].scaled_balance, 7429711998);
+
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
+
+        let margin_shortage =
+            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
+
+        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
+            / (margin_shortage + user.liquidation_margin_freed as u128);
+        assert_eq!(pct_margin_freed, 433267); // ~43.3%
+        assert_eq!(user.is_being_liquidated(), true);
+
+        let slot = 136_u64;
+        liquidate_spot(
+            0,
+            1,
+            10 * 10_u128.pow(6),
+            None,
+            &mut user,
+            &user_key,
+            &mut user_stats,
+            &mut liquidator,
+            &liquidator_key,
+            &mut liquidator_stats,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            now,
+            slot,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(user.last_active_slot, 1);
+        assert_eq!(user.liquidation_margin_freed, 0);
+        assert_eq!(user.spot_positions[0].scaled_balance, 455580082000);
+        assert_eq!(user.spot_positions[1].scaled_balance, 4067681997);
+        assert_eq!(user.is_being_liquidated(), false);
+    }
+
+    #[test]
+    pub fn successful_liquidation_half_if_fee() {
+        let now = 0_i64;
+        let slot = 0_u64;
+
+        let mut sol_oracle_price = get_pyth_price(100, 6);
+        let sol_oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            sol_oracle_price,
+            &sol_oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let market_map = PerpMarketMap::empty();
+
+        let mut usdc_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            maintenance_asset_weight: SPOT_WEIGHT_PRECISION,
+            deposit_balance: 200 * SPOT_BALANCE_PRECISION,
+            liquidator_fee: 0,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: QUOTE_PRECISION_I64,
+                last_oracle_price_twap_5min: QUOTE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(usdc_market, SpotMarket, usdc_spot_market_account_info);
+        let mut sol_market = SpotMarket {
+            market_index: 1,
+            oracle_source: OracleSource::Pyth,
+            oracle: sol_oracle_price_key,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            cumulative_borrow_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 9,
+            initial_asset_weight: 8 * SPOT_WEIGHT_PRECISION / 10,
+            maintenance_asset_weight: 9 * SPOT_WEIGHT_PRECISION / 10,
+            initial_liability_weight: 12 * SPOT_WEIGHT_PRECISION / 10,
+            maintenance_liability_weight: 11 * SPOT_WEIGHT_PRECISION / 10,
+            deposit_balance: SPOT_BALANCE_PRECISION,
+            borrow_balance: SPOT_BALANCE_PRECISION,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 20,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(sol_market, SpotMarket, sol_spot_market_account_info);
+        let mut usdt_market = SpotMarket {
+            market_index: 2,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: 8 * SPOT_WEIGHT_PRECISION / 10,
+            maintenance_asset_weight: 9 * SPOT_WEIGHT_PRECISION / 10,
+            deposit_balance: 200 * SPOT_BALANCE_PRECISION,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: QUOTE_PRECISION_I64,
+                last_oracle_price_twap_5min: QUOTE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(usdt_market, SpotMarket, usdt_spot_market_account_info);
+        let spot_market_account_infos = Vec::from([
+            &usdc_spot_market_account_info,
+            &sol_spot_market_account_info,
+            &usdt_spot_market_account_info,
+        ]);
+        let spot_market_map =
+            SpotMarketMap::load_multiple(spot_market_account_infos, true).unwrap();
+
+        let mut spot_positions = [SpotPosition::default(); 8];
+        spot_positions[1] = SpotPosition {
+            market_index: 1,
+            balance_type: SpotBalanceType::Borrow,
             scaled_balance: SPOT_BALANCE_PRECISION_U64,
+            ..SpotPosition::default()
+        };
+        spot_positions[2] = SpotPosition {
+            market_index: 2,
+            balance_type: SpotBalanceType::Deposit,
+            scaled_balance: 105 * SPOT_BALANCE_PRECISION_U64,
             ..SpotPosition::default()
         };
         let mut user = User {
@@ -2792,120 +4471,58 @@ pub mod liquidate_spot {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
+        let liquidation_buffer = MARGIN_PRECISION / 50;
+        let state = State {
+            liquidation_margin_buffer_ratio: liquidation_buffer,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
 
         liquidate_spot(
-            0,
+            2,
             1,
-            10_u128.pow(6),
+            10_u128.pow(9),
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            liquidation_buffer, // 2%
-            LIQUIDATION_PCT_PRECISION / 10,
-            150,
+            &state,
         )
         .unwrap();
 
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 700032);
-        assert_eq!(user.spot_positions[0].scaled_balance, 99055856000);
-        assert_eq!(user.spot_positions[1].scaled_balance, 940676999);
+        let liability_market = spot_market_map.get_ref(&1).unwrap();
+        let revenue_pool_token_amount = get_token_amount(
+            liability_market.revenue_pool.scaled_balance,
+            &liability_market,
+            &SpotBalanceType::Deposit,
+        )
+        .unwrap();
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        assert_eq!(revenue_pool_token_amount, 23944781); // 2.39%
 
-        let margin_shortage =
-            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
-
-        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
-            / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 100004); // ~10%
-
-        let slot = 51_u64;
-        liquidate_spot(
-            0,
-            1,
-            10_u128.pow(6),
-            None,
-            &mut user,
-            &user_key,
-            &mut liquidator,
-            &liquidator_key,
+        let margin_calc = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
             &market_map,
             &spot_market_map,
             &mut oracle_map,
-            now,
-            slot,
-            liquidation_buffer, // 2%
-            LIQUIDATION_PCT_PRECISION / 10,
-            150,
+            MarginContext::liquidation(liquidation_buffer),
         )
         .unwrap();
 
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 3032982);
-        assert_eq!(user.spot_positions[0].scaled_balance, 79245846000);
-        assert_eq!(user.spot_positions[1].scaled_balance, 742971998);
-
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
-
-        let margin_shortage =
-            ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
-
-        let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
-            / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 433283); // ~43.3%
-
-        let slot = 136_u64;
-        liquidate_spot(
-            0,
-            1,
-            10_u128.pow(6),
-            None,
-            &mut user,
-            &user_key,
-            &mut liquidator,
-            &liquidator_key,
-            &market_map,
-            &spot_market_map,
-            &mut oracle_map,
-            now,
-            slot,
-            liquidation_buffer, // 2%
-            LIQUIDATION_PCT_PRECISION / 10,
-            150,
-        )
-        .unwrap();
-
-        assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 0);
-        assert_eq!(user.spot_positions[0].scaled_balance, 45559160000);
-        assert_eq!(user.spot_positions[1].scaled_balance, 406777997);
+        print!("{:?}", margin_calc);
+        assert!(margin_calc.meets_margin_requirement());
     }
 }
 
@@ -2927,10 +4544,9 @@ pub mod liquidate_borrow_for_perp_pnl {
         QUOTE_PRECISION_I64, SPOT_BALANCE_PRECISION, SPOT_BALANCE_PRECISION_U64,
         SPOT_CUMULATIVE_INTEREST_PRECISION, SPOT_WEIGHT_PRECISION,
     };
-    use crate::math::margin::{
-        calculate_margin_requirement_and_total_collateral, MarginRequirementType,
-    };
+    use crate::math::margin::calculate_margin_requirement_and_total_collateral_and_liability_info;
     use crate::math::spot_balance::{get_token_amount, get_token_value};
+    use crate::state::margin_calculation::{MarginCalculation, MarginContext};
     use crate::state::oracle::HistoricalOracleData;
     use crate::state::oracle::OracleSource;
     use crate::state::oracle_map::OracleMap;
@@ -3022,6 +4638,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3177,6 +4794,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3220,7 +4838,7 @@ pub mod liquidate_borrow_for_perp_pnl {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
+        let liquidation_buffer = MARGIN_PRECISION / 50;
         liquidate_borrow_for_perp_pnl(
             0,
             1,
@@ -3244,16 +4862,18 @@ pub mod liquidate_borrow_for_perp_pnl {
         assert_eq!(user.spot_positions[0].scaled_balance, 357739999);
         assert_eq!(user.perp_positions[0].quote_asset_amount, 40066807);
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
 
         assert_eq!(total_collateral, 40066807);
         assert_eq!(margin_requirement_plus_buffer, 40066880);
@@ -3370,6 +4990,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3433,14 +5054,14 @@ pub mod liquidate_borrow_for_perp_pnl {
         )
         .unwrap();
 
-        assert_eq!(user.spot_positions[0].scaled_balance, 208712999);
+        assert_eq!(user.spot_positions[0].scaled_balance, 208711999);
         assert_eq!(user.perp_positions[0].quote_asset_amount, 0);
 
         assert_eq!(
             liquidator.spot_positions[1].balance_type,
             SpotBalanceType::Borrow
         );
-        assert_eq!(liquidator.spot_positions[1].scaled_balance, 791287001);
+        assert_eq!(liquidator.spot_positions[1].scaled_balance, 791288001);
         assert_eq!(liquidator.perp_positions[0].quote_asset_amount, 80000000);
     }
 
@@ -3524,6 +5145,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3670,6 +5292,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3817,6 +5440,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3860,7 +5484,7 @@ pub mod liquidate_borrow_for_perp_pnl {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
+        let liquidation_buffer = MARGIN_PRECISION / 50;
         liquidate_borrow_for_perp_pnl(
             0,
             1,
@@ -3967,12 +5591,13 @@ pub mod liquidate_borrow_for_perp_pnl {
             maintenance_asset_weight: 9 * SPOT_WEIGHT_PRECISION / 10,
             initial_liability_weight: 12 * SPOT_WEIGHT_PRECISION / 10,
             maintenance_liability_weight: 11 * SPOT_WEIGHT_PRECISION / 10,
-            deposit_balance: SPOT_BALANCE_PRECISION,
-            borrow_balance: SPOT_BALANCE_PRECISION,
+            deposit_balance: 100 * SPOT_BALANCE_PRECISION,
+            borrow_balance: 11 * SPOT_BALANCE_PRECISION,
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -3989,14 +5614,14 @@ pub mod liquidate_borrow_for_perp_pnl {
         spot_positions[0] = SpotPosition {
             market_index: 1,
             balance_type: SpotBalanceType::Borrow,
-            scaled_balance: SPOT_BALANCE_PRECISION_U64,
+            scaled_balance: 10 * SPOT_BALANCE_PRECISION_U64,
             ..SpotPosition::default()
         };
         let mut user = User {
             orders: [Order::default(); 32],
             perp_positions: get_positions(PerpPosition {
                 market_index: 0,
-                quote_asset_amount: 105 * QUOTE_PRECISION_I64,
+                quote_asset_amount: 1050 * QUOTE_PRECISION_I64,
                 ..PerpPosition::default()
             }),
             spot_positions,
@@ -4007,7 +5632,7 @@ pub mod liquidate_borrow_for_perp_pnl {
             spot_positions: get_spot_positions(SpotPosition {
                 market_index: 0,
                 balance_type: SpotBalanceType::Deposit,
-                scaled_balance: 100 * SPOT_BALANCE_PRECISION_U64,
+                scaled_balance: 1000 * SPOT_BALANCE_PRECISION_U64,
                 ..SpotPosition::default()
             }),
             ..User::default()
@@ -4016,11 +5641,11 @@ pub mod liquidate_borrow_for_perp_pnl {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
+        let liquidation_buffer = MARGIN_PRECISION / 50;
         liquidate_borrow_for_perp_pnl(
             0,
             1,
-            2 * 10_u128.pow(6),
+            10 * 10_u128.pow(6),
             None,
             &mut user,
             &user_key,
@@ -4038,33 +5663,35 @@ pub mod liquidate_borrow_for_perp_pnl {
         .unwrap();
 
         assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 699993);
-        assert_eq!(user.spot_positions[0].scaled_balance, 935773999);
-        assert_eq!(user.perp_positions[0].quote_asset_amount, 98506681);
+        assert_eq!(user.liquidation_margin_freed, 6999927);
+        assert_eq!(user.spot_positions[0].scaled_balance, 9357739999);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, 985066807);
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
 
         let margin_shortage =
             ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
 
         let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
             / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 99999); // ~10%
+        assert_eq!(pct_margin_freed, 99998); // ~10%
 
         let slot = 51_u64;
         liquidate_borrow_for_perp_pnl(
             0,
             1,
-            2 * 10_u128.pow(6),
+            10 * 10_u128.pow(6),
             None,
             &mut user,
             &user_key,
@@ -4082,33 +5709,35 @@ pub mod liquidate_borrow_for_perp_pnl {
         .unwrap();
 
         assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 3032859);
-        assert_eq!(user.spot_positions[0].scaled_balance, 721727998);
-        assert_eq!(user.perp_positions[0].quote_asset_amount, 76866395);
+        assert_eq!(user.liquidation_margin_freed, 30328628);
+        assert_eq!(user.spot_positions[0].scaled_balance, 7217275998);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, 768663540);
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
 
         let margin_shortage =
             ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
 
         let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
             / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 433265); // ~43.3%
+        assert_eq!(pct_margin_freed, 433266); // ~43.3%
 
         let slot = 136_u64;
         liquidate_borrow_for_perp_pnl(
             0,
             1,
-            2 * 10_u128.pow(6),
+            10 * 10_u128.pow(6),
             None,
             &mut user,
             &user_key,
@@ -4131,6 +5760,7 @@ pub mod liquidate_borrow_for_perp_pnl {
 }
 
 pub mod liquidate_perp_pnl_for_deposit {
+    use crate::state::state::State;
     use std::str::FromStr;
 
     use anchor_lang::Owner;
@@ -4147,9 +5777,8 @@ pub mod liquidate_perp_pnl_for_deposit {
         SPOT_BALANCE_PRECISION, SPOT_BALANCE_PRECISION_U64, SPOT_CUMULATIVE_INTEREST_PRECISION,
         SPOT_WEIGHT_PRECISION,
     };
-    use crate::math::margin::{
-        calculate_margin_requirement_and_total_collateral, MarginRequirementType,
-    };
+    use crate::math::margin::calculate_margin_requirement_and_total_collateral_and_liability_info;
+    use crate::state::margin_calculation::{MarginCalculation, MarginContext};
     use crate::state::oracle::HistoricalOracleData;
     use crate::state::oracle::OracleSource;
     use crate::state::oracle_map::OracleMap;
@@ -4157,10 +5786,10 @@ pub mod liquidate_perp_pnl_for_deposit {
     use crate::state::perp_market_map::PerpMarketMap;
     use crate::state::spot_market::{AssetTier, SpotBalanceType, SpotMarket};
     use crate::state::spot_market_map::SpotMarketMap;
+    use crate::state::user::UserStats;
     use crate::state::user::{Order, PerpPosition, SpotPosition, User, UserStatus};
     use crate::test_utils::*;
     use crate::test_utils::{get_positions, get_pyth_price, get_spot_positions};
-
     #[test]
     pub fn successful_liquidation_liquidator_max_pnl_transfer() {
         let now = 0_i64;
@@ -4241,6 +5870,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -4396,6 +6026,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -4453,7 +6084,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             &mut oracle_map,
             now,
             slot,
-            MARGIN_PRECISION as u32 / 50,
+            MARGIN_PRECISION / 50,
             PERCENTAGE_PRECISION,
             150,
         )
@@ -4553,6 +6184,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -4617,14 +6249,14 @@ pub mod liquidate_perp_pnl_for_deposit {
         .unwrap();
 
         assert_eq!(user.spot_positions[0].scaled_balance, 0);
-        assert_eq!(user.perp_positions[0].quote_asset_amount, -51098902);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -51098901);
 
         assert_eq!(
             liquidator.spot_positions[1].balance_type,
             SpotBalanceType::Deposit
         );
         assert_eq!(liquidator.spot_positions[1].scaled_balance, 1000000000);
-        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, -98901098);
+        assert_eq!(liquidator.perp_positions[0].quote_asset_amount, -98901099);
     }
 
     #[test]
@@ -4707,6 +6339,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -4853,6 +6486,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -5000,6 +6634,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -5057,7 +6692,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             &mut oracle_map,
             now,
             slot,
-            MARGIN_PRECISION as u32 / 50,
+            MARGIN_PRECISION / 50,
             PERCENTAGE_PRECISION,
             150,
         )
@@ -5155,6 +6790,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -5171,14 +6807,14 @@ pub mod liquidate_perp_pnl_for_deposit {
         spot_positions[0] = SpotPosition {
             market_index: 1,
             balance_type: SpotBalanceType::Deposit,
-            scaled_balance: SPOT_BALANCE_PRECISION_U64,
+            scaled_balance: 10 * SPOT_BALANCE_PRECISION_U64,
             ..SpotPosition::default()
         };
         let mut user = User {
             orders: [Order::default(); 32],
             perp_positions: get_positions(PerpPosition {
                 market_index: 0,
-                quote_asset_amount: -91 * QUOTE_PRECISION_I64,
+                quote_asset_amount: -950 * QUOTE_PRECISION_I64,
                 ..PerpPosition::default()
             }),
             spot_positions,
@@ -5189,7 +6825,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             spot_positions: get_spot_positions(SpotPosition {
                 market_index: 0,
                 balance_type: SpotBalanceType::Deposit,
-                scaled_balance: 100 * SPOT_BALANCE_PRECISION_U64,
+                scaled_balance: 1000 * SPOT_BALANCE_PRECISION_U64,
                 ..SpotPosition::default()
             }),
             ..User::default()
@@ -5198,7 +6834,7 @@ pub mod liquidate_perp_pnl_for_deposit {
         let user_key = Pubkey::default();
         let liquidator_key = Pubkey::default();
 
-        let liquidation_buffer = MARGIN_PRECISION as u32 / 50;
+        let liquidation_buffer = MARGIN_PRECISION / 50;
         liquidate_perp_pnl_for_deposit(
             0,
             1,
@@ -5220,27 +6856,29 @@ pub mod liquidate_perp_pnl_for_deposit {
         .unwrap();
 
         assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 100051);
-        assert_eq!(user.spot_positions[0].scaled_balance, 988766000);
-        assert_eq!(user.perp_positions[0].quote_asset_amount, -89888889);
+        assert_eq!(user.liquidation_margin_freed, 5000035);
+        assert_eq!(user.spot_positions[0].scaled_balance, 9438272000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -894444445);
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
 
         let margin_shortage =
             ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
 
         let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
             / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 100051); // ~10%
+        assert_eq!(pct_margin_freed, 100000); // ~10%
 
         let slot = 51_u64;
         liquidate_perp_pnl_for_deposit(
@@ -5264,33 +6902,35 @@ pub mod liquidate_perp_pnl_for_deposit {
         .unwrap();
 
         assert_eq!(user.last_active_slot, 1);
-        assert_eq!(user.liquidation_margin_freed, 433231);
-        assert_eq!(user.spot_positions[0].scaled_balance, 951337000);
-        assert_eq!(user.perp_positions[0].quote_asset_amount, -86187099);
+        assert_eq!(user.liquidation_margin_freed, 23000055);
+        assert_eq!(user.spot_positions[0].scaled_balance, 7416050000);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -694444445);
 
-        let (_, total_collateral, margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
-                &user,
-                &market_map,
-                MarginRequirementType::Maintenance,
-                &spot_market_map,
-                &mut oracle_map,
-                Some(liquidation_buffer as u128),
-            )
-            .unwrap();
+        let MarginCalculation {
+            total_collateral,
+            margin_requirement_plus_buffer,
+            ..
+        } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+            &user,
+            &market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            MarginContext::liquidation(liquidation_buffer),
+        )
+        .unwrap();
 
         let margin_shortage =
             ((margin_requirement_plus_buffer as i128) - total_collateral).unsigned_abs();
 
         let pct_margin_freed = (user.liquidation_margin_freed as u128) * PRICE_PRECISION
             / (margin_shortage + user.liquidation_margin_freed as u128);
-        assert_eq!(pct_margin_freed, 433231); // ~43%
+        assert_eq!(pct_margin_freed, 460001); // ~43%
 
         let slot = 136_u64;
         liquidate_perp_pnl_for_deposit(
             0,
             1,
-            200 * 10_u128.pow(6), // .8
+            2000 * 10_u128.pow(6), // .8
             None,
             &mut user,
             &user_key,
@@ -5315,7 +6955,8 @@ pub mod liquidate_perp_pnl_for_deposit {
     pub fn failure_due_to_asset_tier_violation() {
         let now = 0_i64;
         let slot = 0_u64;
-
+        let mut user_stats = UserStats::default();
+        let mut liquidator_stats = UserStats::default();
         let mut sol_oracle_price = get_pyth_price(100, 6);
         let sol_oracle_price_key =
             Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
@@ -5465,6 +7106,13 @@ pub mod liquidate_perp_pnl_for_deposit {
         )
         .is_err());
 
+        let state = State {
+            liquidation_margin_buffer_ratio: MARGIN_PRECISION / 50,
+            initial_pct_to_liquidate: (PERCENTAGE_PRECISION / 10) as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
         liquidate_spot(
             0,
             1,
@@ -5472,16 +7120,16 @@ pub mod liquidate_perp_pnl_for_deposit {
             None,
             &mut user,
             &user_key,
+            &mut user_stats,
             &mut liquidator,
             &liquidator_key,
+            &mut liquidator_stats,
             &market_map,
             &spot_market_map,
             &mut oracle_map,
             now,
             slot,
-            10,
-            PERCENTAGE_PRECISION,
-            150,
+            &state,
         )
         .unwrap();
 
@@ -5508,7 +7156,7 @@ pub mod liquidate_perp_pnl_for_deposit {
         .unwrap();
         assert_eq!(user.perp_positions[0].quote_asset_amount, -50000000);
         assert_eq!(user.spot_positions[0].scaled_balance, 49394850000); // <$50
-        assert_eq!(user.status, UserStatus::BeingLiquidated);
+        assert_eq!(user.status, UserStatus::BeingLiquidated as u8);
 
         liquidate_perp_pnl_for_deposit(
             0,
@@ -5532,8 +7180,8 @@ pub mod liquidate_perp_pnl_for_deposit {
         assert_eq!(user.spot_positions[0].scaled_balance, 0);
         assert_eq!(user.spot_positions[1].scaled_balance, 0);
 
-        assert_eq!(user.perp_positions[0].quote_asset_amount, -1099099);
-        assert_eq!(user.status, UserStatus::Bankrupt);
+        assert_eq!(user.perp_positions[0].quote_asset_amount, -1099098);
+        assert_eq!(user.status, UserStatus::Bankrupt as u8);
     }
 
     #[test]
@@ -5654,6 +7302,7 @@ pub mod liquidate_perp_pnl_for_deposit {
             liquidator_fee: LIQUIDATION_FEE_PRECISION / 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price_twap: (sol_oracle_price.agg.price * 99 / 100),
+                last_oracle_price_twap_5min: (sol_oracle_price.agg.price * 99 / 100),
                 ..HistoricalOracleData::default()
             },
             ..SpotMarket::default()
@@ -5900,7 +7549,7 @@ pub mod resolve_perp_bankruptcy {
                 ..PerpPosition::default()
             }),
             spot_positions: [SpotPosition::default(); 8],
-            status: UserStatus::Bankrupt,
+            status: UserStatus::Bankrupt as u8,
             next_liquidation_id: 2,
             ..User::default()
         };
@@ -5919,7 +7568,7 @@ pub mod resolve_perp_bankruptcy {
         let liquidator_key = Pubkey::default();
 
         let mut expected_user = user;
-        expected_user.status = UserStatus::Active;
+        expected_user.status = 0;
         expected_user.perp_positions[0].quote_asset_amount = 0;
         expected_user.total_social_loss = 100000000;
 
@@ -6111,7 +7760,7 @@ pub mod resolve_perp_bankruptcy {
                 ..PerpPosition::default()
             }),
             spot_positions: [SpotPosition::default(); 8],
-            status: UserStatus::Bankrupt,
+            status: UserStatus::Bankrupt as u8,
             next_liquidation_id: 2,
             ..User::default()
         };
@@ -6130,7 +7779,7 @@ pub mod resolve_perp_bankruptcy {
         let liquidator_key = Pubkey::default();
 
         let mut expected_user = user;
-        expected_user.status = UserStatus::Active;
+        expected_user.status = 0;
         expected_user.perp_positions[0].quote_asset_amount = 0;
         expected_user.total_social_loss = 100000000;
 
@@ -6347,7 +7996,7 @@ pub mod resolve_spot_bankruptcy {
                 balance_type: SpotBalanceType::Borrow,
                 ..SpotPosition::default()
             }),
-            status: UserStatus::Bankrupt,
+            status: UserStatus::Bankrupt as u8,
             next_liquidation_id: 2,
             ..User::default()
         };
@@ -6366,7 +8015,7 @@ pub mod resolve_spot_bankruptcy {
         let liquidator_key = Pubkey::default();
 
         let mut expected_user = user;
-        expected_user.status = UserStatus::Active;
+        expected_user.status = 0;
         expected_user.spot_positions[0].scaled_balance = 0;
         expected_user.spot_positions[0].cumulative_deposits = 100 * QUOTE_PRECISION_I64;
         expected_user.total_social_loss = 100000000;
@@ -6401,5 +8050,317 @@ pub mod resolve_spot_bankruptcy {
             get_token_amount(deposit_balance, &spot_market, &SpotBalanceType::Deposit).unwrap();
 
         assert_eq!(deposit_token_amount, 900 * QUOTE_PRECISION);
+    }
+}
+
+pub mod set_user_status_to_being_liquidated {
+
+    use crate::state::state::State;
+    use std::str::FromStr;
+
+    use anchor_lang::Owner;
+    use solana_program::pubkey::Pubkey;
+
+    use crate::controller::liquidation::set_user_status_to_being_liquidated;
+    use crate::controller::position::PositionDirection;
+    use crate::error::ErrorCode;
+    use crate::math::constants::{
+        AMM_RESERVE_PRECISION, BASE_PRECISION_I128, BASE_PRECISION_I64, BASE_PRECISION_U64,
+        LIQUIDATION_FEE_PRECISION, PEG_PRECISION, QUOTE_PRECISION_I128, QUOTE_PRECISION_I64,
+        SPOT_CUMULATIVE_INTEREST_PRECISION, SPOT_WEIGHT_PRECISION,
+    };
+    use crate::state::oracle::{HistoricalOracleData, OracleSource};
+    use crate::state::oracle_map::OracleMap;
+    use crate::state::perp_market::{MarketStatus, PerpMarket, AMM};
+    use crate::state::perp_market_map::PerpMarketMap;
+    use crate::state::spot_market::{SpotBalanceType, SpotMarket};
+    use crate::state::spot_market_map::SpotMarketMap;
+    use crate::state::user::{
+        Order, OrderStatus, OrderType, PerpPosition, SpotPosition, User, UserStatus,
+    };
+    use crate::test_utils::{get_orders, get_positions, get_pyth_price};
+    use crate::{create_account_info, PRICE_PRECISION_I64};
+    use crate::{create_anchor_account_info, LIQUIDATION_PCT_PRECISION};
+    use crate::{test_utils::*, DEFAULT_LIQUIDATION_MARGIN_BUFFER_RATIO};
+
+    #[test]
+    pub fn failure_sufficient_collateral() {
+        let slot = 0_u64;
+
+        let mut oracle_price = get_pyth_price(200, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: BASE_PRECISION_I128,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Initialized,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            initial_asset_weight: SPOT_WEIGHT_PRECISION,
+            maintenance_asset_weight: SPOT_WEIGHT_PRECISION,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut user = User {
+            orders: get_orders(Order {
+                market_index: 0,
+                status: OrderStatus::Open,
+                order_type: OrderType::Limit,
+                direction: PositionDirection::Long,
+                base_asset_amount: BASE_PRECISION_U64,
+                slot: 0,
+                ..Order::default()
+            }),
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: BASE_PRECISION_I64,
+                quote_asset_amount: 100 * QUOTE_PRECISION_I64,
+                quote_entry_amount: 100 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: 100 * QUOTE_PRECISION_I64,
+                open_orders: 1,
+                open_bids: BASE_PRECISION_I64,
+                ..PerpPosition::default()
+            }),
+            spot_positions: get_spot_positions(SpotPosition {
+                market_index: 0,
+                scaled_balance: 1000000000000,
+                cumulative_deposits: 100000000000,
+                balance_type: SpotBalanceType::Deposit,
+                ..SpotPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let state = State {
+            liquidation_margin_buffer_ratio: DEFAULT_LIQUIDATION_MARGIN_BUFFER_RATIO,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let result = set_user_status_to_being_liquidated(
+            &mut user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            &state,
+        );
+
+        assert_eq!(result, Err(ErrorCode::SufficientCollateral));
+    }
+
+    #[test]
+    pub fn failure_from_user_statuses() {
+        let slot = 0_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut user = User {
+            orders: [Order::default(); 32],
+            perp_positions: [PerpPosition::default(); 8],
+            spot_positions: [SpotPosition::default(); 8],
+            ..User::default()
+        };
+
+        user.add_user_status(UserStatus::Bankrupt);
+        let state = State {
+            liquidation_margin_buffer_ratio: DEFAULT_LIQUIDATION_MARGIN_BUFFER_RATIO,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let mut market = PerpMarket {
+            amm: AMM::default(),
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+        let mut spot_market = SpotMarket::default();
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut result = set_user_status_to_being_liquidated(
+            &mut user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            &state,
+        );
+
+        assert_eq!(result, Err(ErrorCode::UserBankrupt));
+
+        user.remove_user_status(UserStatus::Bankrupt);
+        user.add_user_status(UserStatus::BeingLiquidated);
+        result = set_user_status_to_being_liquidated(
+            &mut user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            &state,
+        );
+        assert_eq!(result, Err(ErrorCode::UserIsBeingLiquidated));
+    }
+
+    #[test]
+    pub fn success() {
+        let slot = 0_u64;
+
+        let mut oracle_price = get_pyth_price(100, 6);
+        let oracle_price_key =
+            Pubkey::from_str("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix").unwrap();
+        let pyth_program = crate::ids::pyth_program::id();
+        create_account_info!(
+            oracle_price,
+            &oracle_price_key,
+            &pyth_program,
+            oracle_account_info
+        );
+        let mut oracle_map = OracleMap::load_one(&oracle_account_info, slot, None).unwrap();
+
+        let mut market = PerpMarket {
+            amm: AMM {
+                base_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                quote_asset_reserve: 100 * AMM_RESERVE_PRECISION,
+                bid_base_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                bid_quote_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_base_asset_reserve: 99 * AMM_RESERVE_PRECISION,
+                ask_quote_asset_reserve: 101 * AMM_RESERVE_PRECISION,
+                sqrt_k: 100 * AMM_RESERVE_PRECISION,
+                peg_multiplier: 100 * PEG_PRECISION,
+                max_slippage_ratio: 50,
+                max_fill_reserve_fraction: 100,
+                order_step_size: 10000000,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I128,
+                base_asset_amount_with_amm: BASE_PRECISION_I128,
+                oracle: oracle_price_key,
+                historical_oracle_data: HistoricalOracleData::default_price(oracle_price.agg.price),
+                ..AMM::default()
+            },
+            margin_ratio_initial: 1000,
+            margin_ratio_maintenance: 500,
+            number_of_users_with_base: 1,
+            status: MarketStatus::Initialized,
+            liquidator_fee: LIQUIDATION_FEE_PRECISION / 100,
+            if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100,
+            ..PerpMarket::default()
+        };
+        create_anchor_account_info!(market, PerpMarket, market_account_info);
+        let perp_market_map = PerpMarketMap::load_one(&market_account_info, true).unwrap();
+
+        let mut spot_market = SpotMarket {
+            market_index: 0,
+            oracle_source: OracleSource::QuoteAsset,
+            cumulative_deposit_interest: SPOT_CUMULATIVE_INTEREST_PRECISION,
+            decimals: 6,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
+            ..SpotMarket::default()
+        };
+        create_anchor_account_info!(spot_market, SpotMarket, spot_market_account_info);
+        let spot_market_map = SpotMarketMap::load_one(&spot_market_account_info, true).unwrap();
+
+        let mut user = User {
+            orders: get_orders(Order {
+                market_index: 0,
+                status: OrderStatus::Open,
+                order_type: OrderType::Limit,
+                direction: PositionDirection::Long,
+                base_asset_amount: BASE_PRECISION_U64,
+                slot: 0,
+                ..Order::default()
+            }),
+            perp_positions: get_positions(PerpPosition {
+                market_index: 0,
+                base_asset_amount: BASE_PRECISION_I64,
+                quote_asset_amount: -150 * QUOTE_PRECISION_I64,
+                quote_entry_amount: -150 * QUOTE_PRECISION_I64,
+                quote_break_even_amount: -150 * QUOTE_PRECISION_I64,
+                open_orders: 1,
+                open_bids: BASE_PRECISION_I64,
+                ..PerpPosition::default()
+            }),
+            ..User::default()
+        };
+
+        let state = State {
+            liquidation_margin_buffer_ratio: DEFAULT_LIQUIDATION_MARGIN_BUFFER_RATIO,
+            initial_pct_to_liquidate: LIQUIDATION_PCT_PRECISION as u16,
+            liquidation_duration: 150,
+            ..Default::default()
+        };
+
+        let result = set_user_status_to_being_liquidated(
+            &mut user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            slot,
+            &state,
+        );
+
+        assert_eq!(user.status, UserStatus::BeingLiquidated as u8);
+        assert_eq!(result, Ok(()));
     }
 }

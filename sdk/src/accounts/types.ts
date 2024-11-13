@@ -5,12 +5,14 @@ import {
 	StateAccount,
 	UserAccount,
 	UserStatsAccount,
+	InsuranceFundStake,
 } from '../types';
 import StrictEventEmitter from 'strict-event-emitter-types';
 import { EventEmitter } from 'events';
-import { PublicKey } from '@solana/web3.js';
+import { Context, PublicKey } from '@solana/web3.js';
 import { Account } from '@solana/spl-token';
-import { OracleInfo, OraclePriceData } from '..';
+import { HighLeverageModeConfig, OracleInfo, OraclePriceData } from '..';
+import { ChannelOptions, CommitmentLevel } from '../isomorphic/grpc';
 
 export interface AccountSubscriber<T> {
 	dataAndSlot?: DataAndSlot<T>;
@@ -19,6 +21,18 @@ export interface AccountSubscriber<T> {
 	unsubscribe(): Promise<void>;
 
 	setData(userAccount: T, slot?: number): void;
+}
+
+export interface ProgramAccountSubscriber<T> {
+	subscribe(
+		onChange: (
+			accountId: PublicKey,
+			data: T,
+			context: Context,
+			buffer: Buffer
+		) => void
+	): Promise<void>;
+	unsubscribe(): Promise<void>;
 }
 
 export class NotSubscribedError extends Error {
@@ -46,6 +60,8 @@ export interface DriftClientAccountSubscriber {
 	addPerpMarket(marketIndex: number): Promise<boolean>;
 	addSpotMarket(marketIndex: number): Promise<boolean>;
 	addOracle(oracleInfo: OracleInfo): Promise<boolean>;
+	setPerpOracleMap(): Promise<void>;
+	setSpotOracleMap(): Promise<void>;
 
 	getStateAccountAndSlot(): DataAndSlot<StateAccount>;
 	getMarketAccountAndSlot(
@@ -57,10 +73,22 @@ export interface DriftClientAccountSubscriber {
 	): DataAndSlot<SpotMarketAccount> | undefined;
 	getSpotMarketAccountsAndSlots(): DataAndSlot<SpotMarketAccount>[];
 	getOraclePriceDataAndSlot(
-		oraclePublicKey: PublicKey
+		oraclePublicKey: PublicKey | string
+	): DataAndSlot<OraclePriceData> | undefined;
+	getOraclePriceDataAndSlotForPerpMarket(
+		marketIndex: number
+	): DataAndSlot<OraclePriceData> | undefined;
+	getOraclePriceDataAndSlotForSpotMarket(
+		marketIndex: number
 	): DataAndSlot<OraclePriceData> | undefined;
 
 	updateAccountLoaderPollingFrequency?: (pollingFrequency: number) => void;
+}
+
+export enum DelistedMarketSetting {
+	Unsubscribe,
+	Subscribe,
+	Discard,
 }
 
 export interface UserAccountEvents {
@@ -96,6 +124,26 @@ export interface TokenAccountSubscriber {
 	unsubscribe(): Promise<void>;
 
 	getTokenAccountAndSlot(): DataAndSlot<Account>;
+}
+
+export interface InsuranceFundStakeAccountSubscriber {
+	eventEmitter: StrictEventEmitter<
+		EventEmitter,
+		InsuranceFundStakeAccountEvents
+	>;
+	isSubscribed: boolean;
+
+	subscribe(): Promise<boolean>;
+	fetch(): Promise<void>;
+	unsubscribe(): Promise<void>;
+
+	getInsuranceFundStakeAccountAndSlot(): DataAndSlot<InsuranceFundStake>;
+}
+
+export interface InsuranceFundStakeAccountEvents {
+	insuranceFundStakeAccountUpdate: (payload: InsuranceFundStake) => void;
+	update: void;
+	error: (e: Error) => void;
 }
 
 export interface OracleEvents {
@@ -139,6 +187,11 @@ export type DataAndSlot<T> = {
 	slot: number;
 };
 
+export type ResubOpts = {
+	resubTimeoutMs?: number;
+	logResubMessages?: boolean;
+};
+
 export interface UserStatsAccountEvents {
 	userStatsAccountUpdate: (payload: UserStatsAccount) => void;
 	update: void;
@@ -154,4 +207,35 @@ export interface UserStatsAccountSubscriber {
 	unsubscribe(): Promise<void>;
 
 	getUserStatsAccountAndSlot(): DataAndSlot<UserStatsAccount>;
+}
+
+export type GrpcConfigs = {
+	endpoint: string;
+	token: string;
+	commitmentLevel?: CommitmentLevel;
+	channelOptions?: ChannelOptions;
+};
+
+export interface HighLeverageModeConfigAccountSubscriber {
+	eventEmitter: StrictEventEmitter<
+		EventEmitter,
+		HighLeverageModeConfigAccountEvents
+	>;
+	isSubscribed: boolean;
+
+	subscribe(
+		highLeverageModeConfigAccount?: HighLeverageModeConfig
+	): Promise<boolean>;
+	fetch(): Promise<void>;
+	unsubscribe(): Promise<void>;
+
+	getHighLeverageModeConfigAccountAndSlot(): DataAndSlot<HighLeverageModeConfig>;
+}
+
+export interface HighLeverageModeConfigAccountEvents {
+	highLeverageModeConfigAccountUpdate: (
+		payload: HighLeverageModeConfig
+	) => void;
+	update: void;
+	error: (e: Error) => void;
 }

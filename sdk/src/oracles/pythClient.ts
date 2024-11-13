@@ -38,6 +38,7 @@ export class PythClient implements OracleClient {
 			priceData.exponent,
 			this.multiple
 		);
+		const minPublishers = Math.min(priceData.numComponentPrices, 3);
 		let price = convertPythPrice(
 			priceData.aggregate.price,
 			priceData.exponent,
@@ -61,16 +62,12 @@ export class PythClient implements OracleClient {
 				priceData.exponent,
 				this.multiple
 			),
-			hasSufficientNumberOfDataPoints: true,
+			hasSufficientNumberOfDataPoints: priceData.numQuoters >= minPublishers,
 		};
 	}
 }
 
-export function convertPythPrice(
-	price: number,
-	exponent: number,
-	multiple: BN
-): BN {
+function convertPythPrice(price: number, exponent: number, multiple: BN): BN {
 	exponent = Math.abs(exponent);
 	const pythPrecision = TEN.pow(new BN(exponent).abs()).div(multiple);
 	return new BN(price * Math.pow(10, exponent))

@@ -1,6 +1,7 @@
 import {
-	DataAndSlot,
 	AccountToPoll,
+	DataAndSlot,
+	DelistedMarketSetting,
 	DriftClientAccountEvents,
 	DriftClientAccountSubscriber,
 	NotSubscribedError,
@@ -10,23 +11,25 @@ import { Program } from '@coral-xyz/anchor';
 import StrictEventEmitter from 'strict-event-emitter-types';
 import { EventEmitter } from 'events';
 import {
-	SpotMarketAccount,
 	PerpMarketAccount,
+	SpotMarketAccount,
 	StateAccount,
 	UserAccount,
 } from '../types';
 import {
 	getDriftStateAccountPublicKey,
-	getSpotMarketPublicKey,
 	getPerpMarketPublicKey,
+	getSpotMarketPublicKey,
 } from '../addresses/pda';
 import { BulkAccountLoader } from './bulkAccountLoader';
-import { capitalize } from './utils';
+import { capitalize, findDelistedPerpMarketsAndOracles } from './utils';
 import { PublicKey } from '@solana/web3.js';
 import { OracleInfo, OraclePriceData } from '../oracles/types';
 import { OracleClientCache } from '../oracles/oracleClientCache';
 import { QUOTE_ORACLE_PRICE_DATA } from '../oracles/quoteAssetOracleClient';
 import { findAllMarketAndOracles } from '../config';
+
+const ORACLE_DEFAULT_KEY = PublicKey.default.toBase58();
 
 export class PollingDriftClientAccountSubscriber
 	implements DriftClientAccountSubscriber
@@ -49,9 +52,14 @@ export class PollingDriftClientAccountSubscriber
 
 	state?: DataAndSlot<StateAccount>;
 	perpMarket = new Map<number, DataAndSlot<PerpMarketAccount>>();
+	perpOracleMap = new Map<number, PublicKey>();
+	perpOracleStringMap = new Map<number, string>();
 	spotMarket = new Map<number, DataAndSlot<SpotMarketAccount>>();
+	spotOracleMap = new Map<number, PublicKey>();
+	spotOracleStringMap = new Map<number, string>();
 	oracles = new Map<string, DataAndSlot<OraclePriceData>>();
 	user?: DataAndSlot<UserAccount>;
+	delistedMarketSetting: DelistedMarketSetting;
 
 	private isSubscribing = false;
 	private subscriptionPromise: Promise<boolean>;
@@ -63,7 +71,8 @@ export class PollingDriftClientAccountSubscriber
 		perpMarketIndexes: number[],
 		spotMarketIndexes: number[],
 		oracleInfos: OracleInfo[],
-		shouldFindAllMarketsAndOracles: boolean
+		shouldFindAllMarketsAndOracles: boolean,
+		delistedMarketSetting: DelistedMarketSetting
 	) {
 		this.isSubscribed = false;
 		this.program = program;
@@ -73,6 +82,7 @@ export class PollingDriftClientAccountSubscriber
 		this.spotMarketIndexes = spotMarketIndexes;
 		this.oracleInfos = oracleInfos;
 		this.shouldFindAllMarketsAndOracles = shouldFindAllMarketsAndOracles;
+		this.delistedMarketSetting = delistedMarketSetting;
 	}
 
 	public async subscribe(): Promise<boolean> {
@@ -99,7 +109,7 @@ export class PollingDriftClientAccountSubscriber
 		}
 
 		await this.updateAccountsToPoll();
-		await this.updateOraclesToPoll();
+		this.updateOraclesToPoll();
 		await this.addToAccountLoader();
 
 		let subscriptionSucceeded = false;
@@ -113,6 +123,10 @@ export class PollingDriftClientAccountSubscriber
 		if (subscriptionSucceeded) {
 			this.eventEmitter.emit('update');
 		}
+
+		this.handleDelistedMarkets();
+
+		await Promise.all([this.setPerpOracleMap(), this.setSpotOracleMap()]);
 
 		this.isSubscribing = false;
 		this.isSubscribed = subscriptionSucceeded;
@@ -136,14 +150,18 @@ export class PollingDriftClientAccountSubscriber
 			eventType: 'stateAccountUpdate',
 		});
 
-		await this.updatePerpMarketAccountsToPoll();
-		await this.updateSpotMarketAccountsToPoll();
+		await Promise.all([
+			this.updatePerpMarketAccountsToPoll(),
+			this.updateSpotMarketAccountsToPoll(),
+		]);
 	}
 
 	async updatePerpMarketAccountsToPoll(): Promise<boolean> {
-		for (const marketIndex of this.perpMarketIndexes) {
-			await this.addPerpMarketAccountToPoll(marketIndex);
-		}
+		await Promise.all(
+			this.perpMarketIndexes.map((marketIndex) => {
+				return this.addPerpMarketAccountToPoll(marketIndex);
+			})
+		);
 		return true;
 	}
 
@@ -164,9 +182,11 @@ export class PollingDriftClientAccountSubscriber
 	}
 
 	async updateSpotMarketAccountsToPoll(): Promise<boolean> {
-		for (const marketIndex of this.spotMarketIndexes) {
-			await this.addSpotMarketAccountToPoll(marketIndex);
-		}
+		await Promise.all(
+			this.spotMarketIndexes.map(async (marketIndex) => {
+				await this.addSpotMarketAccountToPoll(marketIndex);
+			})
+		);
 
 		return true;
 	}
@@ -204,15 +224,18 @@ export class PollingDriftClientAccountSubscriber
 
 		return true;
 	}
-
 	async addToAccountLoader(): Promise<void> {
+		const accountPromises = [];
 		for (const [_, accountToPoll] of this.accountsToPoll) {
-			await this.addAccountToAccountLoader(accountToPoll);
+			accountPromises.push(this.addAccountToAccountLoader(accountToPoll));
 		}
 
+		const oraclePromises = [];
 		for (const [_, oracleToPoll] of this.oraclesToPoll) {
-			await this.addOracleToAccountLoader(oracleToPoll);
+			oraclePromises.push(this.addOracleToAccountLoader(oracleToPoll));
 		}
+
+		await Promise.all([...accountPromises, ...oraclePromises]);
 
 		this.errorCallbackId = this.accountLoader.addErrorCallbacks((error) => {
 			this.eventEmitter.emit('error', error);
@@ -227,7 +250,7 @@ export class PollingDriftClientAccountSubscriber
 
 				const account = this.program.account[
 					accountToPoll.key
-				].coder.accounts.decode(capitalize(accountToPoll.key), buffer);
+				].coder.accounts.decodeUnchecked(capitalize(accountToPoll.key), buffer);
 				const dataAndSlot = {
 					data: account,
 					slot,
@@ -252,7 +275,8 @@ export class PollingDriftClientAccountSubscriber
 	async addOracleToAccountLoader(oracleToPoll: OraclesToPoll): Promise<void> {
 		const oracleClient = this.oracleClientCache.get(
 			oracleToPoll.source,
-			this.program.provider.connection
+			this.program.provider.connection,
+			this.program
 		);
 
 		oracleToPoll.callbackId = await this.accountLoader.addAccount(
@@ -282,14 +306,20 @@ export class PollingDriftClientAccountSubscriber
 	public async fetch(): Promise<void> {
 		await this.accountLoader.load();
 		for (const [_, accountToPoll] of this.accountsToPoll) {
-			const { buffer, slot } = this.accountLoader.getBufferAndSlot(
+			const bufferAndSlot = this.accountLoader.getBufferAndSlot(
 				accountToPoll.publicKey
 			);
+
+			if (!bufferAndSlot) {
+				continue;
+			}
+
+			const { buffer, slot } = bufferAndSlot;
+
 			if (buffer) {
 				const account = this.program.account[
 					accountToPoll.key
-				].coder.accounts.decode(capitalize(accountToPoll.key), buffer);
-
+				].coder.accounts.decodeUnchecked(capitalize(accountToPoll.key), buffer);
 				if (accountToPoll.mapKey != undefined) {
 					this[accountToPoll.key].set(accountToPoll.mapKey, {
 						data: account,
@@ -305,13 +335,21 @@ export class PollingDriftClientAccountSubscriber
 		}
 
 		for (const [_, oracleToPoll] of this.oraclesToPoll) {
-			const { buffer, slot } = this.accountLoader.getBufferAndSlot(
+			const bufferAndSlot = this.accountLoader.getBufferAndSlot(
 				oracleToPoll.publicKey
 			);
+
+			if (!bufferAndSlot) {
+				continue;
+			}
+
+			const { buffer, slot } = bufferAndSlot;
+
 			if (buffer) {
 				const oracleClient = this.oracleClientCache.get(
 					oracleToPoll.source,
-					this.program.provider.connection
+					this.program.provider.connection,
+					this.program
 				);
 				const oraclePriceData =
 					oracleClient.getOraclePriceDataFromBuffer(buffer);
@@ -367,6 +405,7 @@ export class PollingDriftClientAccountSubscriber
 		const accountToPoll = this.accountsToPoll.get(marketPublicKey.toString());
 
 		await this.addAccountToAccountLoader(accountToPoll);
+		this.setSpotOracleMap();
 		return true;
 	}
 
@@ -383,23 +422,118 @@ export class PollingDriftClientAccountSubscriber
 		await this.addPerpMarketAccountToPoll(marketIndex);
 		const accountToPoll = this.accountsToPoll.get(marketPublicKey.toString());
 		await this.addAccountToAccountLoader(accountToPoll);
+		await this.setPerpOracleMap();
 		return true;
 	}
 
 	async addOracle(oracleInfo: OracleInfo): Promise<boolean> {
 		if (
 			oracleInfo.publicKey.equals(PublicKey.default) ||
-			this.oraclesToPoll.has(oracleInfo.publicKey.toString())
+			this.oracles.has(oracleInfo.publicKey.toBase58())
 		) {
 			return true;
 		}
 
-		this.addOracleToPoll(oracleInfo);
-		const oracleToPoll = this.oraclesToPoll.get(
-			oracleInfo.publicKey.toString()
-		);
-		await this.addOracleToAccountLoader(oracleToPoll);
+		const oracleString = oracleInfo.publicKey.toBase58();
+		// this func can be called multiple times before the first pauseForOracleToBeAdded finishes
+		// avoid adding to oraclesToPoll multiple time
+		if (!this.oraclesToPoll.has(oracleString)) {
+			this.addOracleToPoll(oracleInfo);
+			const oracleToPoll = this.oraclesToPoll.get(oracleString);
+			await this.addOracleToAccountLoader(oracleToPoll);
+		}
+
+		await this.pauseForOracleToBeAdded(3, oracleString);
+
 		return true;
+	}
+
+	private async pauseForOracleToBeAdded(
+		tries: number,
+		oracle: string
+	): Promise<void> {
+		let i = 0;
+		while (i < tries) {
+			await new Promise((r) =>
+				setTimeout(r, this.accountLoader.pollingFrequency)
+			);
+			if (this.accountLoader.bufferAndSlotMap.has(oracle)) {
+				return;
+			}
+			i++;
+		}
+		console.log(`Pausing to find oracle ${oracle} failed`);
+	}
+	async setPerpOracleMap() {
+		const perpMarkets = this.getMarketAccountsAndSlots();
+		const oraclePromises = [];
+		for (const perpMarket of perpMarkets) {
+			const perpMarketAccount = perpMarket.data;
+			const perpMarketIndex = perpMarketAccount.marketIndex;
+			const oracle = perpMarketAccount.amm.oracle;
+			if (!this.oracles.has(oracle.toBase58())) {
+				oraclePromises.push(
+					this.addOracle({
+						publicKey: oracle,
+						source: perpMarketAccount.amm.oracleSource,
+					})
+				);
+			}
+			this.perpOracleMap.set(perpMarketIndex, oracle);
+			this.perpOracleStringMap.set(perpMarketIndex, oracle.toBase58());
+		}
+		await Promise.all(oraclePromises);
+	}
+
+	async setSpotOracleMap() {
+		const spotMarkets = this.getSpotMarketAccountsAndSlots();
+		const oraclePromises = [];
+		for (const spotMarket of spotMarkets) {
+			const spotMarketAccount = spotMarket.data;
+			const spotMarketIndex = spotMarketAccount.marketIndex;
+			const oracle = spotMarketAccount.oracle;
+			if (!this.oracles.has(oracle.toBase58())) {
+				oraclePromises.push(
+					this.addOracle({
+						publicKey: oracle,
+						source: spotMarketAccount.oracleSource,
+					})
+				);
+			}
+			this.spotOracleMap.set(spotMarketIndex, oracle);
+			this.spotOracleStringMap.set(spotMarketIndex, oracle.toBase58());
+		}
+		await Promise.all(oraclePromises);
+	}
+
+	handleDelistedMarkets(): void {
+		if (this.delistedMarketSetting === DelistedMarketSetting.Subscribe) {
+			return;
+		}
+
+		const { perpMarketIndexes, oracles } = findDelistedPerpMarketsAndOracles(
+			this.getMarketAccountsAndSlots(),
+			this.getSpotMarketAccountsAndSlots()
+		);
+
+		for (const perpMarketIndex of perpMarketIndexes) {
+			const perpMarketPubkey = this.perpMarket.get(perpMarketIndex).data.pubkey;
+			const callbackId = this.accountsToPoll.get(
+				perpMarketPubkey.toBase58()
+			).callbackId;
+			this.accountLoader.removeAccount(perpMarketPubkey, callbackId);
+			if (this.delistedMarketSetting === DelistedMarketSetting.Discard) {
+				this.perpMarket.delete(perpMarketIndex);
+			}
+		}
+
+		for (const oracle of oracles) {
+			const callbackId = this.oraclesToPoll.get(oracle.toBase58()).callbackId;
+			this.accountLoader.removeAccount(oracle, callbackId);
+			if (this.delistedMarketSetting === DelistedMarketSetting.Discard) {
+				this.oracles.delete(oracle.toBase58());
+			}
+		}
 	}
 
 	assertIsSubscribed(): void {
@@ -436,17 +570,58 @@ export class PollingDriftClientAccountSubscriber
 	}
 
 	public getOraclePriceDataAndSlot(
-		oraclePublicKey: PublicKey
+		oraclePublicKey: PublicKey | string
 	): DataAndSlot<OraclePriceData> | undefined {
 		this.assertIsSubscribed();
-		if (oraclePublicKey.equals(PublicKey.default)) {
+		const oracleString =
+			typeof oraclePublicKey === 'string'
+				? oraclePublicKey
+				: oraclePublicKey.toBase58();
+		if (oracleString === ORACLE_DEFAULT_KEY) {
 			return {
 				data: QUOTE_ORACLE_PRICE_DATA,
 				slot: 0,
 			};
 		}
 
-		return this.oracles.get(oraclePublicKey.toString());
+		return this.oracles.get(oracleString);
+	}
+
+	public getOraclePriceDataAndSlotForPerpMarket(
+		marketIndex: number
+	): DataAndSlot<OraclePriceData> | undefined {
+		const perpMarketAccount = this.getMarketAccountAndSlot(marketIndex);
+		const oracle = this.perpOracleMap.get(marketIndex);
+		const oracleString = this.perpOracleStringMap.get(marketIndex);
+
+		if (!perpMarketAccount || !oracle) {
+			return undefined;
+		}
+
+		if (!perpMarketAccount.data.amm.oracle.equals(oracle)) {
+			// If the oracle has changed, we need to update the oracle map in background
+			this.setPerpOracleMap();
+		}
+
+		return this.getOraclePriceDataAndSlot(oracleString);
+	}
+
+	public getOraclePriceDataAndSlotForSpotMarket(
+		marketIndex: number
+	): DataAndSlot<OraclePriceData> | undefined {
+		const spotMarketAccount = this.getSpotMarketAccountAndSlot(marketIndex);
+		const oracle = this.spotOracleMap.get(marketIndex);
+		const oracleString = this.spotOracleStringMap.get(marketIndex);
+		if (!spotMarketAccount || !oracle) {
+			return undefined;
+		}
+
+		if (!spotMarketAccount.data.oracle.equals(oracle)) {
+			// If the oracle has changed, we need to update the oracle map in background
+			this.setSpotOracleMap();
+		}
+
+		return this.getOraclePriceDataAndSlot(oracleString);
 	}
 
 	public updateAccountLoaderPollingFrequency(pollingFrequency: number): void {

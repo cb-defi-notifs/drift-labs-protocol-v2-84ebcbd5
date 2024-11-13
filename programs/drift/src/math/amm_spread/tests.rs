@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test {
+    use crate::math::amm::calculate_price;
     use crate::math::amm_spread::*;
     use crate::math::constants::{
         AMM_RESERVE_PRECISION, BASE_PRECISION_I128, BID_ASK_SPREAD_PRECISION,
@@ -35,6 +36,157 @@ mod test {
         let (l, s) = cap_to_max_spread(2510, 110, 2500).unwrap();
         assert_eq!(l, 2396);
         assert_eq!(s, 104);
+    }
+
+    #[test]
+    fn calculate_reference_price_offset_tests() {
+        let rev_price = 4216 * 10000;
+        let max_offset: i64 = 2500; // 25 bps
+
+        let res =
+            calculate_reference_price_offset(rev_price, 0, 0, 0, 0, 0, 0, 0, max_offset).unwrap();
+        assert_eq!(res, 0);
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            1,
+            10,
+            1,
+            4216 * 10000,
+            4217 * 10000,
+            4216 * 10000,
+            4217 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, 158); // 237*2/3); // 1 penny divergence
+        let res = calculate_reference_price_offset(
+            rev_price,
+            1,
+            10,
+            1,
+            4216 * 10000,
+            4219 * 10000,
+            4216 * 10000,
+            4219 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, 237 * 2); // 3 penny divergence
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            -43_000_000,
+            10,
+            1,
+            4216 * 10000,
+            4218 * 10000,
+            4216 * 10000,
+            4218 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, -517); // counter acting 24h_avg sign
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            -43_000_000,
+            -10000,
+            1,
+            4216 * 10000,
+            4218 * 10000,
+            4216 * 10000,
+            4218 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, -542); // counteracting 24h_avg / base inventory sign
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            -43_000_000,
+            -10,
+            1,
+            4216 * 10000,
+            4214 * 10000,
+            4216 * 10000,
+            4214 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, -1149); // flipped
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            1,
+            10,
+            1,
+            4216 * 10000,
+            4223 * 10000,
+            4216 * 10000,
+            4223 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, 1660 * 2 / 3); // 7 penny divergence
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            10_000_000,
+            10,
+            1,
+            4216 * 10000,
+            4233 * 10000,
+            4216 * 10000,
+            4233 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, 2500); // upper bound
+
+        let res = calculate_reference_price_offset(
+            rev_price,
+            -10_000_000,
+            -10,
+            1,
+            4216 * 10000,
+            4123 * 10000,
+            4216 * 10000,
+            4123 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, -2500); // lower bound
+
+        // max offset = 0
+        let res = calculate_reference_price_offset(
+            rev_price,
+            -10_000_000,
+            -10,
+            1,
+            4216 * 10000,
+            4123 * 10000,
+            6 * 10000,
+            4123 * 10000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(res, 0); // zero bound
+
+        // counteracting fast/slow twaps to 0
+        let res = calculate_reference_price_offset(
+            rev_price,
+            -1,
+            1,
+            1,
+            4216 * 10000,
+            4123 * 10000,
+            4123 * 10000,
+            4216 * 10000,
+            max_offset,
+        )
+        .unwrap();
+        assert_eq!(res, 0);
     }
 
     #[test]
@@ -120,7 +272,7 @@ mod test {
 
         // oracle retreat * skew that increases long spread
         last_oracle_reserve_price_spread_pct = BID_ASK_SPREAD_PRECISION_I64 / 20; //5%
-        last_oracle_conf_pct = (BID_ASK_SPREAD_PRECISION / 100) as u64; //1%
+        last_oracle_conf_pct = BID_ASK_SPREAD_PRECISION / 100; //1%
         total_fee_minus_distributions = QUOTE_PRECISION as i128;
         let (long_spread3, short_spread3) = calculate_spread(
             base_spread,
@@ -181,8 +333,8 @@ mod test {
         .unwrap();
         assert!(short_spread4 < long_spread4);
         // (1000000/777 + 1 )* 1.562 * 2 -> 2012 * 2
-        assert_eq!(long_spread4, 33256);
-        // base_spread
+        assert_eq!(long_spread4, 33255); // lower one for conf_component change
+                                         // base_spread
         assert_eq!(short_spread4, 500);
 
         // increases to fee pool will decrease long spread (all else equal)
@@ -211,6 +363,8 @@ mod test {
 
         assert!(long_spread5 < long_spread4);
         assert_eq!(short_spread5, short_spread4);
+        assert_eq!(long_spread5, 27270);
+        assert_eq!(short_spread5, 500);
 
         let amm = AMM {
             base_asset_reserve: 2 * AMM_RESERVE_PRECISION,
@@ -219,20 +373,98 @@ mod test {
             peg_multiplier: PEG_PRECISION,
             long_spread: long_spread5,
             short_spread: short_spread5,
+            max_spread: 1000,
+            curve_update_intensity: 100,
             ..AMM::default()
         };
 
-        let (bar_l, qar_l) = calculate_spread_reserves(&amm, PositionDirection::Long).unwrap();
-        let (bar_s, qar_s) = calculate_spread_reserves(&amm, PositionDirection::Short).unwrap();
+        let mut market = PerpMarket {
+            amm,
+            ..PerpMarket::default()
+        };
+
+        let max_ref_offset = amm.get_max_reference_price_offset().unwrap();
+        assert_eq!(max_ref_offset, 0);
+
+        market.amm.curve_update_intensity = 110;
+        let max_ref_offset = market.amm.get_max_reference_price_offset().unwrap();
+        assert_eq!(max_ref_offset, 1000); // 10 bps
+
+        market.amm.curve_update_intensity = 200;
+        let max_ref_offset = market.amm.get_max_reference_price_offset().unwrap();
+        assert_eq!(max_ref_offset, 10000); // 100 bps
+
+        market.amm.max_spread = 10000 * 10; // 10%
+        let max_ref_offset = market.amm.get_max_reference_price_offset().unwrap();
+        assert_eq!(max_ref_offset, 20000); // 200 bps (5% of max spread)
+
+        let orig_price = calculate_price(
+            amm.quote_asset_reserve,
+            amm.base_asset_reserve,
+            amm.peg_multiplier,
+        )
+        .unwrap();
+        assert_eq!(orig_price, 1000000);
+
+        let (bar_l, qar_l) = calculate_spread_reserves(&market, PositionDirection::Long).unwrap();
+        let (bar_s, qar_s) = calculate_spread_reserves(&market, PositionDirection::Short).unwrap();
+
+        assert_eq!(bar_s, 2000500125);
+        assert_eq!(bar_l, 1972972973);
+        assert_eq!(qar_l, 2027397260);
+        assert_eq!(qar_s, 1999500000);
 
         assert!(qar_l > amm.quote_asset_reserve);
         assert!(bar_l < amm.base_asset_reserve);
         assert!(qar_s < amm.quote_asset_reserve);
         assert!(bar_s > amm.base_asset_reserve);
-        assert_eq!(bar_s, 2000500125);
-        assert_eq!(bar_l, 1972972973);
-        assert_eq!(qar_l, 2027397260);
-        assert_eq!(qar_s, 1999500000);
+
+        let l_price = calculate_price(qar_l, bar_l, amm.peg_multiplier).unwrap();
+        let s_price = calculate_price(qar_s, bar_s, amm.peg_multiplier).unwrap();
+        assert_eq!(l_price, 1027584);
+        assert_eq!(s_price, 999500);
+        assert!(l_price > s_price);
+
+        market.amm.reference_price_offset = 1000; // 10 bps
+
+        let (bar_l, qar_l) = calculate_spread_reserves(&market, PositionDirection::Long).unwrap();
+        let (bar_s, qar_s) = calculate_spread_reserves(&market, PositionDirection::Short).unwrap();
+
+        assert_eq!(amm.quote_asset_reserve, 2000000000);
+        assert_eq!(qar_s, 2000500000); // down
+
+        assert!(qar_l > amm.quote_asset_reserve);
+        assert!(bar_l < amm.base_asset_reserve);
+        assert!(qar_s > amm.quote_asset_reserve);
+        assert!(bar_s < amm.base_asset_reserve);
+        assert_eq!(bar_s, 1999500124); // up
+        assert_eq!(bar_l, 1971830986); // down
+        assert_eq!(qar_l, 2028571428); // up
+
+        let l_price = calculate_price(qar_l, bar_l, amm.peg_multiplier).unwrap();
+        let s_price = calculate_price(qar_s, bar_s, amm.peg_multiplier).unwrap();
+        assert_eq!(l_price, 1028775);
+        assert_eq!(s_price, 1000500);
+        assert!(l_price > s_price);
+
+        market.amm.reference_price_offset = -1000; // -10 bps
+        let (bar_l, qar_l) = calculate_spread_reserves(&market, PositionDirection::Long).unwrap();
+        let (bar_s, qar_s) = calculate_spread_reserves(&market, PositionDirection::Short).unwrap();
+
+        assert!(qar_l > amm.quote_asset_reserve);
+        assert!(bar_l < amm.base_asset_reserve);
+        assert!(qar_s < amm.quote_asset_reserve);
+        assert!(bar_s > amm.base_asset_reserve);
+        assert_eq!(bar_s, 2001501501); // up
+        assert_eq!(bar_l, 1974025974); // up
+        assert_eq!(qar_l, 2026315789); // down
+        assert_eq!(qar_s, 1998499625); // down
+
+        let l_price = calculate_price(qar_l, bar_l, amm.peg_multiplier).unwrap();
+        let s_price = calculate_price(qar_s, bar_s, amm.peg_multiplier).unwrap();
+        assert_eq!(l_price, 1026488);
+        assert_eq!(s_price, 998500);
+        assert!(l_price > s_price);
 
         let (long_spread_btc, short_spread_btc) = calculate_spread(
             500,
@@ -257,8 +489,8 @@ mod test {
         )
         .unwrap();
 
-        assert_eq!(long_spread_btc, 411);
-        assert_eq!(short_spread_btc, 74584);
+        assert_eq!(long_spread_btc, 250);
+        assert_eq!(short_spread_btc, 74142);
 
         let (long_spread_btc1, short_spread_btc1) = calculate_spread(
             500,
@@ -736,7 +968,7 @@ mod test {
         // user long => bar < sqrt_k < qar => tqar < qar => peg < reserve_price
         let lscale = calculate_spread_leverage_scale(
             AMM_RESERVE_PRECISION * 1000,
-            (AMM_RESERVE_PRECISION * 9999 / 10000) as u128,
+            AMM_RESERVE_PRECISION * 9999 / 10000,
             12 * PEG_PRECISION,
             BASE_PRECISION_I128,
             (12.1 * PRICE_PRECISION as f64) as u64,
@@ -958,7 +1190,7 @@ mod test {
         )
         .unwrap();
         assert_eq!(long_spread, 195556);
-        assert_eq!(short_spread, max_spread - long_spread);
+        assert_eq!(short_spread, 4444);
 
         let (long_spread, short_spread) = calculate_spread(
             base_spread,
@@ -1178,6 +1410,8 @@ mod test {
 
     #[test]
     fn various_spread_tests() {
+        // should match typescript sdk tests in sdk/tests/amm/test.ts
+
         let (long_spread, short_spread) = calculate_spread(
             300,
             0,
@@ -1200,8 +1434,62 @@ mod test {
             432067603632,
         )
         .unwrap();
-        assert_eq!(long_spread, 4262);
-        assert_eq!(short_spread, 43238);
+        assert_eq!(long_spread, 89746);
+        assert_eq!(short_spread, 910254);
+
+        // terms 3
+        let (long_spread, short_spread) = calculate_spread(
+            300,
+            0,
+            484,
+            47500,
+            923807816209694,
+            925117623772584,
+            13731157,
+            -1314027016625,
+            13667686,
+            115876379475,
+            91316628,
+            928097825691666,
+            907979542352912,
+            945977491145601,
+            161188,
+            1459632439,
+            12358265776,
+            72230366233,
+            432067603632,
+        )
+        .unwrap();
+        assert_eq!(long_spread, 89746);
+        assert_eq!(short_spread, 910254);
+
+        // terms 4
+        let (long_spread, short_spread) = calculate_spread(
+            300,
+            0,
+            484,
+            47500,
+            923807816209694,
+            925117623772584,
+            13731157,
+            -1314027016625,
+            13667686,
+            115876379475,
+            91316628,
+            928097825691666,
+            907979542352912,
+            945977491145601,
+            161188,
+            1459632439,
+            12358265776,
+            72230366233,
+            432067603632,
+        )
+        .unwrap();
+        assert_eq!(long_spread, 89746);
+        assert_eq!(short_spread, 910254);
+
+        // extra one?
 
         let (long_spread, short_spread) = calculate_spread(
             300,
@@ -1225,7 +1513,105 @@ mod test {
             427588331503,
         )
         .unwrap();
-        assert_eq!(long_spread, 4390);
-        assert_eq!(short_spread, 43110);
+        assert_eq!(long_spread, 22137);
+        assert_eq!(short_spread, 217356);
+    }
+
+    #[test]
+    fn calculate_prediction_market_spread_tests_low_price() {
+        let amm = AMM {
+            base_asset_reserve: 2 * AMM_RESERVE_PRECISION,
+            quote_asset_reserve: 2 * AMM_RESERVE_PRECISION,
+            sqrt_k: 2 * AMM_RESERVE_PRECISION,
+            peg_multiplier: PEG_PRECISION / 30, // .02
+            long_spread: 10000,
+            short_spread: 10000,
+            base_spread: 10000,
+            max_spread: 100000,
+            curve_update_intensity: 100,
+            ..AMM::default()
+        };
+
+        let market = PerpMarket {
+            amm,
+            contract_type: ContractType::Prediction,
+            ..PerpMarket::default()
+        };
+
+        let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
+        let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
+
+        assert_eq!(
+            crate::math::amm::calculate_price(
+                new_ask_quote_asset_reserve,
+                new_ask_base_asset_reserve,
+                market.amm.peg_multiplier,
+            )
+            .unwrap(),
+            50001 // over .05
+        );
+
+        assert_eq!(
+            crate::math::amm::calculate_price(
+                new_bid_quote_asset_reserve,
+                new_bid_base_asset_reserve,
+                market.amm.peg_multiplier,
+            )
+            .unwrap(),
+            33000
+        );
+    }
+
+    #[test]
+    fn calculate_prediction_market_spread_tests_high_price() {
+        let amm = AMM {
+            base_asset_reserve: 2 * AMM_RESERVE_PRECISION,
+            quote_asset_reserve: 2 * AMM_RESERVE_PRECISION,
+            sqrt_k: 2 * AMM_RESERVE_PRECISION,
+            peg_multiplier: PEG_PRECISION - PEG_PRECISION / 1000, // .999
+            long_spread: 10000,
+            short_spread: 10000,
+            base_spread: 10000,
+            max_spread: 100000,
+            curve_update_intensity: 100,
+            ..AMM::default()
+        };
+
+        let market = PerpMarket {
+            amm,
+            contract_type: ContractType::Prediction,
+            ..PerpMarket::default()
+        };
+
+        let (new_ask_base_asset_reserve, new_ask_quote_asset_reserve) =
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Long)
+                .unwrap();
+        let (new_bid_base_asset_reserve, new_bid_quote_asset_reserve) =
+            crate::math::amm_spread::calculate_spread_reserves(&market, PositionDirection::Short)
+                .unwrap();
+
+        assert_eq!(
+            crate::math::amm::calculate_price(
+                new_ask_quote_asset_reserve,
+                new_ask_base_asset_reserve,
+                market.amm.peg_multiplier,
+            )
+            .unwrap(),
+            1000000 // exactly $1
+        );
+
+        assert_eq!(
+            crate::math::amm::calculate_price(
+                new_bid_quote_asset_reserve,
+                new_bid_base_asset_reserve,
+                market.amm.peg_multiplier,
+            )
+            .unwrap(),
+            949981 // under .95
+        );
     }
 }

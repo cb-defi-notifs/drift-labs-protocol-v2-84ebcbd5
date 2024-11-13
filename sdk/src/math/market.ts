@@ -129,24 +129,45 @@ export function calculateOracleSpread(
 export function calculateMarketMarginRatio(
 	market: PerpMarketAccount,
 	size: BN,
-	marginCategory: MarginCategory
+	marginCategory: MarginCategory,
+	customMarginRatio = 0,
+	userHighLeverageMode = false
 ): number {
+	let marginRationInitial;
+	let marginRatioMaintenance;
+
+	if (
+		userHighLeverageMode &&
+		market.highLeverageMarginRatioInitial > 0 &&
+		market.highLeverageMarginRatioMaintenance
+	) {
+		marginRationInitial = market.highLeverageMarginRatioInitial;
+		marginRatioMaintenance = market.highLeverageMarginRatioMaintenance;
+	} else {
+		marginRationInitial = market.marginRatioInitial;
+		marginRatioMaintenance = market.marginRatioMaintenance;
+	}
+
 	let marginRatio;
 	switch (marginCategory) {
 		case 'Initial': {
-			marginRatio = calculateSizePremiumLiabilityWeight(
-				size,
-				new BN(market.imfFactor),
-				new BN(market.marginRatioInitial),
-				MARGIN_PRECISION
-			).toNumber();
+			// use lowest leverage between max allowed and optional user custom max
+			marginRatio = Math.max(
+				calculateSizePremiumLiabilityWeight(
+					size,
+					new BN(market.imfFactor),
+					new BN(marginRationInitial),
+					MARGIN_PRECISION
+				).toNumber(),
+				customMarginRatio
+			);
 			break;
 		}
 		case 'Maintenance': {
 			marginRatio = calculateSizePremiumLiabilityWeight(
 				size,
 				new BN(market.imfFactor),
-				new BN(market.marginRatioMaintenance),
+				new BN(marginRatioMaintenance),
 				MARGIN_PRECISION
 			).toNumber();
 			break;
@@ -230,11 +251,14 @@ export function calculateNetUserPnl(
 	oraclePriceData: OraclePriceData
 ): BN {
 	const netUserPositionValue = perpMarket.amm.baseAssetAmountWithAmm
+		.add(perpMarket.amm.baseAssetAmountWithUnsettledLp)
 		.mul(oraclePriceData.price)
 		.div(BASE_PRECISION)
 		.div(PRICE_TO_QUOTE_PRECISION);
 
-	const netUserCostBasis = perpMarket.amm.quoteAssetAmount;
+	const netUserCostBasis = perpMarket.amm.quoteAssetAmount
+		.add(perpMarket.amm.quoteAssetAmountWithUnsettledLp)
+		.add(perpMarket.amm.netUnsettledFundingPnl);
 
 	const netUserPnl = netUserPositionValue.add(netUserCostBasis);
 
@@ -244,7 +268,8 @@ export function calculateNetUserPnl(
 export function calculateNetUserPnlImbalance(
 	perpMarket: PerpMarketAccount,
 	spotMarket: SpotMarketAccount,
-	oraclePriceData: OraclePriceData
+	oraclePriceData: OraclePriceData,
+	applyFeePoolDiscount = true
 ): BN {
 	const netUserPnl = calculateNetUserPnl(perpMarket, oraclePriceData);
 
@@ -253,11 +278,14 @@ export function calculateNetUserPnlImbalance(
 		spotMarket,
 		SpotBalanceType.DEPOSIT
 	);
-	const feePool = getTokenAmount(
+	let feePool = getTokenAmount(
 		perpMarket.amm.feePool.scaledBalance,
 		spotMarket,
 		SpotBalanceType.DEPOSIT
 	);
+	if (applyFeePoolDiscount) {
+		feePool = feePool.div(new BN(5));
+	}
 
 	const imbalance = netUserPnl.sub(pnlPool.add(feePool));
 
@@ -279,27 +307,22 @@ export function calculateAvailablePerpLiquidity(
 
 	asks = asks.abs();
 
-	const bidPrice = calculateBidPrice(market, oraclePriceData);
-	const askPrice = calculateAskPrice(market, oraclePriceData);
-
-	for (const bid of dlob.getMakerLimitBids(
+	for (const bid of dlob.getRestingLimitBids(
 		market.marketIndex,
 		slot,
 		MarketType.PERP,
-		oraclePriceData,
-		askPrice
+		oraclePriceData
 	)) {
 		bids = bids.add(
 			bid.order.baseAssetAmount.sub(bid.order.baseAssetAmountFilled)
 		);
 	}
 
-	for (const ask of dlob.getMakerLimitAsks(
+	for (const ask of dlob.getRestingLimitAsks(
 		market.marketIndex,
 		slot,
 		MarketType.PERP,
-		oraclePriceData,
-		bidPrice
+		oraclePriceData
 	)) {
 		asks = asks.add(
 			ask.order.baseAssetAmount.sub(ask.order.baseAssetAmountFilled)

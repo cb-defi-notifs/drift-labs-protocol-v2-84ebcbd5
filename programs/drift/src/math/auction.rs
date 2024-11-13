@@ -8,6 +8,9 @@ use crate::state::oracle::OraclePriceData;
 use crate::state::user::{Order, OrderType};
 use solana_program::msg;
 
+use crate::state::fill_mode::FillMode;
+use crate::state::perp_market::{AMMAvailability, PerpMarket};
+use crate::{OrderParams, MAX_PREDICTION_MARKET_PRICE};
 use std::cmp::min;
 
 #[cfg(test)]
@@ -83,18 +86,32 @@ pub fn calculate_auction_price(
     slot: u64,
     tick_size: u64,
     valid_oracle_price: Option<i64>,
+    is_prediction_market: bool,
 ) -> DriftResult<u64> {
     match order.order_type {
-        OrderType::Market | OrderType::TriggerMarket | OrderType::Limit => {
+        OrderType::Market | OrderType::TriggerMarket | OrderType::TriggerLimit => {
             calculate_auction_price_for_fixed_auction(order, slot, tick_size)
+        }
+        OrderType::Limit => {
+            if order.has_oracle_price_offset() {
+                calculate_auction_price_for_oracle_offset_auction(
+                    order,
+                    slot,
+                    tick_size,
+                    valid_oracle_price,
+                    is_prediction_market,
+                )
+            } else {
+                calculate_auction_price_for_fixed_auction(order, slot, tick_size)
+            }
         }
         OrderType::Oracle => calculate_auction_price_for_oracle_offset_auction(
             order,
             slot,
             tick_size,
             valid_oracle_price,
+            is_prediction_market,
         ),
-        _ => unreachable!(),
     }
 }
 
@@ -139,6 +156,7 @@ fn calculate_auction_price_for_oracle_offset_auction(
     slot: u64,
     tick_size: u64,
     valid_oracle_price: Option<i64>,
+    is_prediction_market: bool,
 ) -> DriftResult<u64> {
     let oracle_price = valid_oracle_price.ok_or_else(|| {
         msg!("Could not find oracle too calculate oracle offset auction price");
@@ -154,14 +172,16 @@ fn calculate_auction_price_for_oracle_offset_auction(
     let auction_end_price_offset = order.auction_end_price;
 
     if delta_denominator == 0 {
-        let price = oracle_price.safe_add(auction_end_price_offset)?;
+        let mut price = oracle_price
+            .safe_add(auction_end_price_offset)?
+            .max(tick_size.cast()?)
+            .cast::<u64>()?;
 
-        if price <= 0 {
-            msg!("Oracle offset auction price below zero: {}", price);
-            return Err(ErrorCode::InvalidOracleOffset);
+        if is_prediction_market {
+            price = price.min(MAX_PREDICTION_MARKET_PRICE);
         }
 
-        return standardize_price(price.cast()?, tick_size, order.direction);
+        return standardize_price(price, tick_size, order.direction);
     }
 
     let price_offset_delta = match order.direction {
@@ -180,36 +200,16 @@ fn calculate_auction_price_for_oracle_offset_auction(
         PositionDirection::Short => auction_start_price_offset.safe_sub(price_offset_delta)?,
     };
 
-    let price = standardize_price(
-        oracle_price.safe_add(price_offset)?.max(0).cast()?,
-        tick_size,
-        order.direction,
-    )?;
+    let mut price = oracle_price
+        .safe_add(price_offset)?
+        .max(tick_size.cast()?)
+        .cast::<u64>()?;
 
-    if price == 0 {
-        msg!("Oracle offset auction price below zero: {}", price);
-        return Err(ErrorCode::InvalidOracleOffset);
+    if is_prediction_market {
+        price = price.min(MAX_PREDICTION_MARKET_PRICE);
     }
 
-    Ok(price)
-}
-
-pub fn does_auction_satisfy_maker_order(
-    maker_order: &Order,
-    taker_order: &Order,
-    auction_price: u64,
-) -> bool {
-    // TODO more conditions to check?
-    if maker_order.direction == taker_order.direction
-        || maker_order.market_index != taker_order.market_index
-    {
-        return false;
-    }
-
-    match maker_order.direction {
-        PositionDirection::Long => auction_price <= maker_order.price,
-        PositionDirection::Short => auction_price >= maker_order.price,
-    }
+    standardize_price(price, tick_size, order.direction)
 }
 
 pub fn is_auction_complete(order_slot: u64, auction_duration: u8, slot: u64) -> DriftResult<bool> {
@@ -222,10 +222,54 @@ pub fn is_auction_complete(order_slot: u64, auction_duration: u8, slot: u64) -> 
     Ok(slots_elapsed > auction_duration.cast()?)
 }
 
+pub fn can_fill_with_amm(
+    amm_availability: AMMAvailability,
+    valid_oracle_price: Option<i64>,
+    order: &Order,
+    min_auction_duration: u8,
+    slot: u64,
+    fill_mode: FillMode,
+) -> DriftResult<bool> {
+    Ok(!(amm_availability == AMMAvailability::Unavailable)
+        && valid_oracle_price.is_some()
+        && (amm_availability == AMMAvailability::Immediate
+            || is_amm_available_liquidity_source(order, min_auction_duration, slot, fill_mode)?))
+}
+
 pub fn is_amm_available_liquidity_source(
     order: &Order,
     min_auction_duration: u8,
     slot: u64,
+    fill_mode: FillMode,
 ) -> DriftResult<bool> {
-    is_auction_complete(order.slot, min_auction_duration, slot)
+    Ok(is_auction_complete(order.slot, min_auction_duration, slot)? || fill_mode.is_liquidation())
+}
+
+pub fn calculate_auction_params_for_trigger_order(
+    order: &Order,
+    oracle_price_data: &OraclePriceData,
+    min_auction_duration: u8,
+    perp_market: Option<&PerpMarket>,
+) -> DriftResult<(u8, i64, i64)> {
+    let auction_duration = min_auction_duration;
+
+    if let Some(perp_market) = perp_market {
+        let (auction_start_price, auction_end_price, derived_auction_duration) =
+            OrderParams::derive_market_order_auction_params(
+                perp_market,
+                order.direction,
+                oracle_price_data.price,
+                order.price,
+                0,
+            )?;
+
+        let auction_duration = auction_duration.max(derived_auction_duration);
+
+        Ok((auction_duration, auction_start_price, auction_end_price))
+    } else {
+        let (auction_start_price, auction_end_price) =
+            calculate_auction_prices(oracle_price_data, order.direction, order.price)?;
+
+        Ok((auction_duration, auction_start_price, auction_end_price))
+    }
 }

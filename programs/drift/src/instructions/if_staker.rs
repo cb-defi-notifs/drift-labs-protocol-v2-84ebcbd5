@@ -1,16 +1,20 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::token_interface::{TokenAccount, TokenInterface};
 
+use crate::controller::insurance::transfer_protocol_insurance_fund_stake;
 use crate::error::ErrorCode;
 use crate::instructions::constraints::*;
-use crate::load_mut;
-use crate::state::insurance_fund_stake::InsuranceFundStake;
+use crate::optional_accounts::get_token_mint;
+use crate::state::insurance_fund_stake::{InsuranceFundStake, ProtocolIfSharesTransferConfig};
+use crate::state::paused_operations::InsuranceFundOperation;
+use crate::state::perp_market::MarketStatus;
 use crate::state::spot_market::SpotMarket;
 use crate::state::state::State;
 use crate::state::traits::Size;
 use crate::state::user::UserStats;
 use crate::validate;
 use crate::{controller, math};
+use crate::{load_mut, QUOTE_SPOT_MARKET_INDEX};
 
 pub fn handle_initialize_insurance_fund_stake(
     ctx: Context<InitializeInsuranceFundStake>,
@@ -27,11 +31,19 @@ pub fn handle_initialize_insurance_fund_stake(
 
     *if_stake = InsuranceFundStake::new(*ctx.accounts.authority.key, market_index, now);
 
+    let spot_market = ctx.accounts.spot_market.load()?;
+
+    validate!(
+        !spot_market.is_insurance_fund_operation_paused(InsuranceFundOperation::Init),
+        ErrorCode::InsuranceFundOperationPaused,
+        "if staking init disabled",
+    )?;
+
     Ok(())
 }
 
-pub fn handle_add_insurance_fund_stake(
-    ctx: Context<AddInsuranceFundStake>,
+pub fn handle_add_insurance_fund_stake<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, AddInsuranceFundStake<'info>>,
     market_index: u16,
     amount: u64,
 ) -> Result<()> {
@@ -46,10 +58,26 @@ pub fn handle_add_insurance_fund_stake(
     let spot_market = &mut load_mut!(ctx.accounts.spot_market)?;
     let state = &ctx.accounts.state;
 
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
+    let mint = get_token_mint(remaining_accounts_iter)?;
+
+    validate!(
+        !spot_market.is_insurance_fund_operation_paused(InsuranceFundOperation::Add),
+        ErrorCode::InsuranceFundOperationPaused,
+        "if staking add disabled",
+    )?;
+
     validate!(
         insurance_fund_stake.market_index == market_index,
         ErrorCode::IncorrectSpotMarketAccountPassed,
         "insurance_fund_stake does not match market_index"
+    )?;
+
+    validate!(
+        spot_market.status != MarketStatus::Initialized,
+        ErrorCode::InvalidSpotMarketState,
+        "spot market = {} not active for insurance_fund_stake",
+        spot_market.market_index
     )?;
 
     validate!(
@@ -68,6 +96,7 @@ pub fn handle_add_insurance_fund_stake(
             &ctx.accounts.token_program,
             &ctx.accounts.drift_signer,
             state,
+            &mint,
         )?;
 
         // reload the vault balances so they're up-to-date
@@ -94,6 +123,7 @@ pub fn handle_add_insurance_fund_stake(
         &ctx.accounts.insurance_fund_vault,
         &ctx.accounts.authority,
         amount,
+        &mint,
     )?;
 
     Ok(())
@@ -108,6 +138,12 @@ pub fn handle_request_remove_insurance_fund_stake(
     let insurance_fund_stake = &mut load_mut!(ctx.accounts.insurance_fund_stake)?;
     let user_stats = &mut load_mut!(ctx.accounts.user_stats)?;
     let spot_market = &mut load_mut!(ctx.accounts.spot_market)?;
+
+    validate!(
+        !spot_market.is_insurance_fund_operation_paused(InsuranceFundOperation::RequestRemove),
+        ErrorCode::InsuranceFundOperationPaused,
+        "if staking request remove disabled",
+    )?;
 
     validate!(
         insurance_fund_stake.market_index == market_index,
@@ -184,8 +220,8 @@ pub fn handle_cancel_request_remove_insurance_fund_stake(
 #[access_control(
     withdraw_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_remove_insurance_fund_stake(
-    ctx: Context<RemoveInsuranceFundStake>,
+pub fn handle_remove_insurance_fund_stake<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, RemoveInsuranceFundStake<'info>>,
     market_index: u16,
 ) -> Result<()> {
     let clock = Clock::get()?;
@@ -194,6 +230,15 @@ pub fn handle_remove_insurance_fund_stake(
     let user_stats = &mut load_mut!(ctx.accounts.user_stats)?;
     let spot_market = &mut load_mut!(ctx.accounts.spot_market)?;
     let state = &ctx.accounts.state;
+
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
+    let mint = get_token_mint(remaining_accounts_iter)?;
+
+    validate!(
+        !spot_market.is_insurance_fund_operation_paused(InsuranceFundOperation::Remove),
+        ErrorCode::InsuranceFundOperationPaused,
+        "if staking remove disabled",
+    )?;
 
     validate!(
         insurance_fund_stake.market_index == market_index,
@@ -223,6 +268,7 @@ pub fn handle_remove_insurance_fund_stake(
         &ctx.accounts.drift_signer,
         state.signer_nonce,
         amount,
+        &mint,
     )?;
 
     ctx.accounts.insurance_fund_vault.reload()?;
@@ -234,6 +280,44 @@ pub fn handle_remove_insurance_fund_stake(
 
     // validate relevant spot market balances before unstake
     math::spot_withdraw::validate_spot_balances(spot_market)?;
+
+    Ok(())
+}
+
+pub fn handle_transfer_protocol_if_shares(
+    ctx: Context<TransferProtocolIfShares>,
+    market_index: u16,
+    shares: u128,
+) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
+
+    validate!(
+        market_index == QUOTE_SPOT_MARKET_INDEX,
+        ErrorCode::DefaultError,
+        "must be if for quote spot market"
+    )?;
+
+    let mut transfer_config = ctx.accounts.transfer_config.load_mut()?;
+
+    transfer_config.validate_signer(ctx.accounts.signer.key)?;
+
+    transfer_config.update_epoch(now)?;
+    transfer_config.validate_transfer(shares)?;
+    transfer_config.current_epoch_transfer += shares;
+
+    let mut if_stake = ctx.accounts.insurance_fund_stake.load_mut()?;
+    let mut user_stats = ctx.accounts.user_stats.load_mut()?;
+    let mut spot_market = ctx.accounts.spot_market.load_mut()?;
+
+    transfer_protocol_insurance_fund_stake(
+        ctx.accounts.insurance_fund_vault.amount,
+        shares,
+        &mut if_stake,
+        &mut user_stats,
+        &mut spot_market,
+        Clock::get()?.unix_timestamp,
+        ctx.accounts.state.signer,
+    )?;
 
     Ok(())
 }
@@ -274,6 +358,7 @@ pub struct InitializeInsuranceFundStake<'info> {
 pub struct AddInsuranceFundStake<'info> {
     pub state: Box<Account<'info, State>>,
     #[account(
+        mut,
         seeds = [b"spot_market", market_index.to_le_bytes().as_ref()],
         bump
     )]
@@ -294,13 +379,13 @@ pub struct AddInsuranceFundStake<'info> {
         seeds = [b"spot_market_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub spot_market_vault: Box<Account<'info, TokenAccount>>,
+    pub spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         seeds = [b"insurance_fund_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub insurance_fund_vault: Box<Account<'info, TokenAccount>>,
+    pub insurance_fund_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         constraint = state.signer.eq(&drift_signer.key())
@@ -312,14 +397,15 @@ pub struct AddInsuranceFundStake<'info> {
         token::mint = insurance_fund_vault.mint,
         token::authority = authority
     )]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
 #[instruction(market_index: u16,)]
 pub struct RequestRemoveInsuranceFundStake<'info> {
     #[account(
+        mut,
         seeds = [b"spot_market", market_index.to_le_bytes().as_ref()],
         bump
     )]
@@ -340,7 +426,7 @@ pub struct RequestRemoveInsuranceFundStake<'info> {
         seeds = [b"insurance_fund_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub insurance_fund_vault: Box<Account<'info, TokenAccount>>,
+    pub insurance_fund_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 }
 
 #[derive(Accounts)]
@@ -348,6 +434,7 @@ pub struct RequestRemoveInsuranceFundStake<'info> {
 pub struct RemoveInsuranceFundStake<'info> {
     pub state: Box<Account<'info, State>>,
     #[account(
+        mut,
         seeds = [b"spot_market", market_index.to_le_bytes().as_ref()],
         bump
     )]
@@ -368,7 +455,7 @@ pub struct RemoveInsuranceFundStake<'info> {
         seeds = [b"insurance_fund_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub insurance_fund_vault: Box<Account<'info, TokenAccount>>,
+    pub insurance_fund_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         constraint = state.signer.eq(&drift_signer.key())
     )]
@@ -379,6 +466,39 @@ pub struct RemoveInsuranceFundStake<'info> {
         token::mint = insurance_fund_vault.mint,
         token::authority = authority
     )]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_index: u16,)]
+pub struct TransferProtocolIfShares<'info> {
+    pub signer: Signer<'info>,
+    #[account(mut)]
+    pub transfer_config: AccountLoader<'info, ProtocolIfSharesTransferConfig>,
+    pub state: Box<Account<'info, State>>,
+    #[account(
+        mut,
+        seeds = [b"spot_market", market_index.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub spot_market: AccountLoader<'info, SpotMarket>,
+    #[account(
+        mut,
+        seeds = [b"insurance_fund_stake", authority.key.as_ref(), market_index.to_le_bytes().as_ref()],
+        bump,
+        has_one = authority,
+    )]
+    pub insurance_fund_stake: AccountLoader<'info, InsuranceFundStake>,
+    #[account(
+        mut,
+        has_one = authority,
+    )]
+    pub user_stats: AccountLoader<'info, UserStats>,
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [b"insurance_fund_vault".as_ref(), market_index.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub insurance_fund_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 }

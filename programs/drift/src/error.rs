@@ -447,7 +447,7 @@ pub enum ErrorCode {
     UnableToGetLimitPrice,
     #[msg("Invalid Liquidation")]
     InvalidLiquidation,
-    #[msg("Spot Fulfullment Config Disabled")]
+    #[msg("Spot Fulfillment Config Disabled")]
     SpotFulfillmentConfigDisabled,
     #[msg("Invalid Maker")]
     InvalidMaker,
@@ -509,6 +509,106 @@ pub enum ErrorCode {
     SpotMarketReduceOnly,
     #[msg("FundingWasNotUpdated")]
     FundingWasNotUpdated,
+    #[msg("ImpossibleFill")]
+    ImpossibleFill,
+    #[msg("CantUpdatePerpBidAskTwap")]
+    CantUpdatePerpBidAskTwap,
+    #[msg("UserReduceOnly")]
+    UserReduceOnly,
+    #[msg("InvalidMarginCalculation")]
+    InvalidMarginCalculation,
+    #[msg("CantPayUserInitFee")]
+    CantPayUserInitFee,
+    #[msg("CantReclaimRent")]
+    CantReclaimRent,
+    #[msg("InsuranceFundOperationPaused")]
+    InsuranceFundOperationPaused,
+    #[msg("NoUnsettledPnl")]
+    NoUnsettledPnl,
+    #[msg("PnlPoolCantSettleUser")]
+    PnlPoolCantSettleUser,
+    #[msg("OracleInvalid")]
+    OracleNonPositive,
+    #[msg("OracleTooVolatile")]
+    OracleTooVolatile,
+    #[msg("OracleTooUncertain")]
+    OracleTooUncertain,
+    #[msg("OracleStaleForMargin")]
+    OracleStaleForMargin,
+    #[msg("OracleInsufficientDataPoints")]
+    OracleInsufficientDataPoints,
+    #[msg("OracleStaleForAMM")]
+    OracleStaleForAMM,
+    #[msg("Unable to parse pull oracle message")]
+    UnableToParsePullOracleMessage,
+    #[msg("Can not borow more than max borrows")]
+    MaxBorrows,
+    #[msg("Updates must be monotonically increasing")]
+    OracleUpdatesNotMonotonic,
+    #[msg("Trying to update price feed with the wrong feed id")]
+    OraclePriceFeedMessageMismatch,
+    #[msg("The message in the update must be a PriceFeedMessage")]
+    OracleUnsupportedMessageType,
+    #[msg("Could not deserialize the message in the update")]
+    OracleDeserializeMessageFailed,
+    #[msg("Wrong guardian set owner in update price atomic")]
+    OracleWrongGuardianSetOwner,
+    #[msg("Oracle post update atomic price feed account must be drift program")]
+    OracleWrongWriteAuthority,
+    #[msg("Oracle vaa owner must be wormhole program")]
+    OracleWrongVaaOwner,
+    #[msg("Multi updates must have 2 or fewer accounts passed in remaining accounts")]
+    OracleTooManyPriceAccountUpdates,
+    #[msg("Don't have the same remaining accounts number and merkle price updates left")]
+    OracleMismatchedVaaAndPriceUpdates,
+    #[msg("Remaining account passed is not a valid pda")]
+    OracleBadRemainingAccountPublicKey,
+    #[msg("FailedOpenbookV2CPI")]
+    FailedOpenbookV2CPI,
+    #[msg("InvalidOpenbookV2Program")]
+    InvalidOpenbookV2Program,
+    #[msg("InvalidOpenbookV2Market")]
+    InvalidOpenbookV2Market,
+    #[msg("Non zero transfer fee")]
+    NonZeroTransferFee,
+    #[msg("Liquidation order failed to fill")]
+    LiquidationOrderFailedToFill,
+    #[msg("Invalid prediction market order")]
+    InvalidPredictionMarketOrder,
+    #[msg("Ed25519 Ix must be before place and make swift order ix")]
+    InvalidVerificationIxIndex,
+    #[msg("Swift message verificaiton failed")]
+    SigVerificationFailed,
+    #[msg("Market index mismatched b/w taker and maker swift order params")]
+    MismatchedSwiftOrderParamsMarketIndex,
+    #[msg("Swift only available for market/oracle perp orders")]
+    InvalidSwiftOrderParam,
+    #[msg("Place and take order success condition failed")]
+    PlaceAndTakeOrderSuccessConditionFailed,
+    #[msg("Invalid High Leverage Mode Config")]
+    InvalidHighLeverageModeConfig,
+    #[msg("Invalid RFQ User Account")]
+    InvalidRFQUserAccount,
+    #[msg("RFQUserAccount should be mutable")]
+    RFQUserAccountWrongMutability,
+    #[msg("RFQUserAccount has too many active RFQs")]
+    RFQUserAccountFull,
+    #[msg("RFQ order not filled as expected")]
+    RFQOrderNotFilled,
+    #[msg("RFQ orders must be jit makers")]
+    InvalidRFQOrder,
+    #[msg("RFQ matches must be valid")]
+    InvalidRFQMatch,
+    #[msg("Invalid swift user account")]
+    InvalidSwiftUserAccount,
+    #[msg("Swift account wrong mutability")]
+    SwiftUserAccountWrongMutability,
+    #[msg("SwiftUserAccount has too many active orders")]
+    SwiftUserOrdersAccountFull,
+    #[msg("Order with swift uuid does not exist")]
+    SwiftOrderDoesNotExist,
+    #[msg("Swift order id cannot be 0s")]
+    InvalidSwiftOrderId,
 }
 
 #[macro_export]

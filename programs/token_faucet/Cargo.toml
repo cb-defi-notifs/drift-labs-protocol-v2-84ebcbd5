@@ -12,9 +12,10 @@ name = "token_faucet"
 no-entrypoint = []
 cpi = ["no-entrypoint"]
 mainnet-beta=[]
+anchor-test= []
 
 [dependencies]
-anchor-lang = "0.26.0"
-solana-program = "1.13.7"
-anchor-spl = "0.26.0"
+anchor-lang = "0.29.0"
+solana-program = "1.16"
+anchor-spl = "0.29.0"
 bytemuck = { version = "1.4.0" }

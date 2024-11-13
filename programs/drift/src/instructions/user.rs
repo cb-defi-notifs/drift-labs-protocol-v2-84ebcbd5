@@ -1,35 +1,44 @@
+use anchor_lang::prelude::*;
 use anchor_lang::Discriminator;
-use anchor_lang::{prelude::*, AnchorDeserialize, AnchorSerialize};
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::{
+    token::Token,
+    token_2022::Token2022,
+    token_interface::{TokenAccount, TokenInterface},
+};
+use solana_program::instruction::Instruction;
+use solana_program::program::invoke;
+use solana_program::system_instruction::transfer;
 
+use crate::controller::orders::place_and_match_rfq_orders;
 use crate::controller::orders::{cancel_orders, ModifyOrderId};
 use crate::controller::position::PositionDirection;
 use crate::controller::spot_balance::update_revenue_pool_balances;
 use crate::controller::spot_position::{
-    update_spot_balances_and_cumulative_deposits,
+    charge_withdraw_fee, update_spot_balances_and_cumulative_deposits,
     update_spot_balances_and_cumulative_deposits_with_limits,
 };
 use crate::error::ErrorCode;
-use crate::get_then_update_id;
-use crate::ids::{jupiter_mainnet_3, jupiter_mainnet_4, marinade_mainnet, serum_program};
+use crate::ids::{
+    jupiter_mainnet_3, jupiter_mainnet_4, jupiter_mainnet_6, marinade_mainnet, serum_program,
+};
 use crate::instructions::constraints::*;
 use crate::instructions::optional_accounts::{
-    get_maker_and_maker_stats, get_referrer_and_referrer_stats, get_whitelist_token, load_maps,
-    AccountMaps,
+    get_referrer_and_referrer_stats, get_whitelist_token, load_maps, AccountMaps,
 };
 use crate::instructions::SpotFulfillmentType;
-use crate::load;
-use crate::load_mut;
 use crate::math::casting::Cast;
 use crate::math::liquidation::is_user_being_liquidated;
 use crate::math::margin::{
-    calculate_max_withdrawable_amount, meets_initial_margin_requirement,
-    meets_withdraw_margin_requirement, validate_spot_margin_trading, MarginRequirementType,
+    calculate_max_withdrawable_amount, meets_maintenance_margin_requirement,
+    meets_place_order_margin_requirement, meets_withdraw_margin_requirement,
+    validate_spot_margin_trading, MarginRequirementType,
 };
 use crate::math::safe_math::SafeMath;
 use crate::math::spot_balance::get_token_value;
-use crate::math::spot_swap::calculate_swap_price;
+use crate::math::spot_swap;
+use crate::math::spot_swap::{calculate_swap_price, validate_price_bands_for_swap};
 use crate::math_error;
+use crate::optional_accounts::{get_token_interface, get_token_mint};
 use crate::print_error;
 use crate::safe_decrement;
 use crate::safe_increment;
@@ -37,32 +46,54 @@ use crate::state::events::{
     DepositDirection, DepositExplanation, DepositRecord, LPAction, LPRecord, NewUserRecord,
     OrderActionExplanation, SwapRecord,
 };
+use crate::state::fill_mode::FillMode;
 use crate::state::fulfillment_params::drift::MatchFulfillmentParams;
+use crate::state::fulfillment_params::openbook_v2::OpenbookV2FulfillmentParams;
 use crate::state::fulfillment_params::phoenix::PhoenixFulfillmentParams;
 use crate::state::fulfillment_params::serum::SerumFulfillmentParams;
+use crate::state::high_leverage_mode_config::HighLeverageModeConfig;
+use crate::state::oracle::StrictOraclePrice;
+use crate::state::order_params::RFQMatch;
+use crate::state::order_params::{
+    parse_optional_params, ModifyOrderParams, OrderParams, PlaceAndTakeOrderSuccessCondition,
+    PlaceOrderOptions, PostOnlyParam,
+};
+use crate::state::paused_operations::{PerpOperation, SpotOperation};
+use crate::state::perp_market::ContractType;
 use crate::state::perp_market::MarketStatus;
 use crate::state::perp_market_map::{get_writable_perp_market_set, MarketSet};
+use crate::state::rfq_user::{load_rfq_user_account_map, RFQUser, RFQ_PDA_SEED};
 use crate::state::spot_fulfillment_params::SpotFulfillmentParams;
 use crate::state::spot_market::SpotBalanceType;
+use crate::state::spot_market::SpotMarket;
 use crate::state::spot_market_map::{
     get_writable_spot_market_set, get_writable_spot_market_set_from_many,
 };
 use crate::state::state::State;
+use crate::state::swift_user::SwiftOrderId;
+use crate::state::swift_user::SwiftUserOrdersLoader;
+use crate::state::swift_user::{SwiftUserOrders, SWIFT_PDA_SEED};
 use crate::state::traits::Size;
-use crate::state::user::{
-    MarketType, OrderTriggerCondition, OrderType, ReferrerName, User, UserStats, UserStatus,
-};
-use crate::state::user_map::load_user_maps;
+use crate::state::user::ReferrerStatus;
+use crate::state::user::{MarginMode, MarketType, OrderType, ReferrerName, User, UserStats};
+use crate::state::user_map::{load_user_maps, UserMap, UserStatsMap};
 use crate::validate;
+use crate::validation::sig_verification::verify_ed25519_ix;
 use crate::validation::user::validate_user_deletion;
 use crate::validation::whitelist::validate_whitelist_token;
 use crate::{controller, math};
+use crate::{get_then_update_id, QUOTE_SPOT_MARKET_INDEX};
+use crate::{load, THIRTEEN_DAY};
+use crate::{load_mut, ExchangeStatus};
 use anchor_lang::solana_program::sysvar::instructions;
 use anchor_spl::associated_token::AssociatedToken;
 use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::sysvar::instructions::{
+    load_current_index_checked, load_instruction_at_checked, ID as IX_ID,
+};
 
-pub fn handle_initialize_user(
-    ctx: Context<InitializeUser>,
+pub fn handle_initialize_user<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, InitializeUser<'info>>,
     sub_account_id: u16,
     name: [u8; 32],
 ) -> Result<()> {
@@ -84,7 +115,7 @@ pub fn handle_initialize_user(
     user_stats.number_of_sub_accounts = user_stats.number_of_sub_accounts.safe_add(1)?;
 
     // Only try to add referrer if it is the first user
-    if user_stats.number_of_sub_accounts == 1 {
+    if user_stats.number_of_sub_accounts_created == 0 {
         let (referrer, referrer_stats) = get_referrer_and_referrer_stats(remaining_accounts_iter)?;
         let referrer = if let (Some(referrer), Some(referrer_stats)) = (referrer, referrer_stats) {
             let referrer = load!(referrer)?;
@@ -97,7 +128,8 @@ pub fn handle_initialize_user(
                 ErrorCode::ReferrerAndReferrerStatsAuthorityUnequal
             )?;
 
-            referrer_stats.is_referrer = true;
+            referrer_stats.referrer_status |= ReferrerStatus::IsReferrer as u8;
+            user_stats.referrer_status |= ReferrerStatus::IsReferred as u8;
 
             referrer.authority
         } else {
@@ -130,13 +162,20 @@ pub fn handle_initialize_user(
     let state = &mut ctx.accounts.state;
     safe_increment!(state.number_of_sub_accounts, 1);
 
+    let max_number_of_sub_accounts = state.max_number_of_sub_accounts();
+
     validate!(
-        state.number_of_sub_accounts <= 7500,
+        max_number_of_sub_accounts == 0
+            || state.number_of_sub_accounts <= max_number_of_sub_accounts,
         ErrorCode::MaxNumberOfUsers
     )?;
 
+    let now_ts = Clock::get()?.unix_timestamp;
+
+    user.last_fuel_bonus_update_ts = now_ts.cast()?;
+
     emit!(NewUserRecord {
-        ts: Clock::get()?.unix_timestamp,
+        ts: now_ts,
         user_authority: ctx.accounts.authority.key(),
         user: user_key,
         sub_account_id,
@@ -144,10 +183,37 @@ pub fn handle_initialize_user(
         referrer: user_stats.referrer
     });
 
+    drop(user);
+
+    let init_fee = state.get_init_user_fee()?;
+
+    if init_fee > 0 {
+        let payer_lamports = ctx.accounts.payer.to_account_info().try_lamports()?;
+        if payer_lamports < init_fee {
+            msg!("payer lamports {} init fee {}", payer_lamports, init_fee);
+            return Err(ErrorCode::CantPayUserInitFee.into());
+        }
+
+        invoke(
+            &transfer(
+                &ctx.accounts.payer.key(),
+                &ctx.accounts.user.key(),
+                init_fee,
+            ),
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+    }
+
     Ok(())
 }
 
-pub fn handle_initialize_user_stats(ctx: Context<InitializeUserStats>) -> Result<()> {
+pub fn handle_initialize_user_stats<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, InitializeUserStats>,
+) -> Result<()> {
     let clock = Clock::get()?;
 
     let mut user_stats = ctx
@@ -162,11 +228,20 @@ pub fn handle_initialize_user_stats(ctx: Context<InitializeUserStats>) -> Result
         last_taker_volume_30d_ts: clock.unix_timestamp,
         last_maker_volume_30d_ts: clock.unix_timestamp,
         last_filler_volume_30d_ts: clock.unix_timestamp,
+        last_fuel_if_bonus_update_ts: clock.unix_timestamp.cast()?,
         ..UserStats::default()
     };
 
     let state = &mut ctx.accounts.state;
     safe_increment!(state.number_of_authorities, 1);
+
+    let max_number_of_sub_accounts = state.max_number_of_sub_accounts();
+
+    validate!(
+        max_number_of_sub_accounts == 0
+            || state.number_of_authorities <= max_number_of_sub_accounts,
+        ErrorCode::MaxNumberOfUsers
+    )?;
 
     Ok(())
 }
@@ -199,11 +274,53 @@ pub fn handle_initialize_referrer_name(
     Ok(())
 }
 
+pub fn handle_initialize_rfq_user<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, InitializeRFQUser<'info>>,
+) -> Result<()> {
+    let mut rfq_user = ctx
+        .accounts
+        .rfq_user
+        .load_init()
+        .or(Err(ErrorCode::UnableToLoadAccountLoader))?;
+    rfq_user.user_pubkey = ctx.accounts.user.key();
+    Ok(())
+}
+
+pub fn handle_initialize_swift_user_orders<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, InitializeSwiftUserOrders<'info>>,
+    num_orders: u16,
+) -> Result<()> {
+    #[cfg(all(feature = "mainnet-beta", not(feature = "anchor-test")))]
+    {
+        panic!("Swift orders are disabled on mainnet-beta");
+    }
+
+    let swift_user_orders = &mut ctx.accounts.swift_user_orders;
+    swift_user_orders.user_pubkey = ctx.accounts.user.key();
+    swift_user_orders
+        .swift_order_data
+        .resize_with(num_orders as usize, SwiftOrderId::default);
+    swift_user_orders.validate()?;
+    Ok(())
+}
+
+pub fn handle_resize_swift_user_orders<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, ResizeSwiftUserOrders<'info>>,
+    num_orders: u16,
+) -> Result<()> {
+    let swift_user_orders = &mut ctx.accounts.swift_user_orders;
+    swift_user_orders
+        .swift_order_data
+        .resize_with(num_orders as usize, SwiftOrderId::default);
+    swift_user_orders.validate()?;
+    Ok(())
+}
+
 #[access_control(
     deposit_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_deposit(
-    ctx: Context<Deposit>,
+pub fn handle_deposit<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, Deposit<'info>>,
     market_index: u16,
     amount: u64,
     reduce_only: bool,
@@ -216,17 +333,20 @@ pub fn handle_deposit(
     let now = clock.unix_timestamp;
     let slot = clock.slot;
 
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
     let AccountMaps {
         perp_market_map,
         spot_market_map,
         mut oracle_map,
     } = load_maps(
-        &mut ctx.remaining_accounts.iter().peekable(),
+        remaining_accounts_iter,
         &MarketSet::new(),
         &get_writable_spot_market_set(market_index),
         clock.slot,
         Some(state.oracle_guard_rails),
     )?;
+
+    let mint = get_token_mint(remaining_accounts_iter)?;
 
     if amount == 0 {
         return Err(ErrorCode::InsufficientDeposit.into());
@@ -250,6 +370,8 @@ pub fn handle_deposit(
     )?;
 
     let position_index = user.force_get_spot_position_index(spot_market.market_index)?;
+
+    let is_borrow_before = user.spot_positions[position_index].is_borrow();
 
     let force_reduce_only = spot_market.is_reduce_only();
 
@@ -297,16 +419,9 @@ pub fn handle_deposit(
 
     if spot_position.balance_type == SpotBalanceType::Deposit && spot_position.scaled_balance > 0 {
         validate!(
-            matches!(
-                spot_market.status,
-                MarketStatus::Active
-                    | MarketStatus::FundingPaused
-                    | MarketStatus::AmmPaused
-                    | MarketStatus::FillPaused
-                    | MarketStatus::WithdrawPaused
-            ),
+            matches!(spot_market.status, MarketStatus::Active),
             ErrorCode::MarketActionPaused,
-            "spot_market in reduce only mode",
+            "spot_market not active",
         )?;
     }
 
@@ -321,10 +436,8 @@ pub fn handle_deposit(
             state.liquidation_margin_buffer_ratio,
         )?;
 
-        if is_being_liquidated {
-            user.status = UserStatus::BeingLiquidated;
-        } else {
-            user.status = UserStatus::Active;
+        if !is_being_liquidated {
+            user.exit_liquidation();
         }
     }
 
@@ -338,11 +451,17 @@ pub fn handle_deposit(
         &ctx.accounts.spot_market_vault,
         &ctx.accounts.authority,
         amount,
+        &mint,
     )?;
     ctx.accounts.spot_market_vault.reload()?;
 
     let deposit_record_id = get_then_update_id!(spot_market, next_deposit_record_id);
     let oracle_price = oracle_price_data.price;
+    let explanation = if is_borrow_before {
+        DepositExplanation::RepayBorrow
+    } else {
+        DepositExplanation::None
+    };
     let deposit_record = DepositRecord {
         ts: now,
         deposit_record_id,
@@ -358,12 +477,12 @@ pub fn handle_deposit(
         total_deposits_after,
         total_withdraws_after,
         market_index,
-        explanation: DepositExplanation::None,
+        explanation,
         transfer_user: None,
     };
     emit!(deposit_record);
 
-    spot_market.validate_max_token_deposits()?;
+    spot_market.validate_max_token_deposits_and_borrows(false)?;
 
     Ok(())
 }
@@ -371,30 +490,34 @@ pub fn handle_deposit(
 #[access_control(
     withdraw_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_withdraw(
-    ctx: Context<Withdraw>,
+pub fn handle_withdraw<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, Withdraw<'info>>,
     market_index: u16,
     amount: u64,
     reduce_only: bool,
 ) -> anchor_lang::Result<()> {
     let user_key = ctx.accounts.user.key();
     let user = &mut load_mut!(ctx.accounts.user)?;
+    let mut user_stats = load_mut!(ctx.accounts.user_stats)?;
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let slot = clock.slot;
     let state = &ctx.accounts.state;
 
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
     let AccountMaps {
         perp_market_map,
         spot_market_map,
         mut oracle_map,
     } = load_maps(
-        &mut ctx.remaining_accounts.iter().peekable(),
+        remaining_accounts_iter,
         &MarketSet::new(),
         &get_writable_spot_market_set(market_index),
         clock.slot,
         Some(state.oracle_guard_rails),
     )?;
+
+    let mint = get_token_mint(remaining_accounts_iter)?;
 
     validate!(!user.is_bankrupt(), ErrorCode::UserBankrupt)?;
 
@@ -416,7 +539,7 @@ pub fn handle_withdraw(
 
         let position_index = user.force_get_spot_position_index(market_index)?;
 
-        let amount = if reduce_only {
+        let mut amount = if reduce_only {
             validate!(
                 user.spot_positions[position_index].balance_type == SpotBalanceType::Deposit,
                 ErrorCode::ReduceOnlyWithdrawIncreasedRisk
@@ -445,6 +568,12 @@ pub fn handle_withdraw(
         let spot_market = &mut spot_market_map.get_ref_mut(&market_index)?;
         let oracle_price_data = oracle_map.get_price_data(&spot_market.oracle)?;
 
+        if user.qualifies_for_withdraw_fee(&user_stats, slot) {
+            let fee =
+                charge_withdraw_fee(spot_market, oracle_price_data.price, user, &mut user_stats)?;
+            amount = amount.safe_sub(fee.cast()?)?;
+        }
+
         user.increment_total_withdraws(
             amount,
             oracle_price_data.price,
@@ -462,22 +591,36 @@ pub fn handle_withdraw(
         amount
     };
 
-    meets_withdraw_margin_requirement(
-        user,
+    user.meets_withdraw_margin_requirement_and_increment_fuel_bonus(
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
         MarginRequirementType::Initial,
+        market_index,
+        amount as u128,
+        &mut user_stats,
+        now,
     )?;
 
-    validate_spot_margin_trading(user, &spot_market_map, &mut oracle_map)?;
+    validate_spot_margin_trading(user, &perp_market_map, &spot_market_map, &mut oracle_map)?;
 
-    user.status = UserStatus::Active;
+    if user.is_being_liquidated() {
+        user.exit_liquidation();
+    }
 
     user.update_last_active_slot(slot);
 
     let mut spot_market = spot_market_map.get_ref_mut(&market_index)?;
     let oracle_price = oracle_map.get_price_data(&spot_market.oracle)?.price;
+
+    let is_borrow = user
+        .get_spot_position(market_index)
+        .map_or(false, |pos| pos.is_borrow());
+    let deposit_explanation = if is_borrow {
+        DepositExplanation::Borrow
+    } else {
+        DepositExplanation::None
+    };
 
     let deposit_record_id = get_then_update_id!(spot_market, next_deposit_record_id);
     let deposit_record = DepositRecord {
@@ -495,7 +638,7 @@ pub fn handle_withdraw(
         market_cumulative_borrow_interest: spot_market.cumulative_borrow_interest,
         total_deposits_after: user.total_deposits,
         total_withdraws_after: user.total_withdraws,
-        explanation: DepositExplanation::None,
+        explanation: deposit_explanation,
         transfer_user: None,
     };
     emit!(deposit_record);
@@ -507,6 +650,7 @@ pub fn handle_withdraw(
         &ctx.accounts.drift_signer,
         state.signer_nonce,
         amount,
+        &mint,
     )?;
 
     // reload the spot market vault balance so it's up-to-date
@@ -516,6 +660,8 @@ pub fn handle_withdraw(
         ctx.accounts.spot_market_vault.amount,
     )?;
 
+    spot_market.validate_max_token_deposits_and_borrows(is_borrow)?;
+
     Ok(())
 }
 
@@ -523,8 +669,8 @@ pub fn handle_withdraw(
     deposit_not_paused(&ctx.accounts.state)
     withdraw_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_transfer_deposit(
-    ctx: Context<TransferDeposit>,
+pub fn handle_transfer_deposit<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, TransferDeposit<'info>>,
     market_index: u16,
     amount: u64,
 ) -> anchor_lang::Result<()> {
@@ -538,6 +684,10 @@ pub fn handle_transfer_deposit(
 
     let to_user = &mut load_mut!(ctx.accounts.to_user)?;
     let from_user = &mut load_mut!(ctx.accounts.from_user)?;
+    let user_stats = &mut load_mut!(ctx.accounts.user_stats)?;
+
+    let clock = Clock::get()?;
+    let now = clock.unix_timestamp;
 
     validate!(
         !to_user.is_bankrupt(),
@@ -586,21 +736,6 @@ pub fn handle_transfer_deposit(
     {
         let spot_market = &mut spot_market_map.get_ref_mut(&market_index)?;
 
-        validate!(
-            matches!(
-                spot_market.status,
-                MarketStatus::Active
-                    | MarketStatus::AmmPaused
-                    | MarketStatus::FundingPaused
-                    | MarketStatus::FillPaused
-                    | MarketStatus::ReduceOnly
-                    | MarketStatus::Settlement
-            ),
-            ErrorCode::MarketWithdrawPaused,
-            "Spot Market {} withdraws are currently paused",
-            spot_market.market_index
-        )?;
-
         from_user.increment_total_withdraws(
             amount,
             oracle_price,
@@ -616,17 +751,27 @@ pub fn handle_transfer_deposit(
         )?;
     }
 
-    meets_withdraw_margin_requirement(
-        from_user,
+    from_user.meets_withdraw_margin_requirement_and_increment_fuel_bonus(
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
         MarginRequirementType::Initial,
+        market_index,
+        amount as u128,
+        user_stats,
+        now,
     )?;
 
-    validate_spot_margin_trading(from_user, &spot_market_map, &mut oracle_map)?;
+    validate_spot_margin_trading(
+        from_user,
+        &perp_market_map,
+        &spot_market_map,
+        &mut oracle_map,
+    )?;
 
-    from_user.status = UserStatus::Active;
+    if from_user.is_being_liquidated() {
+        from_user.exit_liquidation();
+    }
 
     from_user.update_last_active_slot(slot);
 
@@ -722,58 +867,13 @@ pub fn handle_transfer_deposit(
     Ok(())
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default, Copy)]
-pub struct OrderParams {
-    pub order_type: OrderType,
-    pub market_type: MarketType,
-    pub direction: PositionDirection,
-    pub user_order_id: u8,
-    pub base_asset_amount: u64,
-    pub price: u64,
-    pub market_index: u16,
-    pub reduce_only: bool,
-    pub post_only: PostOnlyParam,
-    pub immediate_or_cancel: bool,
-    pub max_ts: Option<i64>,
-    pub trigger_price: Option<u64>,
-    pub trigger_condition: OrderTriggerCondition,
-    pub oracle_price_offset: Option<i32>,
-    pub auction_duration: Option<u8>,
-    pub auction_start_price: Option<i64>,
-    pub auction_end_price: Option<i64>,
-}
-
-#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
-pub enum PostOnlyParam {
-    None,
-    MustPostOnly, // Tx fails if order can't be post only
-    TryPostOnly,  // Tx succeeds and order not placed if can't be post only
-}
-
-impl Default for PostOnlyParam {
-    fn default() -> Self {
-        PostOnlyParam::None
-    }
-}
-
-pub struct PlaceOrderOptions {
-    pub try_expire_orders: bool,
-    pub enforce_margin_check: bool,
-}
-
-impl Default for PlaceOrderOptions {
-    fn default() -> Self {
-        Self {
-            try_expire_orders: true,
-            enforce_margin_check: true,
-        }
-    }
-}
-
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_place_perp_order(ctx: Context<PlaceOrder>, params: OrderParams) -> Result<()> {
+pub fn handle_place_perp_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceOrder>,
+    params: OrderParams,
+) -> Result<()> {
     let clock = &Clock::get()?;
     let state = &ctx.accounts.state;
 
@@ -794,9 +894,13 @@ pub fn handle_place_perp_order(ctx: Context<PlaceOrder>, params: OrderParams) ->
         return Err(print_error!(ErrorCode::InvalidOrderIOC)().into());
     }
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+
     controller::orders::place_perp_order(
         &ctx.accounts.state,
-        &ctx.accounts.user,
+        &mut user,
+        user_key,
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
@@ -808,10 +912,82 @@ pub fn handle_place_perp_order(ctx: Context<PlaceOrder>, params: OrderParams) ->
     Ok(())
 }
 
+pub fn handle_place_and_match_rfq_orders<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceAndMatchRFQOrders<'info>>,
+    rfq_matches: Vec<RFQMatch>,
+) -> Result<()> {
+    // Verify everything before proceeding to match the rfq orders
+
+    let ix_sysvar = &ctx.accounts.ix_sysvar.to_account_info();
+    let number_of_verify_ixs_needed = rfq_matches.len();
+    let ix_idx = load_current_index_checked(ix_sysvar)?;
+
+    for i in 0..rfq_matches.len() {
+        // First verify that the message is legitimate
+        let maker_order_params = &rfq_matches[i].maker_order_params;
+        if rfq_matches[i].base_asset_amount > maker_order_params.base_asset_amount {
+            msg!(
+                "RFQ match amount exceeds maker order amount: {} > {}",
+                rfq_matches[i].base_asset_amount,
+                maker_order_params.base_asset_amount
+            );
+            return Err(ErrorCode::InvalidRFQMatch.into());
+        }
+
+        let ix: Instruction = load_instruction_at_checked(
+            ix_idx as usize - number_of_verify_ixs_needed + i,
+            ix_sysvar,
+        )?;
+        verify_ed25519_ix(
+            &ix,
+            &maker_order_params.authority.to_bytes(),
+            &maker_order_params.clone().try_to_vec()?,
+            &rfq_matches[i].maker_signature,
+        )?;
+    }
+
+    // TODO: generalize to support multiple market types
+    let state = &ctx.accounts.state;
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
+    let AccountMaps {
+        perp_market_map,
+        spot_market_map,
+        mut oracle_map,
+    } = load_maps(
+        remaining_accounts_iter,
+        &MarketSet::new(),
+        &MarketSet::new(),
+        Clock::get()?.slot,
+        Some(state.oracle_guard_rails),
+    )?;
+
+    let (makers_and_referrer, makers_and_referrer_stats) =
+        load_user_maps(remaining_accounts_iter, true)?;
+
+    let maker_rfq_account_map = load_rfq_user_account_map(remaining_accounts_iter)?;
+
+    place_and_match_rfq_orders(
+        &ctx.accounts.user,
+        &ctx.accounts.user_stats,
+        rfq_matches,
+        maker_rfq_account_map,
+        &makers_and_referrer,
+        &makers_and_referrer_stats,
+        &perp_market_map,
+        &spot_market_map,
+        &mut oracle_map,
+        state,
+    )?;
+    Ok(())
+}
+
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_cancel_order(ctx: Context<CancelOrder>, order_id: Option<u32>) -> Result<()> {
+pub fn handle_cancel_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, CancelOrder>,
+    order_id: Option<u32>,
+) -> Result<()> {
     let clock = &Clock::get()?;
     let state = &ctx.accounts.state;
 
@@ -847,7 +1023,10 @@ pub fn handle_cancel_order(ctx: Context<CancelOrder>, order_id: Option<u32>) -> 
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_cancel_order_by_user_id(ctx: Context<CancelOrder>, user_order_id: u8) -> Result<()> {
+pub fn handle_cancel_order_by_user_id<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, CancelOrder>,
+    user_order_id: u8,
+) -> Result<()> {
     let clock = &Clock::get()?;
     let state = &ctx.accounts.state;
 
@@ -878,8 +1057,44 @@ pub fn handle_cancel_order_by_user_id(ctx: Context<CancelOrder>, user_order_id: 
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_cancel_orders(
-    ctx: Context<CancelOrder>,
+pub fn handle_cancel_orders_by_ids<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, CancelOrder>,
+    order_ids: Vec<u32>,
+) -> Result<()> {
+    let clock = &Clock::get()?;
+    let state = &ctx.accounts.state;
+
+    let AccountMaps {
+        perp_market_map,
+        spot_market_map,
+        mut oracle_map,
+    } = load_maps(
+        &mut ctx.remaining_accounts.iter().peekable(),
+        &MarketSet::new(),
+        &MarketSet::new(),
+        clock.slot,
+        Some(state.oracle_guard_rails),
+    )?;
+
+    for order_id in order_ids {
+        controller::orders::cancel_order_by_order_id(
+            order_id,
+            &ctx.accounts.user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            clock,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[access_control(
+    exchange_not_paused(&ctx.accounts.state)
+)]
+pub fn handle_cancel_orders<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, CancelOrder<'info>>,
     market_type: Option<MarketType>,
     market_index: Option<u16>,
     direction: Option<PositionDirection>,
@@ -920,41 +1135,11 @@ pub fn handle_cancel_orders(
     Ok(())
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
-pub struct ModifyOrderParams {
-    pub direction: Option<PositionDirection>,
-    pub base_asset_amount: Option<u64>,
-    pub price: Option<u64>,
-    pub reduce_only: Option<bool>,
-    pub post_only: Option<PostOnlyParam>,
-    pub immediate_or_cancel: Option<bool>,
-    pub max_ts: Option<i64>,
-    pub trigger_price: Option<u64>,
-    pub trigger_condition: Option<OrderTriggerCondition>,
-    pub oracle_price_offset: Option<i32>,
-    pub auction_duration: Option<u8>,
-    pub auction_start_price: Option<i64>,
-    pub auction_end_price: Option<i64>,
-    pub policy: Option<ModifyOrderPolicy>,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Eq, PartialEq)]
-pub enum ModifyOrderPolicy {
-    TryModify,
-    MustModify,
-}
-
-impl Default for ModifyOrderPolicy {
-    fn default() -> Self {
-        Self::TryModify
-    }
-}
-
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_modify_order(
-    ctx: Context<CancelOrder>,
+pub fn handle_modify_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, CancelOrder<'info>>,
     order_id: Option<u32>,
     modify_order_params: ModifyOrderParams,
 ) -> Result<()> {
@@ -995,8 +1180,8 @@ pub fn handle_modify_order(
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_modify_order_by_user_order_id(
-    ctx: Context<CancelOrder>,
+pub fn handle_modify_order_by_user_order_id<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, CancelOrder<'info>>,
     user_order_id: u8,
     modify_order_params: ModifyOrderParams,
 ) -> Result<()> {
@@ -1032,7 +1217,10 @@ pub fn handle_modify_order_by_user_order_id(
 #[access_control(
     exchange_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_place_orders(ctx: Context<PlaceOrder>, params: Vec<OrderParams>) -> Result<()> {
+pub fn handle_place_orders<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceOrder>,
+    params: Vec<OrderParams>,
+) -> Result<()> {
     let clock = &Clock::get()?;
     let state = &ctx.accounts.state;
 
@@ -1054,6 +1242,9 @@ pub fn handle_place_orders(ctx: Context<PlaceOrder>, params: Vec<OrderParams>) -
         "max 32 order params"
     )?;
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+
     let num_orders = params.len();
     for (i, params) in params.iter().enumerate() {
         validate!(
@@ -1064,14 +1255,19 @@ pub fn handle_place_orders(ctx: Context<PlaceOrder>, params: Vec<OrderParams>) -
 
         // only enforce margin on last order and only try to expire on first order
         let options = PlaceOrderOptions {
+            swift_taker_order_slot: None,
             enforce_margin_check: i == num_orders - 1,
             try_expire_orders: i == 0,
+            risk_increasing: false,
+            explanation: OrderActionExplanation::None,
+            is_rfq_order: false,
         };
 
         if params.market_type == MarketType::Perp {
             controller::orders::place_perp_order(
                 &ctx.accounts.state,
-                &ctx.accounts.user,
+                &mut user,
+                user_key,
                 &perp_market_map,
                 &spot_market_map,
                 &mut oracle_map,
@@ -1082,7 +1278,8 @@ pub fn handle_place_orders(ctx: Context<PlaceOrder>, params: Vec<OrderParams>) -
         } else {
             controller::orders::place_spot_order(
                 &ctx.accounts.state,
-                &ctx.accounts.user,
+                &mut user,
+                user_key,
                 &perp_market_map,
                 &spot_market_map,
                 &mut oracle_map,
@@ -1099,10 +1296,10 @@ pub fn handle_place_orders(ctx: Context<PlaceOrder>, params: Vec<OrderParams>) -
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_place_and_take_perp_order<'info>(
-    ctx: Context<PlaceAndTake>,
+pub fn handle_place_and_take_perp_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceAndTake<'info>>,
     params: OrderParams,
-    _maker_order_id: Option<u32>,
+    optional_params: Option<u32>, // u32 for backwards compatibility
 ) -> Result<()> {
     let clock = Clock::get()?;
     let state = &ctx.accounts.state;
@@ -1125,7 +1322,8 @@ pub fn handle_place_and_take_perp_order<'info>(
         return Err(print_error!(ErrorCode::InvalidOrderPostOnly)().into());
     }
 
-    let (makers_and_referrer, makers_and_referrer_stats) = load_user_maps(remaining_accounts_iter)?;
+    let (makers_and_referrer, makers_and_referrer_stats) =
+        load_user_maps(remaining_accounts_iter, true)?;
 
     let is_immediate_or_cancel = params.immediate_or_cancel;
 
@@ -1137,21 +1335,30 @@ pub fn handle_place_and_take_perp_order<'info>(
         &Clock::get()?,
     )?;
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+    let clock = Clock::get()?;
+
+    let (success_condition, auction_duration_percentage) = parse_optional_params(optional_params);
+
     controller::orders::place_perp_order(
         &ctx.accounts.state,
-        &ctx.accounts.user,
+        &mut user,
+        user_key,
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
-        &Clock::get()?,
+        &clock,
         params,
         PlaceOrderOptions::default(),
     )?;
 
+    drop(user);
+
     let user = &mut ctx.accounts.user;
     let order_id = load!(user)?.get_last_order_id();
 
-    controller::orders::fill_perp_order(
+    let (base_asset_amount_filled, _) = controller::orders::fill_perp_order(
         order_id,
         &ctx.accounts.state,
         user,
@@ -1165,6 +1372,10 @@ pub fn handle_place_and_take_perp_order<'info>(
         &makers_and_referrer_stats,
         None,
         &Clock::get()?,
+        FillMode::PlaceAndTake(
+            is_immediate_or_cancel || optional_params.is_some(),
+            auction_duration_percentage,
+        ),
     )?;
 
     let order_exists = load!(ctx.accounts.user)?
@@ -1183,14 +1394,28 @@ pub fn handle_place_and_take_perp_order<'info>(
         )?;
     }
 
+    if success_condition == PlaceAndTakeOrderSuccessCondition::PartialFill as u8 {
+        validate!(
+            base_asset_amount_filled > 0,
+            ErrorCode::PlaceAndTakeOrderSuccessConditionFailed,
+            "no partial fill"
+        )?;
+    } else if success_condition == PlaceAndTakeOrderSuccessCondition::FullFill as u8 {
+        validate!(
+            base_asset_amount_filled > 0 && !order_exists,
+            ErrorCode::PlaceAndTakeOrderSuccessConditionFailed,
+            "no full fill"
+        )?;
+    }
+
     Ok(())
 }
 
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_place_and_make_perp_order<'a, 'b, 'c, 'info>(
-    ctx: Context<'a, 'b, 'c, 'info, PlaceAndMake<'info>>,
+pub fn handle_place_and_make_perp_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceAndMake<'info>>,
     params: OrderParams,
     taker_order_id: u32,
 ) -> Result<()> {
@@ -1226,9 +1451,13 @@ pub fn handle_place_and_make_perp_order<'a, 'b, 'c, 'info>(
         clock,
     )?;
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+
     controller::orders::place_perp_order(
         state,
-        &ctx.accounts.user,
+        &mut user,
+        user_key,
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
@@ -1237,14 +1466,12 @@ pub fn handle_place_and_make_perp_order<'a, 'b, 'c, 'info>(
         PlaceOrderOptions::default(),
     )?;
 
-    let (order_id, authority) = {
-        let user = load!(ctx.accounts.user)?;
-        let order_id = user.get_last_order_id();
-        (order_id, user.authority)
-    };
+    let (order_id, authority) = (user.get_last_order_id(), user.authority);
+
+    drop(user);
 
     let (mut makers_and_referrer, mut makers_and_referrer_stats) =
-        load_user_maps(remaining_accounts_iter)?;
+        load_user_maps(remaining_accounts_iter, true)?;
     makers_and_referrer.insert(ctx.accounts.user.key(), ctx.accounts.user.clone())?;
     makers_and_referrer_stats.insert(authority, ctx.accounts.user_stats.clone())?;
 
@@ -1262,6 +1489,7 @@ pub fn handle_place_and_make_perp_order<'a, 'b, 'c, 'info>(
         &makers_and_referrer_stats,
         Some(order_id),
         clock,
+        FillMode::PlaceAndMake,
     )?;
 
     let order_exists = load!(ctx.accounts.user)?
@@ -1283,7 +1511,117 @@ pub fn handle_place_and_make_perp_order<'a, 'b, 'c, 'info>(
     Ok(())
 }
 
-pub fn handle_place_spot_order(ctx: Context<PlaceOrder>, params: OrderParams) -> Result<()> {
+#[access_control(
+    fill_not_paused(&ctx.accounts.state)
+)]
+pub fn handle_place_and_make_swift_perp_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceAndMakeSwift<'info>>,
+    params: OrderParams,
+    swift_order_uuid: [u8; 8],
+) -> Result<()> {
+    let clock = &Clock::get()?;
+    let state = &ctx.accounts.state;
+
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
+    let AccountMaps {
+        perp_market_map,
+        spot_market_map,
+        mut oracle_map,
+    } = load_maps(
+        remaining_accounts_iter,
+        &get_writable_perp_market_set(params.market_index),
+        &MarketSet::new(),
+        Clock::get()?.slot,
+        Some(state.oracle_guard_rails),
+    )?;
+
+    if !params.immediate_or_cancel
+        || params.post_only == PostOnlyParam::None
+        || params.order_type != OrderType::Limit
+    {
+        msg!("place_and_make must use IOC post only limit order");
+        return Err(print_error!(ErrorCode::InvalidOrderIOCPostOnly)().into());
+    }
+
+    controller::repeg::update_amm(
+        params.market_index,
+        &perp_market_map,
+        &mut oracle_map,
+        state,
+        clock,
+    )?;
+
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+
+    controller::orders::place_perp_order(
+        state,
+        &mut user,
+        user_key,
+        &perp_market_map,
+        &spot_market_map,
+        &mut oracle_map,
+        clock,
+        params,
+        PlaceOrderOptions::default(),
+    )?;
+
+    let (order_id, authority) = (user.get_last_order_id(), user.authority);
+
+    drop(user);
+
+    let (mut makers_and_referrer, mut makers_and_referrer_stats) =
+        load_user_maps(remaining_accounts_iter, true)?;
+    makers_and_referrer.insert(ctx.accounts.user.key(), ctx.accounts.user.clone())?;
+    makers_and_referrer_stats.insert(authority, ctx.accounts.user_stats.clone())?;
+
+    let taker_swift_account = ctx.accounts.taker_swift_user_orders.load()?;
+    let taker_order_id = taker_swift_account
+        .iter()
+        .find(|swift_order_id| swift_order_id.uuid == swift_order_uuid)
+        .ok_or(ErrorCode::SwiftOrderDoesNotExist)?
+        .order_id;
+
+    controller::orders::fill_perp_order(
+        taker_order_id,
+        state,
+        &ctx.accounts.taker,
+        &ctx.accounts.taker_stats,
+        &spot_market_map,
+        &perp_market_map,
+        &mut oracle_map,
+        &ctx.accounts.user.clone(),
+        &ctx.accounts.user_stats.clone(),
+        &makers_and_referrer,
+        &makers_and_referrer_stats,
+        Some(order_id),
+        clock,
+        FillMode::PlaceAndMake,
+    )?;
+
+    let order_exists = load!(ctx.accounts.user)?
+        .orders
+        .iter()
+        .any(|order| order.order_id == order_id);
+
+    if order_exists {
+        controller::orders::cancel_order_by_order_id(
+            order_id,
+            &ctx.accounts.user,
+            &perp_market_map,
+            &spot_market_map,
+            &mut oracle_map,
+            clock,
+        )?;
+    }
+
+    Ok(())
+}
+
+pub fn handle_place_spot_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceOrder>,
+    params: OrderParams,
+) -> Result<()> {
     let AccountMaps {
         perp_market_map,
         spot_market_map,
@@ -1301,9 +1639,13 @@ pub fn handle_place_spot_order(ctx: Context<PlaceOrder>, params: OrderParams) ->
         return Err(print_error!(ErrorCode::InvalidOrderIOC)().into());
     }
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+
     controller::orders::place_spot_order(
         &ctx.accounts.state,
-        &ctx.accounts.user,
+        &mut user,
+        user_key,
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
@@ -1318,11 +1660,11 @@ pub fn handle_place_spot_order(ctx: Context<PlaceOrder>, params: OrderParams) ->
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_place_and_take_spot_order<'info>(
-    ctx: Context<PlaceAndTake>,
+pub fn handle_place_and_take_spot_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceAndTake<'info>>,
     params: OrderParams,
     fulfillment_type: SpotFulfillmentType,
-    maker_order_id: Option<u32>,
+    _maker_order_id: Option<u32>,
 ) -> Result<()> {
     let clock = Clock::get()?;
     let market_index = params.market_index;
@@ -1334,8 +1676,8 @@ pub fn handle_place_and_take_spot_order<'info>(
         mut oracle_map,
     } = load_maps(
         remaining_accounts_iter,
-        &get_writable_perp_market_set(params.market_index),
         &MarketSet::new(),
+        &get_writable_spot_market_set_from_many(vec![QUOTE_SPOT_MARKET_INDEX, market_index]),
         clock.slot,
         None,
     )?;
@@ -1345,15 +1687,10 @@ pub fn handle_place_and_take_spot_order<'info>(
         return Err(print_error!(ErrorCode::InvalidOrderPostOnly)().into());
     }
 
-    let (maker, maker_stats) = match maker_order_id {
-        Some(_) => {
-            let (user, user_stats) = get_maker_and_maker_stats(remaining_accounts_iter)?;
-            (Some(user), Some(user_stats))
-        }
-        None => (None, None),
+    let (makers_and_referrer, makers_and_referrer_stats) = match fulfillment_type {
+        SpotFulfillmentType::Match => load_user_maps(remaining_accounts_iter, true)?,
+        _ => (UserMap::empty(), UserStatsMap::empty()),
     };
-
-    let (_referrer, _referrer_stats) = get_referrer_and_referrer_stats(remaining_accounts_iter)?;
 
     let is_immediate_or_cancel = params.immediate_or_cancel;
 
@@ -1379,6 +1716,17 @@ pub fn handle_place_and_take_spot_order<'info>(
                 &quote_market,
             )?)
         }
+        SpotFulfillmentType::OpenbookV2 => {
+            let base_market = spot_market_map.get_ref(&market_index)?;
+            let quote_market = spot_market_map.get_quote_spot_market()?;
+            Box::new(OpenbookV2FulfillmentParams::new(
+                remaining_accounts_iter,
+                &ctx.accounts.state,
+                &base_market,
+                &quote_market,
+                clock.unix_timestamp,
+            )?)
+        }
         SpotFulfillmentType::Match => {
             let base_market = spot_market_map.get_ref(&market_index)?;
             let quote_market = spot_market_map.get_quote_spot_market()?;
@@ -1390,9 +1738,15 @@ pub fn handle_place_and_take_spot_order<'info>(
         }
     };
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+
+    let order_id_before = user.get_last_order_id();
+
     controller::orders::place_spot_order(
         &ctx.accounts.state,
-        &ctx.accounts.user,
+        &mut user,
+        user_key,
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
@@ -1401,8 +1755,15 @@ pub fn handle_place_and_take_spot_order<'info>(
         PlaceOrderOptions::default(),
     )?;
 
+    drop(user);
+
     let user = &mut ctx.accounts.user;
     let order_id = load!(user)?.get_last_order_id();
+
+    if order_id == order_id_before {
+        msg!("new order failed to be placed");
+        return Err(print_error!(ErrorCode::InvalidOrder)().into());
+    }
 
     controller::orders::fill_spot_order(
         order_id,
@@ -1414,9 +1775,9 @@ pub fn handle_place_and_take_spot_order<'info>(
         &mut oracle_map,
         &user.clone(),
         &ctx.accounts.user_stats.clone(),
-        maker.as_ref(),
-        maker_stats.as_ref(),
-        maker_order_id,
+        &makers_and_referrer,
+        &makers_and_referrer_stats,
+        None,
         &clock,
         fulfillment_params.as_mut(),
     )?;
@@ -1447,8 +1808,8 @@ pub fn handle_place_and_take_spot_order<'info>(
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_place_and_make_spot_order<'info>(
-    ctx: Context<PlaceAndMake>,
+pub fn handle_place_and_make_spot_order<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, PlaceAndMake<'info>>,
     params: OrderParams,
     taker_order_id: u32,
     fulfillment_type: SpotFulfillmentType,
@@ -1463,8 +1824,8 @@ pub fn handle_place_and_make_spot_order<'info>(
         mut oracle_map,
     } = load_maps(
         remaining_accounts_iter,
-        &get_writable_perp_market_set(params.market_index),
         &MarketSet::new(),
+        &get_writable_spot_market_set_from_many(vec![QUOTE_SPOT_MARKET_INDEX, params.market_index]),
         Clock::get()?.slot,
         None,
     )?;
@@ -1503,6 +1864,17 @@ pub fn handle_place_and_make_spot_order<'info>(
                 &quote_market,
             )?)
         }
+        SpotFulfillmentType::OpenbookV2 => {
+            let base_market = spot_market_map.get_ref(&market_index)?;
+            let quote_market = spot_market_map.get_quote_spot_market()?;
+            Box::new(OpenbookV2FulfillmentParams::new(
+                remaining_accounts_iter,
+                &ctx.accounts.state,
+                &base_market,
+                &quote_market,
+                clock.unix_timestamp,
+            )?)
+        }
         SpotFulfillmentType::Match => {
             let base_market = spot_market_map.get_ref(&market_index)?;
             let quote_market = spot_market_map.get_quote_spot_market()?;
@@ -1514,9 +1886,14 @@ pub fn handle_place_and_make_spot_order<'info>(
         }
     };
 
+    let user_key = ctx.accounts.user.key();
+    let mut user = load_mut!(ctx.accounts.user)?;
+    let authority = user.authority;
+
     controller::orders::place_spot_order(
         state,
-        &ctx.accounts.user,
+        &mut user,
+        user_key,
         &perp_market_map,
         &spot_market_map,
         &mut oracle_map,
@@ -1525,7 +1902,14 @@ pub fn handle_place_and_make_spot_order<'info>(
         PlaceOrderOptions::default(),
     )?;
 
+    drop(user);
+
     let order_id = load!(ctx.accounts.user)?.get_last_order_id();
+
+    let mut makers_and_referrer = UserMap::empty();
+    let mut makers_and_referrer_stats = UserStatsMap::empty();
+    makers_and_referrer.insert(ctx.accounts.user.key(), ctx.accounts.user.clone())?;
+    makers_and_referrer_stats.insert(authority, ctx.accounts.user_stats.clone())?;
 
     controller::orders::fill_spot_order(
         taker_order_id,
@@ -1537,8 +1921,8 @@ pub fn handle_place_and_make_spot_order<'info>(
         &mut oracle_map,
         &ctx.accounts.user.clone(),
         &ctx.accounts.user_stats.clone(),
-        Some(&ctx.accounts.user),
-        Some(&ctx.accounts.user_stats),
+        &makers_and_referrer,
+        &makers_and_referrer_stats,
         Some(order_id),
         clock,
         fulfillment_params.as_mut(),
@@ -1570,8 +1954,8 @@ pub fn handle_place_and_make_spot_order<'info>(
 #[access_control(
     amm_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_add_perp_lp_shares<'info>(
-    ctx: Context<AddRemoveLiquidity>,
+pub fn handle_add_perp_lp_shares<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, AddRemoveLiquidity<'info>>,
     n_shares: u64,
     market_index: u16,
 ) -> Result<()> {
@@ -1606,15 +1990,21 @@ pub fn handle_add_perp_lp_shares<'info>(
         let mut market = perp_market_map.get_ref_mut(&market_index)?;
 
         validate!(
-            matches!(
-                market.status,
-                MarketStatus::Active
-                    | MarketStatus::FundingPaused
-                    | MarketStatus::FillPaused
-                    | MarketStatus::WithdrawPaused
-            ),
+            matches!(market.status, MarketStatus::Active),
             ErrorCode::MarketStatusInvalidForNewLP,
             "Market Status doesn't allow for new LP liquidity"
+        )?;
+
+        validate!(
+            !matches!(market.contract_type, ContractType::Prediction),
+            ErrorCode::MarketStatusInvalidForNewLP,
+            "Contract Type doesn't allow for LP liquidity"
+        )?;
+
+        validate!(
+            !market.is_operation_paused(PerpOperation::AmmFill),
+            ErrorCode::MarketStatusInvalidForNewLP,
+            "Market amm fills paused"
         )?;
 
         validate!(
@@ -1644,15 +2034,12 @@ pub fn handle_add_perp_lp_shares<'info>(
     }
 
     // check margin requirements
-    validate!(
-        meets_initial_margin_requirement(
-            user,
-            &perp_market_map,
-            &spot_market_map,
-            &mut oracle_map
-        )?,
-        ErrorCode::InsufficientCollateral,
-        "User does not meet initial margin requirement"
+    meets_place_order_margin_requirement(
+        user,
+        &perp_market_map,
+        &spot_market_map,
+        &mut oracle_map,
+        true,
     )?;
 
     user.update_last_active_slot(clock.slot);
@@ -1669,8 +2056,8 @@ pub fn handle_add_perp_lp_shares<'info>(
     Ok(())
 }
 
-pub fn handle_remove_perp_lp_shares_in_expiring_market(
-    ctx: Context<RemoveLiquidityInExpiredMarket>,
+pub fn handle_remove_perp_lp_shares_in_expiring_market<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, RemoveLiquidityInExpiredMarket<'info>>,
     shares_to_burn: u64,
     market_index: u16,
 ) -> Result<()> {
@@ -1722,8 +2109,8 @@ pub fn handle_remove_perp_lp_shares_in_expiring_market(
 #[access_control(
     amm_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_remove_perp_lp_shares(
-    ctx: Context<AddRemoveLiquidity>,
+pub fn handle_remove_perp_lp_shares<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, AddRemoveLiquidity<'info>>,
     shares_to_burn: u64,
     market_index: u16,
 ) -> Result<()> {
@@ -1782,13 +2169,14 @@ pub fn handle_update_user_custom_margin_ratio(
     Ok(())
 }
 
-pub fn handle_update_user_margin_trading_enabled(
-    ctx: Context<UpdateUser>,
+pub fn handle_update_user_margin_trading_enabled<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, UpdateUser<'info>>,
     _sub_account_id: u16,
     margin_trading_enabled: bool,
 ) -> Result<()> {
     let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
     let AccountMaps {
+        perp_market_map,
         spot_market_map,
         mut oracle_map,
         ..
@@ -1803,7 +2191,7 @@ pub fn handle_update_user_margin_trading_enabled(
     let mut user = load_mut!(ctx.accounts.user)?;
     user.is_margin_trading_enabled = margin_trading_enabled;
 
-    validate_spot_margin_trading(&user, &spot_market_map, &mut oracle_map)
+    validate_spot_margin_trading(&user, &perp_market_map, &spot_market_map, &mut oracle_map)
         .map_err(|_| ErrorCode::MarginOrdersOpen)?;
 
     Ok(())
@@ -1819,16 +2207,189 @@ pub fn handle_update_user_delegate(
     Ok(())
 }
 
+pub fn handle_update_user_reduce_only(
+    ctx: Context<UpdateUser>,
+    _sub_account_id: u16,
+    reduce_only: bool,
+) -> Result<()> {
+    let mut user = load_mut!(ctx.accounts.user)?;
+
+    validate!(!user.is_being_liquidated(), ErrorCode::LiquidationsOngoing)?;
+
+    user.update_reduce_only_status(reduce_only)?;
+    Ok(())
+}
+
+pub fn handle_update_user_advanced_lp(
+    ctx: Context<UpdateUser>,
+    _sub_account_id: u16,
+    advanced_lp: bool,
+) -> Result<()> {
+    let mut user = load_mut!(ctx.accounts.user)?;
+
+    validate!(!user.is_being_liquidated(), ErrorCode::LiquidationsOngoing)?;
+
+    user.update_advanced_lp_status(advanced_lp)?;
+    Ok(())
+}
+
 pub fn handle_delete_user(ctx: Context<DeleteUser>) -> Result<()> {
     let user = &load!(ctx.accounts.user)?;
     let user_stats = &mut load_mut!(ctx.accounts.user_stats)?;
 
-    validate_user_deletion(user, user_stats)?;
+    validate_user_deletion(
+        user,
+        user_stats,
+        &ctx.accounts.state,
+        Clock::get()?.unix_timestamp,
+    )?;
 
     safe_decrement!(user_stats.number_of_sub_accounts, 1);
 
     let state = &mut ctx.accounts.state;
     safe_decrement!(state.number_of_sub_accounts, 1);
+
+    Ok(())
+}
+
+pub fn handle_delete_swift_user_orders(_ctx: Context<DeleteSwiftUserOrders>) -> Result<()> {
+    Ok(())
+}
+
+pub fn handle_reclaim_rent(ctx: Context<ReclaimRent>) -> Result<()> {
+    let user_size = ctx.accounts.user.to_account_info().data_len();
+    let minimum_lamports = ctx.accounts.rent.minimum_balance(user_size);
+    let current_lamports = ctx.accounts.user.to_account_info().try_lamports()?;
+    let reclaim_amount = current_lamports.saturating_sub(minimum_lamports);
+
+    validate!(
+        reclaim_amount > 0,
+        ErrorCode::CantReclaimRent,
+        "user account has no excess lamports to reclaim"
+    )?;
+
+    **ctx
+        .accounts
+        .user
+        .to_account_info()
+        .try_borrow_mut_lamports()? = minimum_lamports;
+
+    **ctx
+        .accounts
+        .authority
+        .to_account_info()
+        .try_borrow_mut_lamports()? += reclaim_amount;
+
+    let user_stats = &mut load!(ctx.accounts.user_stats)?;
+
+    // Skip age check if is no max sub accounts
+    let max_sub_accounts = ctx.accounts.state.max_number_of_sub_accounts();
+    let estimated_user_stats_age = user_stats.get_age_ts(Clock::get()?.unix_timestamp);
+    validate!(
+        max_sub_accounts == 0 || estimated_user_stats_age >= THIRTEEN_DAY,
+        ErrorCode::CantReclaimRent,
+        "user stats too young to reclaim rent. age ={} minimum = {}",
+        estimated_user_stats_age,
+        THIRTEEN_DAY
+    )?;
+
+    Ok(())
+}
+
+#[access_control(
+    deposit_not_paused(&ctx.accounts.state)
+)]
+pub fn handle_deposit_into_spot_market_revenue_pool<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, RevenuePoolDeposit<'info>>,
+    amount: u64,
+) -> Result<()> {
+    if amount == 0 {
+        return Err(ErrorCode::InsufficientDeposit.into());
+    }
+
+    let mut spot_market = load_mut!(ctx.accounts.spot_market)?;
+
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
+
+    let mint = get_token_mint(remaining_accounts_iter)?;
+
+    validate!(
+        !spot_market.is_in_settlement(Clock::get()?.unix_timestamp),
+        ErrorCode::DefaultError,
+        "spot market {} not active",
+        spot_market.market_index
+    )?;
+
+    controller::spot_balance::update_revenue_pool_balances(
+        amount.cast::<u128>()?,
+        &SpotBalanceType::Deposit,
+        &mut spot_market,
+    )?;
+
+    controller::token::receive(
+        &ctx.accounts.token_program,
+        &ctx.accounts.user_token_account,
+        &ctx.accounts.spot_market_vault,
+        &ctx.accounts.authority,
+        amount,
+        &mint,
+    )?;
+
+    spot_market.validate_max_token_deposits_and_borrows(false)?;
+    ctx.accounts.spot_market_vault.reload()?;
+    math::spot_withdraw::validate_spot_market_vault_amount(
+        &spot_market,
+        ctx.accounts.spot_market_vault.amount,
+    )?;
+
+    Ok(())
+}
+
+pub fn handle_enable_user_high_leverage_mode<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, EnableUserHighLeverageMode>,
+    _sub_account_id: u16,
+) -> Result<()> {
+    let state = &ctx.accounts.state;
+    let mut user = load_mut!(ctx.accounts.user)?;
+
+    let AccountMaps {
+        perp_market_map,
+        spot_market_map,
+        mut oracle_map,
+    } = load_maps(
+        &mut ctx.remaining_accounts.iter().peekable(),
+        &MarketSet::new(),
+        &MarketSet::new(),
+        Clock::get()?.slot,
+        Some(state.oracle_guard_rails),
+    )?;
+
+    validate!(
+        user.margin_mode != MarginMode::HighLeverage,
+        ErrorCode::DefaultError,
+        "user already in high leverage mode"
+    )?;
+
+    meets_maintenance_margin_requirement(
+        &user,
+        &perp_market_map,
+        &spot_market_map,
+        &mut oracle_map,
+    )?;
+
+    user.margin_mode = MarginMode::HighLeverage;
+
+    let mut config = load_mut!(ctx.accounts.high_leverage_mode_config)?;
+
+    validate!(
+        !config.is_reduce_only(),
+        ErrorCode::DefaultError,
+        "high leverage mode config reduce only"
+    )?;
+
+    config.current_users = config.current_users.safe_add(1)?;
+
+    config.validate()?;
 
     Ok(())
 }
@@ -1876,6 +2437,71 @@ pub struct InitializeUserStats<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeRFQUser<'info> {
+    #[account(
+        init,
+        seeds = [RFQ_PDA_SEED.as_ref(), user.key().as_ref()],
+        space = RFQUser::SIZE,
+        bump,
+        payer = payer
+    )]
+    pub rfq_user: AccountLoader<'info, RFQUser>,
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = can_sign_for_user(&user, &authority)?
+    )]
+    pub user: AccountLoader<'info, User>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(num_orders: u16)]
+pub struct InitializeSwiftUserOrders<'info> {
+    #[account(
+        init,
+        seeds = [SWIFT_PDA_SEED.as_ref(), user.key().as_ref()],
+        space = SwiftUserOrders::space(num_orders as usize),
+        bump,
+        payer = payer
+    )]
+    pub swift_user_orders: Box<Account<'info, SwiftUserOrders>>,
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = can_sign_for_user(&user, &authority)?
+    )]
+    pub user: AccountLoader<'info, User>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(num_orders: u16)]
+pub struct ResizeSwiftUserOrders<'info> {
+    #[account(
+        mut,
+        seeds = [SWIFT_PDA_SEED.as_ref(), user.key().as_ref()],
+        bump,
+        realloc = SwiftUserOrders::space(num_orders as usize),
+        realloc::payer = authority,
+        realloc::zero = false,
+    )]
+    pub swift_user_orders: Box<Account<'info, SwiftUserOrders>>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = can_sign_for_user(&user, &authority)?
+    )]
+    pub user: AccountLoader<'info, User>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1929,14 +2555,36 @@ pub struct Deposit<'info> {
         seeds = [b"spot_market_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub spot_market_vault: Box<Account<'info, TokenAccount>>,
+    pub spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         constraint = &spot_market_vault.mint.eq(&user_token_account.mint),
         token::authority = authority
     )]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct RevenuePoolDeposit<'info> {
+    pub state: Box<Account<'info, State>>,
+    #[account(mut)]
+    pub spot_market: AccountLoader<'info, SpotMarket>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"spot_market_vault".as_ref(), spot_market.load()?.market_index.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        mut,
+        constraint = &spot_market_vault.mint.eq(&user_token_account.mint),
+        token::authority = authority
+    )]
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -1959,7 +2607,7 @@ pub struct Withdraw<'info> {
         seeds = [b"spot_market_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub spot_market_vault: Box<Account<'info, TokenAccount>>,
+    pub spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         constraint = state.signer.eq(&drift_signer.key())
     )]
@@ -1969,8 +2617,8 @@ pub struct Withdraw<'info> {
         mut,
         constraint = &spot_market_vault.mint.eq(&user_token_account.mint)
     )]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -1997,7 +2645,7 @@ pub struct TransferDeposit<'info> {
         seeds = [b"spot_market_vault".as_ref(), market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub spot_market_vault: Box<Account<'info, TokenAccount>>,
+    pub spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 }
 
 #[derive(Accounts)]
@@ -2062,6 +2710,54 @@ pub struct PlaceAndMake<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PlaceAndMakeSwift<'info> {
+    pub state: Box<Account<'info, State>>,
+    #[account(
+        mut,
+        constraint = can_sign_for_user(&user, &authority)?
+    )]
+    pub user: AccountLoader<'info, User>,
+    #[account(
+        mut,
+        constraint = is_stats_for_user(&user, &user_stats)?
+    )]
+    pub user_stats: AccountLoader<'info, UserStats>,
+    #[account(mut)]
+    pub taker: AccountLoader<'info, User>,
+    #[account(
+        mut,
+        constraint = is_stats_for_user(&taker, &taker_stats)?
+    )]
+    pub taker_stats: AccountLoader<'info, UserStats>,
+    #[account(
+        seeds = [SWIFT_PDA_SEED.as_ref(), taker.key().as_ref()],
+        bump,
+    )]
+    /// CHECK: checked in SwiftUserOrdersZeroCopy checks
+    pub taker_swift_user_orders: AccountInfo<'info>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct PlaceAndMatchRFQOrders<'info> {
+    pub state: Box<Account<'info, State>>,
+    #[account(mut)]
+    pub user: AccountLoader<'info, User>,
+    #[account(
+        mut,
+        constraint = is_stats_for_user(&user, &user_stats)?
+    )]
+    pub user_stats: AccountLoader<'info, UserStats>,
+    pub authority: Signer<'info>,
+    /// CHECK: The address check is needed because otherwise
+    /// the supplied Sysvar could be anything else.
+    /// The Instruction Sysvar has not been implemented
+    /// in the Anchor framework yet, so this is the safe approach.
+    #[account(address = IX_ID)]
+    pub ix_sysvar: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
 pub struct AddRemoveLiquidity<'info> {
     pub state: Box<Account<'info, State>>,
     #[account(
@@ -2112,6 +2808,42 @@ pub struct DeleteUser<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DeleteSwiftUserOrders<'info> {
+    #[account(
+        mut,
+        has_one = authority,
+    )]
+    pub user: AccountLoader<'info, User>,
+    #[account(
+        mut,
+        close = user,
+        seeds = [SWIFT_PDA_SEED.as_ref(), user.key().as_ref()],
+        bump,
+    )]
+    pub swift_user_orders: Box<Account<'info, SwiftUserOrders>>,
+    #[account(mut)]
+    pub state: Box<Account<'info, State>>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReclaimRent<'info> {
+    #[account(
+        mut,
+        has_one = authority,
+    )]
+    pub user: AccountLoader<'info, User>,
+    #[account(
+        mut,
+        has_one = authority
+    )]
+    pub user_stats: AccountLoader<'info, UserStats>,
+    pub state: Box<Account<'info, State>>,
+    pub authority: Signer<'info>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
 #[instruction(in_market_index: u16, out_market_index: u16, )]
 pub struct Swap<'info> {
     pub state: Box<Account<'info, State>>,
@@ -2131,26 +2863,26 @@ pub struct Swap<'info> {
         seeds = [b"spot_market_vault".as_ref(), out_market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub out_spot_market_vault: Box<Account<'info, TokenAccount>>,
+    pub out_spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         seeds = [b"spot_market_vault".as_ref(), in_market_index.to_le_bytes().as_ref()],
         bump,
     )]
-    pub in_spot_market_vault: Box<Account<'info, TokenAccount>>,
+    pub in_spot_market_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         constraint = &out_spot_market_vault.mint.eq(&out_token_account.mint),
         token::authority = authority
     )]
-    pub out_token_account: Box<Account<'info, TokenAccount>>,
+    pub out_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         constraint = &in_spot_market_vault.mint.eq(&in_token_account.mint),
         token::authority = authority
     )]
-    pub in_token_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub in_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     #[account(
         constraint = state.signer.eq(&drift_signer.key())
     )]
@@ -2162,11 +2894,28 @@ pub struct Swap<'info> {
     pub instructions: UncheckedAccount<'info>,
 }
 
+#[derive(Accounts)]
+#[instruction(
+    sub_account_id: u16,
+)]
+pub struct EnableUserHighLeverageMode<'info> {
+    pub state: Box<Account<'info, State>>,
+    #[account(
+        mut,
+        seeds = [b"user", authority.key.as_ref(), sub_account_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub user: AccountLoader<'info, User>,
+    pub authority: Signer<'info>,
+    #[account(mut)]
+    pub high_leverage_mode_config: AccountLoader<'info, HighLeverageModeConfig>,
+}
+
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_begin_swap(
-    ctx: Context<Swap>,
+pub fn handle_begin_swap<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, Swap<'info>>,
     in_market_index: u16,
     out_market_index: u16,
     amount_in: u64,
@@ -2175,17 +2924,21 @@ pub fn handle_begin_swap(
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
 
+    let remaining_accounts_iter = &mut ctx.remaining_accounts.iter().peekable();
     let AccountMaps {
         perp_market_map,
         spot_market_map,
         mut oracle_map,
     } = load_maps(
-        &mut ctx.remaining_accounts.iter().peekable(),
+        remaining_accounts_iter,
         &MarketSet::new(),
         &get_writable_spot_market_set_from_many(vec![in_market_index, out_market_index]),
         clock.slot,
         Some(state.oracle_guard_rails),
     )?;
+
+    let _token_interface = get_token_interface(remaining_accounts_iter)?;
+    let mint = get_token_mint(remaining_accounts_iter)?;
 
     let mut user = load_mut!(&ctx.accounts.user)?;
     let delegate_is_signer = user.delegate == ctx.accounts.authority.key();
@@ -2247,6 +3000,12 @@ pub fn handle_begin_swap(
     )?;
 
     validate!(
+        in_market_index != out_market_index,
+        ErrorCode::InvalidSwap,
+        "in and out market the same"
+    )?;
+
+    validate!(
         amount_in != 0,
         ErrorCode::InvalidSwap,
         "amount_out cannot be zero"
@@ -2269,6 +3028,7 @@ pub fn handle_begin_swap(
         &ctx.accounts.drift_signer,
         state.signer_nonce,
         amount_in,
+        &mint,
     )?;
 
     let ixs = ctx.accounts.instructions.as_ref();
@@ -2344,22 +3104,49 @@ pub fn handle_begin_swap(
                 ErrorCode::InvalidSwap,
                 "the in_token_account passed to SwapBegin and End must match"
             )?;
+
+            validate!(
+                ctx.remaining_accounts.len() == ix.accounts.len() - 11,
+                ErrorCode::InvalidSwap,
+                "begin and end ix must have the same number of accounts"
+            )?;
+
+            for i in 11..ix.accounts.len() {
+                validate!(
+                    *ctx.remaining_accounts[i - 11].key == ix.accounts[i].pubkey,
+                    ErrorCode::InvalidSwap,
+                    "begin and end ix must have the same accounts. {}th account mismatch. begin: {}, end: {}",
+                    i,
+                    ctx.remaining_accounts[i - 11].key,
+                    ix.accounts[i].pubkey
+                )?;
+            }
         } else {
             let mut whitelisted_programs = vec![
                 serum_program::id(),
                 AssociatedToken::id(),
                 jupiter_mainnet_3::ID,
                 jupiter_mainnet_4::ID,
+                jupiter_mainnet_6::ID,
             ];
             if !delegate_is_signer {
                 whitelisted_programs.push(Token::id());
+                whitelisted_programs.push(Token2022::id());
                 whitelisted_programs.push(marinade_mainnet::ID);
             }
             validate!(
                 whitelisted_programs.contains(&ix.program_id),
                 ErrorCode::InvalidSwap,
-                "only allowed to pass in ixs to token or openbook or Jupiter v3 or v4 programs"
+                "only allowed to pass in ixs to token, openbook, and Jupiter v3/v4/v6 programs"
             )?;
+
+            for meta in ix.accounts.iter() {
+                validate!(
+                    meta.pubkey != crate::id(),
+                    ErrorCode::InvalidSwap,
+                    "instructions between begin and end must not be drift instructions"
+                )?;
+            }
         }
 
         index += 1;
@@ -2383,8 +3170,8 @@ pub enum SwapReduceOnly {
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_end_swap(
-    ctx: Context<Swap>,
+pub fn handle_end_swap<'c: 'info, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, Swap<'info>>,
     in_market_index: u16,
     out_market_index: u16,
     limit_price: Option<u64>,
@@ -2395,24 +3182,43 @@ pub fn handle_end_swap(
     let slot = clock.slot;
     let now = clock.unix_timestamp;
 
+    let remaining_accounts = &mut ctx.remaining_accounts.iter().peekable();
     let AccountMaps {
         perp_market_map,
         spot_market_map,
         mut oracle_map,
     } = load_maps(
-        &mut ctx.remaining_accounts.iter().peekable(),
+        remaining_accounts,
         &MarketSet::new(),
         &get_writable_spot_market_set_from_many(vec![in_market_index, out_market_index]),
         clock.slot,
         Some(state.oracle_guard_rails),
     )?;
+    let out_token_program = get_token_interface(remaining_accounts)?;
+
+    let in_mint = get_token_mint(remaining_accounts)?;
+    let out_mint = get_token_mint(remaining_accounts)?;
 
     let user_key = ctx.accounts.user.key();
     let mut user = load_mut!(&ctx.accounts.user)?;
 
     let mut user_stats = load_mut!(&ctx.accounts.user_stats)?;
 
+    let exchange_status = state.get_exchange_status()?;
+
+    validate!(
+        !exchange_status.contains(ExchangeStatus::DepositPaused | ExchangeStatus::WithdrawPaused),
+        ErrorCode::ExchangePaused
+    )?;
+
     let mut in_spot_market = spot_market_map.get_ref_mut(&in_market_index)?;
+
+    validate!(
+        !in_spot_market.is_operation_paused(SpotOperation::Withdraw),
+        ErrorCode::MarketFillOrderPaused,
+        "withdraw from market {} paused",
+        in_market_index
+    )?;
 
     validate!(
         in_spot_market.flash_loan_amount != 0,
@@ -2424,6 +3230,13 @@ pub fn handle_end_swap(
     let in_oracle_price = in_oracle_data.price;
 
     let mut out_spot_market = spot_market_map.get_ref_mut(&out_market_index)?;
+
+    validate!(
+        !out_spot_market.is_operation_paused(SpotOperation::Deposit),
+        ErrorCode::MarketFillOrderPaused,
+        "deposit to market {} paused",
+        out_market_index
+    )?;
 
     let out_oracle_data = oracle_map.get_price_data(&out_spot_market.oracle)?;
     let out_oracle_price = out_oracle_data.price;
@@ -2443,6 +3256,7 @@ pub fn handle_end_swap(
             in_vault,
             &ctx.accounts.authority,
             residual,
+            &in_mint,
         )?;
         in_token_account.reload()?;
         in_vault.reload()?;
@@ -2461,6 +3275,10 @@ pub fn handle_end_swap(
         &mut in_spot_market,
         &mut user,
     )?;
+
+    let in_token_amount_after = user
+        .force_get_spot_position_mut(in_market_index)?
+        .get_signed_token_amount(&in_spot_market)?;
 
     let in_position_is_reduced =
         in_token_amount_before > 0 && in_token_amount_before.unsigned_abs() >= amount_in.cast()?;
@@ -2488,6 +3306,13 @@ pub fn handle_end_swap(
             "swap lead to increase in liability for in market {}",
             in_market_index
         )?;
+
+        validate!(
+            !user.is_reduce_only(),
+            ErrorCode::UserReduceOnly,
+            "swap lead to increase in liability for in market {}",
+            in_market_index
+        )?;
     }
 
     math::spot_withdraw::validate_spot_market_vault_amount(&in_spot_market, in_vault.amount)?;
@@ -2504,13 +3329,26 @@ pub fn handle_end_swap(
             .amount
             .safe_sub(out_spot_market.flash_loan_initial_token_amount)?;
 
-        controller::token::receive(
-            &ctx.accounts.token_program,
-            out_token_account,
-            out_vault,
-            &ctx.accounts.authority,
-            amount_out,
-        )?;
+        if let Some(token_interface) = out_token_program {
+            controller::token::receive(
+                &token_interface,
+                out_token_account,
+                out_vault,
+                &ctx.accounts.authority,
+                amount_out,
+                &out_mint,
+            )?;
+        } else {
+            controller::token::receive(
+                &ctx.accounts.token_program,
+                out_token_account,
+                out_vault,
+                &ctx.accounts.authority,
+                amount_out,
+                &out_mint,
+            )?;
+        }
+
         out_vault.reload()?;
     }
 
@@ -2536,19 +3374,25 @@ pub fn handle_end_swap(
 
     out_spot_market.total_swap_fee = out_spot_market.total_swap_fee.saturating_add(fee);
 
-    let fee_value = get_token_value(fee.cast()?, out_spot_market.decimals, out_oracle_data.price)?;
+    let fee_value = get_token_value(fee.cast()?, out_spot_market.decimals, out_oracle_price)?;
 
     // update fees
     user.update_cumulative_spot_fees(-fee_value.cast()?)?;
     user_stats.increment_total_fees(fee_value.cast()?)?;
 
-    // update taker volume
-    let amount_out_value = get_token_value(
-        amount_out.cast()?,
-        out_spot_market.decimals,
-        out_oracle_data.price,
-    )?;
-    user_stats.update_taker_volume_30d(amount_out_value.cast()?, now)?;
+    if fee != 0 {
+        // update taker volume
+        let amount_out_value = get_token_value(
+            amount_out.cast()?,
+            out_spot_market.decimals,
+            out_oracle_price,
+        )?;
+        user_stats.update_taker_volume_30d(
+            out_spot_market.fuel_boost_taker,
+            amount_out_value.cast()?,
+            now,
+        )?;
+    }
 
     validate!(
         amount_out != 0,
@@ -2569,11 +3413,15 @@ pub fn handle_end_swap(
         Some(amount_out.cast()?),
     )?;
 
+    let out_token_amount_after = user
+        .force_get_spot_position_mut(out_market_index)?
+        .get_signed_token_amount(&out_spot_market)?;
+
     // update fees
     update_revenue_pool_balances(fee.cast()?, &SpotBalanceType::Deposit, &mut out_spot_market)?;
 
     let out_position_is_reduced = out_token_amount_before < 0
-        && out_token_amount_before.unsigned_abs() >= amount_out.cast()?;
+        && out_token_amount_before.unsigned_abs() >= amount_out_after_fee.cast()?;
 
     if !out_position_is_reduced {
         validate!(
@@ -2591,6 +3439,13 @@ pub fn handle_end_swap(
             out_token_amount_before,
             amount_out
         )?;
+
+        validate!(
+            !user.is_reduce_only(),
+            ErrorCode::UserReduceOnly,
+            "swap lead to increase in deposit for in market {}, can only pay off borrow",
+            out_market_index
+        )?;
     }
 
     math::spot_withdraw::validate_spot_market_vault_amount(&out_spot_market, out_vault.amount)?;
@@ -2598,19 +3453,38 @@ pub fn handle_end_swap(
     out_spot_market.flash_loan_initial_token_amount = 0;
     out_spot_market.flash_loan_amount = 0;
 
-    out_spot_market.validate_max_token_deposits()?;
+    out_spot_market.validate_max_token_deposits_and_borrows(false)?;
 
-    let out_safer_than_in =
-        out_spot_market.maintenance_asset_weight > in_spot_market.maintenance_asset_weight;
+    let in_strict_price = StrictOraclePrice::new(
+        in_oracle_price,
+        in_spot_market
+            .historical_oracle_data
+            .last_oracle_price_twap_5min,
+        true,
+    );
+
+    let out_strict_price = StrictOraclePrice::new(
+        out_oracle_price,
+        out_spot_market
+            .historical_oracle_data
+            .last_oracle_price_twap_5min,
+        true,
+    );
+
+    let margin_type = spot_swap::select_margin_type_for_swap(
+        &in_spot_market,
+        &out_spot_market,
+        &in_strict_price,
+        &out_strict_price,
+        in_token_amount_before,
+        out_token_amount_before,
+        in_token_amount_after,
+        out_token_amount_after,
+        MarginRequirementType::Initial,
+    )?;
 
     drop(out_spot_market);
     drop(in_spot_market);
-
-    let margin_type = if in_position_is_reduced && out_safer_than_in {
-        MarginRequirementType::Maintenance
-    } else {
-        MarginRequirementType::Initial
-    };
 
     meets_withdraw_margin_requirement(
         &user,
@@ -2651,6 +3525,18 @@ pub fn handle_end_swap(
             && in_spot_market.flash_loan_amount == 0,
         ErrorCode::InvalidSwap,
         "end_swap ended in invalid state"
+    )?;
+
+    validate_price_bands_for_swap(
+        &in_spot_market,
+        &out_spot_market,
+        amount_in,
+        amount_out,
+        in_oracle_price,
+        out_oracle_price,
+        state
+            .oracle_guard_rails
+            .max_oracle_twap_5min_percent_divergence(),
     )?;
 
     Ok(())

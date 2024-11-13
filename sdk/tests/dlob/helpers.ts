@@ -21,6 +21,10 @@ import {
 	OrderRecord,
 	ZERO,
 	ContractTier,
+	SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
+	SPOT_MARKET_WEIGHT_PRECISION,
+	PRICE_PRECISION,
+	DataAndSlot,
 } from '../../src';
 
 export const mockPerpPosition: PerpPosition = {
@@ -38,9 +42,11 @@ export const mockPerpPosition: PerpPosition = {
 	remainderBaseAssetAmount: 0,
 	lastBaseAssetAmountPerLp: new BN(0),
 	lastQuoteAssetAmountPerLp: new BN(0),
+	perLpBase: 0,
 };
 
 export const mockAMM: AMM = {
+	perLpBase: 0,
 	/* these values create a bid/ask price of 12 */
 	baseAssetReserve: new BN(1).mul(BASE_PRECISION),
 	quoteAssetReserve: new BN(12)
@@ -56,6 +62,7 @@ export const mockAMM: AMM = {
 	lastMarkPriceTwap: new BN(0),
 	lastMarkPriceTwap5Min: new BN(0),
 	lastMarkPriceTwapTs: new BN(0),
+	totalFeeEarnedPerLp: new BN(0),
 	historicalOracleData: {
 		lastOraclePrice: new BN(0),
 		lastOracleConf: new BN(0),
@@ -78,7 +85,7 @@ export const mockAMM: AMM = {
 	baseAssetAmountWithUnsettledLp: new BN(0),
 	orderStepSize: new BN(0),
 	orderTickSize: new BN(1),
-	last24hAvgFundingRate: new BN(0),
+	last24HAvgFundingRate: new BN(0),
 	lastFundingRateShort: new BN(0),
 	lastFundingRateLong: new BN(0),
 	concentrationCoef: new BN(0),
@@ -135,6 +142,10 @@ export const mockAMM: AMM = {
 	bidQuoteAssetReserve: new BN(0),
 	askBaseAssetReserve: new BN(0),
 	askQuoteAssetReserve: new BN(0),
+
+	netUnsettledFundingPnl: new BN(0),
+	quoteAssetAmountWithUnsettledLp: new BN(0),
+	referencePriceOffset: 0,
 };
 
 export const mockPerpMarkets: Array<PerpMarketAccount> = [
@@ -150,8 +161,8 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 		amm: mockAMM,
 		numberOfUsersWithBase: 0,
 		numberOfUsers: 0,
-		marginRatioInitial: 0,
-		marginRatioMaintenance: 0,
+		marginRatioInitial: 2000,
+		marginRatioMaintenance: 1000,
 		nextFillRecordId: new BN(0),
 		pnlPool: {
 			scaledBalance: new BN(0),
@@ -174,6 +185,11 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 			quoteMaxInsurance: new BN(0),
 		},
 		quoteSpotMarketIndex: 0,
+		feeAdjustment: 0,
+		pausedOperations: 0,
+		fuelBoostPosition: 0,
+		fuelBoostMaker: 0,
+		fuelBoostTaker: 0,
 	},
 	{
 		status: MarketStatus.INITIALIZED,
@@ -211,6 +227,11 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 			quoteMaxInsurance: new BN(0),
 		},
 		quoteSpotMarketIndex: 0,
+		feeAdjustment: 0,
+		pausedOperations: 0,
+		fuelBoostPosition: 0,
+		fuelBoostMaker: 0,
+		fuelBoostTaker: 0,
 	},
 	{
 		status: MarketStatus.INITIALIZED,
@@ -248,6 +269,11 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 			quoteMaxInsurance: new BN(0),
 		},
 		quoteSpotMarketIndex: 0,
+		feeAdjustment: 0,
+		pausedOperations: 0,
+		fuelBoostPosition: 0,
+		fuelBoostMaker: 0,
+		fuelBoostTaker: 0,
 	},
 ];
 
@@ -256,7 +282,7 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		status: MarketStatus.ACTIVE,
 		assetTier: AssetTier.COLLATERAL,
 		name: [],
-		maxTokenDeposits: new BN(100),
+		maxTokenDeposits: new BN(1000000 * QUOTE_PRECISION.toNumber()),
 		marketIndex: 0,
 		pubkey: PublicKey.default,
 		mint: DevnetSpotMarkets[0].mint,
@@ -284,8 +310,8 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		optimalUtilization: 0,
 		optimalBorrowRate: 0,
 		maxBorrowRate: 0,
-		cumulativeDepositInterest: new BN(0),
-		cumulativeBorrowInterest: new BN(0),
+		cumulativeDepositInterest: SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
+		cumulativeBorrowInterest: SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
 		totalSocialLoss: new BN(0),
 		totalQuoteSocialLoss: new BN(0),
 		depositBalance: new BN(0),
@@ -293,10 +319,11 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		lastInterestTs: new BN(0),
 		lastTwapTs: new BN(0),
 		oracle: PublicKey.default,
-		initialAssetWeight: 0,
-		maintenanceAssetWeight: 0,
-		initialLiabilityWeight: 0,
-		maintenanceLiabilityWeight: 0,
+		initialAssetWeight: SPOT_MARKET_WEIGHT_PRECISION.toNumber(),
+		maintenanceAssetWeight: SPOT_MARKET_WEIGHT_PRECISION.toNumber(),
+		initialLiabilityWeight: SPOT_MARKET_WEIGHT_PRECISION.toNumber(),
+		maintenanceLiabilityWeight: SPOT_MARKET_WEIGHT_PRECISION.toNumber(),
+		scaleInitialAssetWeightStart: new BN(0),
 		imfFactor: 0,
 		withdrawGuardThreshold: new BN(0),
 		depositTokenTwap: new BN(0),
@@ -317,20 +344,30 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		flashLoanInitialTokenAmount: new BN(0),
 		oracleSource: OracleSource.PYTH,
 		historicalOracleData: {
-			lastOraclePrice: new BN(0),
+			lastOraclePrice: PRICE_PRECISION,
 			lastOracleConf: new BN(0),
 			lastOracleDelay: new BN(0),
-			lastOraclePriceTwap: new BN(0),
-			lastOraclePriceTwap5Min: new BN(0),
+			lastOraclePriceTwap: PRICE_PRECISION,
+			lastOraclePriceTwap5Min: PRICE_PRECISION,
 			lastOraclePriceTwapTs: new BN(0),
 		},
 		historicalIndexData: {
-			lastIndexBidPrice: new BN(0),
-			lastIndexAskPrice: new BN(0),
-			lastIndexPriceTwap: new BN(0),
-			lastIndexPriceTwap5Min: new BN(0),
+			lastIndexBidPrice: PRICE_PRECISION,
+			lastIndexAskPrice: PRICE_PRECISION,
+			lastIndexPriceTwap: PRICE_PRECISION,
+			lastIndexPriceTwap5Min: PRICE_PRECISION,
 			lastIndexPriceTwapTs: new BN(0),
 		},
+		pausedOperations: 0,
+		ifPausedOperations: 0,
+		maxTokenBorrowsFraction: 0,
+		minBorrowRate: 0,
+		fuelBoostDeposits: 0,
+		fuelBoostBorrows: 0,
+		fuelBoostTaker: 0,
+		fuelBoostMaker: 0,
+		fuelBoostInsurance: 0,
+		tokenProgram: 0,
 	},
 	{
 		status: MarketStatus.ACTIVE,
@@ -364,8 +401,8 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		optimalUtilization: 0,
 		optimalBorrowRate: 0,
 		maxBorrowRate: 0,
-		cumulativeDepositInterest: new BN(0),
-		cumulativeBorrowInterest: new BN(0),
+		cumulativeDepositInterest: SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
+		cumulativeBorrowInterest: SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
 		totalSocialLoss: new BN(0),
 		totalQuoteSocialLoss: new BN(0),
 		depositBalance: new BN(0),
@@ -377,6 +414,7 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		maintenanceAssetWeight: 0,
 		initialLiabilityWeight: 0,
 		maintenanceLiabilityWeight: 0,
+		scaleInitialAssetWeightStart: new BN(0),
 		imfFactor: 0,
 		withdrawGuardThreshold: new BN(0),
 		depositTokenTwap: new BN(0),
@@ -411,6 +449,16 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 			lastIndexPriceTwap5Min: new BN(0),
 			lastIndexPriceTwapTs: new BN(0),
 		},
+		pausedOperations: 0,
+		ifPausedOperations: 0,
+		maxTokenBorrowsFraction: 0,
+		minBorrowRate: 0,
+		fuelBoostDeposits: 0,
+		fuelBoostBorrows: 0,
+		fuelBoostTaker: 0,
+		fuelBoostMaker: 0,
+		fuelBoostInsurance: 0,
+		tokenProgram: 0,
 	},
 	{
 		status: MarketStatus.ACTIVE,
@@ -444,8 +492,8 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		optimalUtilization: 0,
 		optimalBorrowRate: 0,
 		maxBorrowRate: 0,
-		cumulativeDepositInterest: new BN(0),
-		cumulativeBorrowInterest: new BN(0),
+		cumulativeDepositInterest: SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
+		cumulativeBorrowInterest: SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
 		totalSocialLoss: new BN(0),
 		totalQuoteSocialLoss: new BN(0),
 		depositBalance: new BN(0),
@@ -457,6 +505,7 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 		maintenanceAssetWeight: 0,
 		initialLiabilityWeight: 0,
 		maintenanceLiabilityWeight: 0,
+		scaleInitialAssetWeightStart: new BN(0),
 		imfFactor: 0,
 		withdrawGuardThreshold: new BN(0),
 		depositTokenTwap: new BN(0),
@@ -491,6 +540,16 @@ export const mockSpotMarkets: Array<SpotMarketAccount> = [
 			lastIndexPriceTwap5Min: new BN(0),
 			lastIndexPriceTwapTs: new BN(0),
 		},
+		pausedOperations: 0,
+		ifPausedOperations: 0,
+		maxTokenBorrowsFraction: 0,
+		minBorrowRate: 0,
+		fuelBoostDeposits: 0,
+		fuelBoostBorrows: 0,
+		fuelBoostTaker: 0,
+		fuelBoostMaker: 0,
+		fuelBoostInsurance: 0,
+		tokenProgram: 0,
 	},
 ];
 
@@ -527,15 +586,13 @@ export const mockStateAccount: StateAccount = {
 				feeNumerator: 0,
 				feeDenominator: 0,
 				makerRebateNumerator: 0,
-				makerRebateDenominator: 0,
+				makerRebateDenominator: 1,
 				referrerRewardNumerator: 0,
 				referrerRewardDenominator: 0,
 				refereeFeeNumerator: 0,
 				refereeFeeDenominator: 0,
 			},
 		],
-		makerRebateNumerator: new BN(0),
-		makerRebateDenominator: new BN(0),
 		fillerRewardStructure: {
 			rewardNumerator: new BN(0),
 			rewardDenominator: new BN(0),
@@ -553,15 +610,13 @@ export const mockStateAccount: StateAccount = {
 				feeNumerator: 0,
 				feeDenominator: 0,
 				makerRebateNumerator: 0,
-				makerRebateDenominator: 0,
+				makerRebateDenominator: 1,
 				referrerRewardNumerator: 0,
 				referrerRewardDenominator: 0,
 				refereeFeeNumerator: 0,
 				refereeFeeDenominator: 0,
 			},
 		],
-		makerRebateNumerator: new BN(0),
-		makerRebateDenominator: new BN(0),
 		fillerRewardStructure: {
 			rewardNumerator: new BN(0),
 			rewardDenominator: new BN(0),
@@ -572,6 +627,8 @@ export const mockStateAccount: StateAccount = {
 	},
 	srmVault: PublicKey.default,
 	whitelistMint: PublicKey.default,
+	maxNumberOfSubAccounts: 0,
+	maxInitializeUserFee: 0,
 };
 
 export class MockUserMap implements UserMapInterface {
@@ -623,11 +680,25 @@ export class MockUserMap implements UserMapInterface {
 		return undefined;
 	}
 
+	public getWithSlot(_key: string): DataAndSlot<User> | undefined {
+		return undefined;
+	}
+
 	public async mustGet(_key: string): Promise<User> {
 		return new User({
 			driftClient: this.driftClient,
 			userAccountPublicKey: PublicKey.default,
 		});
+	}
+
+	public async mustGetWithSlot(_key: string): Promise<DataAndSlot<User>> {
+		return {
+			data: new User({
+				driftClient: this.driftClient,
+				userAccountPublicKey: PublicKey.default,
+			}),
+			slot: 0,
+		};
 	}
 
 	public getUserAuthority(key: string): PublicKey | undefined {
@@ -640,5 +711,30 @@ export class MockUserMap implements UserMapInterface {
 
 	public values(): IterableIterator<User> {
 		return this.userMap.values();
+	}
+
+	public *valuesWithSlot(): IterableIterator<DataAndSlot<User>> {
+		for (const user of this.userMap.values()) {
+			yield {
+				data: user,
+				slot: 0,
+			};
+		}
+	}
+
+	public entries(): IterableIterator<[string, User]> {
+		return this.userMap.entries();
+	}
+
+	public *entriesWithSlot(): IterableIterator<[string, DataAndSlot<User>]> {
+		for (const [key, user] of this.userMap.entries()) {
+			yield [
+				key,
+				{
+					data: user,
+					slot: 0,
+				},
+			];
+		}
 	}
 }

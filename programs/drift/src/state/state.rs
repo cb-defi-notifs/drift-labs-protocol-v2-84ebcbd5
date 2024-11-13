@@ -5,9 +5,13 @@ use crate::error::DriftResult;
 use crate::math::constants::{
     FEE_DENOMINATOR, FEE_PERCENTAGE_DENOMINATOR, MAX_REFERRER_REWARD_EPOCH_UPPER_BOUND,
 };
+use crate::math::safe_math::SafeMath;
 use crate::math::safe_unwrap::SafeUnwrap;
 use crate::state::traits::Size;
-use crate::PERCENTAGE_PRECISION_U64;
+use crate::{LAMPORTS_PER_SOL_U64, PERCENTAGE_PRECISION_U64};
+
+#[cfg(test)]
+mod tests;
 
 #[account]
 #[derive(Default)]
@@ -35,7 +39,9 @@ pub struct State {
     pub exchange_status: u8,
     pub liquidation_duration: u8,
     pub initial_pct_to_liquidate: u16,
-    pub padding: [u8; 14],
+    pub max_number_of_sub_accounts: u16,
+    pub max_initialize_user_fee: u16,
+    pub padding: [u8; 10],
 }
 
 #[derive(BitFlags, Clone, Copy, PartialEq, Debug, Eq)]
@@ -48,6 +54,7 @@ pub enum ExchangeStatus {
     LiqPaused = 0b00010000,
     FundingPaused = 0b00100000,
     SettlePnlPaused = 0b01000000,
+    AmmImmediateFillPaused = 0b10000000,
     // Paused = 0b11111111
 }
 
@@ -62,6 +69,12 @@ impl State {
         BitFlags::<ExchangeStatus>::from_bits(usize::from(self.exchange_status)).safe_unwrap()
     }
 
+    pub fn amm_immediate_fill_paused(&self) -> DriftResult<bool> {
+        Ok(self
+            .get_exchange_status()?
+            .contains(ExchangeStatus::AmmImmediateFillPaused))
+    }
+
     pub fn amm_paused(&self) -> DriftResult<bool> {
         Ok(self
             .get_exchange_status()?
@@ -73,13 +86,42 @@ impl State {
             .get_exchange_status()?
             .contains(ExchangeStatus::FundingPaused))
     }
+
+    pub fn max_number_of_sub_accounts(&self) -> u64 {
+        if self.max_number_of_sub_accounts <= 5 {
+            return self.max_number_of_sub_accounts as u64;
+        }
+
+        (self.max_number_of_sub_accounts as u64).saturating_mul(100)
+    }
+
+    pub fn get_init_user_fee(&self) -> DriftResult<u64> {
+        let max_init_fee: u64 = (self.max_initialize_user_fee as u64) * LAMPORTS_PER_SOL_U64 / 100;
+
+        let target_utilization: u64 = 8 * PERCENTAGE_PRECISION_U64 / 10;
+
+        let account_space_utilization: u64 = self
+            .number_of_sub_accounts
+            .safe_mul(PERCENTAGE_PRECISION_U64)?
+            .safe_div(self.max_number_of_sub_accounts().max(1))?;
+
+        let init_fee: u64 = if account_space_utilization > target_utilization {
+            max_init_fee
+                .safe_mul(account_space_utilization.safe_sub(target_utilization)?)?
+                .safe_div(PERCENTAGE_PRECISION_U64.safe_sub(target_utilization)?)?
+        } else {
+            0
+        };
+
+        Ok(init_fee)
+    }
 }
 
 impl Size for State {
     const SIZE: usize = 992;
 }
 
-#[derive(Copy, AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(Copy, AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct OracleGuardRails {
     pub price_divergence: PriceDivergenceGuardRails,
     pub validity: ValidityGuardRails,
@@ -107,7 +149,7 @@ impl OracleGuardRails {
     }
 }
 
-#[derive(Copy, AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(Copy, AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct PriceDivergenceGuardRails {
     pub mark_oracle_percent_divergence: u64,
     pub oracle_twap_5min_percent_divergence: u64,
@@ -122,7 +164,7 @@ impl Default for PriceDivergenceGuardRails {
     }
 }
 
-#[derive(Copy, AnchorSerialize, AnchorDeserialize, Clone, Default)]
+#[derive(Copy, AnchorSerialize, AnchorDeserialize, Clone, Default, Debug)]
 pub struct ValidityGuardRails {
     pub slots_before_stale_for_amm: i64,
     pub slots_before_stale_for_margin: i64,
@@ -130,7 +172,7 @@ pub struct ValidityGuardRails {
     pub too_volatile_ratio: i64,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct FeeStructure {
     pub fee_tiers: [FeeTier; 10],
     pub filler_reward_structure: OrderFillerRewardStructure,
@@ -144,7 +186,7 @@ impl Default for FeeStructure {
     }
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Copy, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Copy, Clone, Debug)]
 pub struct FeeTier {
     pub fee_numerator: u32,
     pub fee_denominator: u32,
@@ -171,7 +213,7 @@ impl Default for FeeTier {
     }
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Default, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Default, Clone, Debug)]
 pub struct OrderFillerRewardStructure {
     pub reward_numerator: u32,
     pub reward_denominator: u32,

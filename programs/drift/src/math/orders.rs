@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::ops::{Neg, Sub};
+use std::ops::Sub;
 
 use solana_program::msg;
 
@@ -7,31 +7,37 @@ use crate::controller::position::PositionDelta;
 use crate::controller::position::PositionDirection;
 use crate::error::{DriftResult, ErrorCode};
 use crate::math::amm::calculate_amm_available_liquidity;
-use crate::math::auction::is_auction_complete;
+use crate::math::auction::is_amm_available_liquidity_source;
 use crate::math::casting::Cast;
+use crate::state::fill_mode::FillMode;
 use crate::{
-    math, BASE_PRECISION_I128, OPEN_ORDER_MARGIN_REQUIREMENT, PERCENTAGE_PRECISION,
-    PERCENTAGE_PRECISION_U64, PRICE_PRECISION_I128, QUOTE_PRECISION_I128, SPOT_WEIGHT_PRECISION,
+    load, math, FeeTier, State, BASE_PRECISION_I128, FEE_ADJUSTMENT_MAX,
+    MAX_PREDICTION_MARKET_PRICE, MAX_PREDICTION_MARKET_PRICE_I64, OPEN_ORDER_MARGIN_REQUIREMENT,
+    PERCENTAGE_PRECISION, PERCENTAGE_PRECISION_U64, PRICE_PRECISION_I128, PRICE_PRECISION_U64,
+    QUOTE_PRECISION_I128, SPOT_WEIGHT_PRECISION, SPOT_WEIGHT_PRECISION_I128,
 };
 
 use crate::math::constants::MARGIN_PRECISION_U128;
 use crate::math::margin::{
     calculate_margin_requirement_and_total_collateral_and_liability_info, MarginRequirementType,
 };
-use crate::math::position::calculate_entry_price;
 use crate::math::safe_math::SafeMath;
-use crate::math::spot_balance::{get_strict_token_value, get_token_value};
+use crate::math::spot_balance::get_strict_token_value;
 use crate::math::spot_withdraw::get_max_withdraw_for_market_with_token_amount;
 use crate::math_error;
 use crate::print_error;
+use crate::state::margin_calculation::{MarginCalculation, MarginContext};
+use crate::state::oracle::{OraclePriceData, StrictOraclePrice};
 use crate::state::oracle_map::OracleMap;
-use crate::state::perp_market::PerpMarket;
+use crate::state::order_params::PostOnlyParam;
+use crate::state::perp_market::{PerpMarket, AMM};
 use crate::state::perp_market_map::PerpMarketMap;
-use crate::state::spot_market::{SpotBalanceType, SpotMarket};
+use crate::state::spot_market::SpotMarket;
 use crate::state::spot_market_map::SpotMarketMap;
 use crate::state::user::{
-    MarketType, Order, OrderStatus, OrderTriggerCondition, PerpPosition, User,
+    MarketType, Order, OrderFillSimulation, OrderStatus, OrderTriggerCondition, PerpPosition, User,
 };
+use crate::state::user_map::UserMap;
 use crate::validate;
 
 #[cfg(test)]
@@ -40,44 +46,79 @@ mod tests;
 pub fn calculate_base_asset_amount_for_amm_to_fulfill(
     order: &Order,
     market: &PerpMarket,
-    valid_oracle_price: Option<i64>,
-    slot: u64,
-    override_limit_price: Option<u64>,
+    limit_price: Option<u64>,
+    override_fill_price: Option<u64>,
     existing_base_asset_amount: i64,
+    fee_tier: &FeeTier,
 ) -> DriftResult<(u64, Option<u64>)> {
-    let limit_price = if let Some(override_limit_price) = override_limit_price {
-        if let Some(limit_price) =
-            order.get_limit_price(valid_oracle_price, None, slot, market.amm.order_tick_size)?
-        {
+    let limit_price = if let Some(override_fill_price) = override_fill_price {
+        if let Some(limit_price) = limit_price {
             validate!(
-                (limit_price >= override_limit_price && order.direction == PositionDirection::Long)
-                    || (limit_price <= override_limit_price
+                (limit_price >= override_fill_price && order.direction == PositionDirection::Long)
+                    || (limit_price <= override_fill_price
                         && order.direction == PositionDirection::Short),
                 ErrorCode::InvalidAmmLimitPriceOverride,
                 "override_limit_price={} not better than order_limit_price={}",
-                override_limit_price,
+                override_fill_price,
                 limit_price
             )?;
         }
 
-        Some(override_limit_price)
+        Some(override_fill_price)
     } else {
-        order.get_limit_price(valid_oracle_price, None, slot, market.amm.order_tick_size)?
+        limit_price
     };
 
     if order.must_be_triggered() && !order.triggered() {
         return Ok((0, limit_price));
     }
 
+    let limit_price_with_buffer =
+        calculate_limit_price_with_buffer(order, limit_price, fee_tier, market.fee_adjustment)?;
+
     let base_asset_amount = calculate_base_asset_amount_to_fill_up_to_limit_price(
         order,
         market,
-        limit_price,
+        limit_price_with_buffer,
         Some(existing_base_asset_amount),
     )?;
     let max_base_asset_amount = calculate_amm_available_liquidity(&market.amm, &order.direction)?;
 
     Ok((min(base_asset_amount, max_base_asset_amount), limit_price))
+}
+
+fn calculate_limit_price_with_buffer(
+    order: &Order,
+    limit_price: Option<u64>,
+    fee_tier: &FeeTier,
+    fee_adjustment: i16,
+) -> DriftResult<Option<u64>> {
+    if !order.post_only {
+        Ok(limit_price)
+    } else if let Some(limit_price) = limit_price {
+        let mut buffer = limit_price
+            .safe_mul(fee_tier.maker_rebate_numerator.cast()?)?
+            .safe_div(fee_tier.maker_rebate_denominator.cast()?)?;
+
+        if fee_adjustment < 0 {
+            let buffer_adjustment = buffer
+                .safe_mul(fee_adjustment.abs().cast()?)?
+                .safe_div(FEE_ADJUSTMENT_MAX)?;
+            buffer = buffer.saturating_sub(buffer_adjustment);
+        } else if fee_adjustment > 0 {
+            let buffer_adjustment = buffer
+                .safe_mul(fee_adjustment.cast()?)?
+                .safe_div(FEE_ADJUSTMENT_MAX)?;
+            buffer = buffer.saturating_add(buffer_adjustment);
+        }
+
+        match order.direction {
+            PositionDirection::Long => limit_price.safe_sub(buffer).map(Some),
+            PositionDirection::Short => limit_price.safe_add(buffer).map(Some),
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn calculate_base_asset_amount_to_fill_up_to_limit_price(
@@ -114,30 +155,6 @@ pub fn calculate_base_asset_amount_to_fill_up_to_limit_price(
         min(base_asset_amount_unfilled, max_trade_base_asset_amount),
         market.amm.order_step_size,
     )
-}
-
-pub fn limit_price_satisfied(
-    limit_price: u128,
-    quote_asset_amount: u128,
-    base_asset_amount: u128,
-    direction: PositionDirection,
-) -> DriftResult<bool> {
-    let price = calculate_entry_price(quote_asset_amount, base_asset_amount)?;
-
-    match direction {
-        PositionDirection::Long => {
-            if price > limit_price {
-                return Ok(false);
-            }
-        }
-        PositionDirection::Short => {
-            if price < limit_price {
-                return Ok(false);
-            }
-        }
-    }
-
-    Ok(true)
 }
 
 pub fn calculate_quote_asset_amount_for_maker_order(
@@ -255,19 +272,33 @@ pub fn standardize_price_i64(
     }
 }
 
-#[cfg(test)]
-mod test2 {
-    use crate::controller::position::PositionDirection;
-    use crate::math::orders::standardize_price_i64;
+pub fn get_price_for_perp_order(
+    price: u64,
+    direction: PositionDirection,
+    post_only: PostOnlyParam,
+    amm: &AMM,
+) -> DriftResult<u64> {
+    let mut limit_price = standardize_price(price, amm.order_tick_size, direction)?;
 
-    #[test]
-    fn test() {
-        let price = -1001_i64;
-
-        let result = standardize_price_i64(price, 100, PositionDirection::Long).unwrap();
-
-        println!("result {}", result);
+    if post_only == PostOnlyParam::Slide {
+        let reserve_price = amm.reserve_price()?;
+        match direction {
+            PositionDirection::Long => {
+                let amm_ask = amm.ask_price(reserve_price)?;
+                if limit_price >= amm_ask {
+                    limit_price = amm_ask.safe_sub(amm.order_tick_size)?;
+                }
+            }
+            PositionDirection::Short => {
+                let amm_bid = amm.bid_price(reserve_price)?;
+                if limit_price <= amm_bid {
+                    limit_price = amm_bid.safe_add(amm.order_tick_size)?;
+                }
+            }
+        }
     }
+
+    Ok(limit_price)
 }
 
 pub fn get_position_delta_for_fill(
@@ -284,23 +315,53 @@ pub fn get_position_delta_for_fill(
             PositionDirection::Long => base_asset_amount.cast()?,
             PositionDirection::Short => -base_asset_amount.cast()?,
         },
+        remainder_base_asset_amount: None,
     })
 }
 
-pub fn should_cancel_market_order_after_fill(
+#[inline(always)]
+pub fn validate_perp_fill_possible(
+    state: &State,
     user: &User,
-    user_order_index: usize,
+    order_index: usize,
     slot: u64,
-) -> DriftResult<bool> {
-    let order = &user.orders[user_order_index];
-    if !order.is_market_order() || order.status != OrderStatus::Open {
-        return Ok(false);
+    num_makers: usize,
+    fill_mode: FillMode,
+) -> DriftResult {
+    let amm_available = is_amm_available_liquidity_source(
+        &user.orders[order_index],
+        state.min_perp_auction_duration,
+        slot,
+        fill_mode,
+    )?;
+
+    if !amm_available && num_makers == 0 && user.orders[order_index].is_limit_order() {
+        msg!("invalid fill. order is limit order, amm is not available and no makers present");
+        return Err(ErrorCode::ImpossibleFill);
     }
 
-    Ok(order.has_limit_price(slot)?
-        && is_auction_complete(order.slot, order.auction_duration, slot)?)
+    Ok(())
 }
 
+#[inline(always)]
+pub fn should_expire_order_before_fill(
+    user: &User,
+    order_index: usize,
+    now: i64,
+) -> DriftResult<bool> {
+    let should_order_be_expired = should_expire_order(user, order_index, now)?;
+    if should_order_be_expired && user.orders[order_index].is_limit_order() {
+        let now_sub_buffer = now.safe_sub(15)?;
+        if !should_expire_order(user, order_index, now_sub_buffer)? {
+            msg!("invalid fill. cant force expire limit order until 15s after max_ts. max ts {}, now {}, now plus buffer {}", user.orders[order_index].max_ts, now, now_sub_buffer);
+            return Err(ErrorCode::ImpossibleFill);
+        }
+    }
+
+    Ok(should_order_be_expired)
+}
+
+#[inline(always)]
 pub fn should_expire_order(user: &User, user_order_index: usize, now: i64) -> DriftResult<bool> {
     let order = &user.orders[user_order_index];
     if order.status != OrderStatus::Open || order.max_ts == 0 || order.must_be_triggered() {
@@ -313,43 +374,50 @@ pub fn should_expire_order(user: &User, user_order_index: usize, now: i64) -> Dr
 pub fn should_cancel_reduce_only_order(
     order: &Order,
     existing_base_asset_amount: i64,
+    step_size: u64,
 ) -> DriftResult<bool> {
     let should_cancel = order.status == OrderStatus::Open
         && order.reduce_only
-        && order.get_base_asset_amount_unfilled(Some(existing_base_asset_amount))? == 0;
+        && order.get_base_asset_amount_unfilled(Some(existing_base_asset_amount))? < step_size;
 
     Ok(should_cancel)
 }
 
-pub fn order_breaches_oracle_price_bands(
+pub fn order_breaches_maker_oracle_price_bands(
     order: &Order,
     oracle_price: i64,
     slot: u64,
     tick_size: u64,
     margin_ratio_initial: u32,
-    margin_ratio_maintenance: u32,
+    is_prediction_market: bool,
 ) -> DriftResult<bool> {
-    let order_limit_price =
-        order.force_get_limit_price(Some(oracle_price), None, slot, tick_size)?;
-    limit_price_breaches_oracle_price_bands(
+    let order_limit_price = order.force_get_limit_price(
+        Some(oracle_price),
+        None,
+        slot,
+        tick_size,
+        is_prediction_market,
+    )?;
+    limit_price_breaches_maker_oracle_price_bands(
         order_limit_price,
         order.direction,
         oracle_price,
         margin_ratio_initial,
-        margin_ratio_maintenance,
     )
 }
 
-pub fn limit_price_breaches_oracle_price_bands(
+/// Cancel maker order if there limit price cross the oracle price sufficiently
+/// E.g. if initial margin ratio is .05 and oracle price is 100, then maker limit price must be
+/// less than 105 to be valid
+pub fn limit_price_breaches_maker_oracle_price_bands(
     order_limit_price: u64,
     order_direction: PositionDirection,
     oracle_price: i64,
     margin_ratio_initial: u32,
-    margin_ratio_maintenance: u32,
 ) -> DriftResult<bool> {
     let oracle_price = oracle_price.unsigned_abs();
 
-    let max_percent_diff = margin_ratio_initial.safe_sub(margin_ratio_maintenance)?;
+    let max_percent_diff = margin_ratio_initial;
 
     match order_direction {
         PositionDirection::Long => {
@@ -408,7 +476,20 @@ pub fn validate_fill_price_within_price_bands(
     oracle_twap_5min: i64,
     margin_ratio_initial: u32,
     oracle_twap_5min_percent_divergence: u64,
+    is_prediction_market: bool,
 ) -> DriftResult {
+    if is_prediction_market {
+        validate!(
+            fill_price <= MAX_PREDICTION_MARKET_PRICE,
+            ErrorCode::PriceBandsBreached,
+            "Fill Price Breaches Prediction Market Price Bands: (fill: {} >= oracle: {})",
+            fill_price,
+            PRICE_PRECISION_U64
+        )?;
+
+        return Ok(());
+    }
+
     let oracle_price = oracle_price.unsigned_abs();
     let oracle_twap_5min = oracle_twap_5min.unsigned_abs();
 
@@ -524,62 +605,36 @@ pub fn order_satisfies_trigger_condition(order: &Order, oracle_price: u64) -> Dr
     }
 }
 
-pub fn is_spot_order_risk_decreasing(
+pub fn is_new_order_risk_increasing(
     order: &Order,
-    balance_type: &SpotBalanceType,
-    token_amount: u128,
-) -> DriftResult<bool> {
-    let risk_decreasing = match (balance_type, order.direction) {
-        (SpotBalanceType::Deposit, PositionDirection::Short) => {
-            (order.base_asset_amount as u128) < token_amount.safe_mul(2)?
-        }
-        (SpotBalanceType::Borrow, PositionDirection::Long) => {
-            (order.base_asset_amount as u128) < token_amount.safe_mul(2)?
-        }
-        (_, _) => false,
-    };
-
-    Ok(risk_decreasing)
-}
-
-pub fn is_spot_order_risk_increasing(
-    order: &Order,
-    balance_type: &SpotBalanceType,
-    token_amount: u128,
-) -> DriftResult<bool> {
-    is_spot_order_risk_decreasing(order, balance_type, token_amount)
-        .map(|risk_decreasing| !risk_decreasing)
-}
-
-pub fn is_order_risk_decreasing(
-    order_direction: &PositionDirection,
-    order_base_asset_amount: u64,
     position_base_asset_amount: i64,
+    position_bids: i64,
+    position_asks: i64,
 ) -> DriftResult<bool> {
-    Ok(match order_direction {
-        // User is short and order is long
-        PositionDirection::Long if position_base_asset_amount < 0 => {
-            order_base_asset_amount < position_base_asset_amount.unsigned_abs().safe_mul(2)?
-        }
-        // User is long and order is short
-        PositionDirection::Short if position_base_asset_amount > 0 => {
-            order_base_asset_amount < position_base_asset_amount.unsigned_abs().safe_mul(2)?
-        }
-        _ => false,
-    })
-}
+    if order.reduce_only {
+        return Ok(false);
+    }
 
-pub fn is_order_risk_increasing(
-    order_direction: &PositionDirection,
-    order_base_asset_amount: u64,
-    position_base_asset_amount: i64,
-) -> DriftResult<bool> {
-    is_order_risk_decreasing(
-        order_direction,
-        order_base_asset_amount,
-        position_base_asset_amount,
-    )
-    .map(|risk_decreasing| !risk_decreasing)
+    match order.direction {
+        PositionDirection::Long => {
+            if position_base_asset_amount >= 0 {
+                return Ok(true);
+            }
+
+            Ok(position_bids.safe_add(order.base_asset_amount.cast()?)?
+                > position_base_asset_amount.abs())
+        }
+        PositionDirection::Short => {
+            if position_base_asset_amount <= 0 {
+                return Ok(true);
+            }
+
+            Ok(position_asks
+                .safe_sub(order.base_asset_amount.cast()?)?
+                .abs()
+                > position_base_asset_amount)
+        }
+    }
 }
 
 pub fn is_order_position_reducing(
@@ -662,41 +717,24 @@ pub fn calculate_fill_price(
         .cast::<u64>()
 }
 
-pub fn get_fallback_price(
-    direction: &PositionDirection,
-    bid_price: u64,
-    ask_price: u64,
-    amm_available_liquidity: u64,
-    oracle_price: i64,
-) -> DriftResult<u64> {
-    let oracle_price = oracle_price.unsigned_abs();
-    match direction {
-        PositionDirection::Long if amm_available_liquidity > 0 => {
-            ask_price.safe_add(ask_price / 200)
-        }
-        PositionDirection::Long => oracle_price.safe_add(oracle_price / 20),
-        PositionDirection::Short if amm_available_liquidity > 0 => {
-            bid_price.safe_sub(bid_price / 200)
-        }
-        PositionDirection::Short => oracle_price.safe_sub(oracle_price / 20),
-    }
-}
-
 pub fn get_max_fill_amounts(
     user: &User,
     user_order_index: usize,
     base_market: &SpotMarket,
     quote_market: &SpotMarket,
+    is_leaving_drift: bool,
 ) -> DriftResult<(Option<u64>, Option<u64>)> {
     let direction: PositionDirection = user.orders[user_order_index].direction;
     match direction {
         PositionDirection::Long => {
-            let max_quote = get_max_fill_amounts_for_market(user, quote_market)?.cast::<u64>()?;
+            let max_quote = get_max_fill_amounts_for_market(user, quote_market, is_leaving_drift)?
+                .cast::<u64>()?;
             Ok((None, Some(max_quote)))
         }
         PositionDirection::Short => {
             let max_base = standardize_base_asset_amount(
-                get_max_fill_amounts_for_market(user, base_market)?.cast::<u64>()?,
+                get_max_fill_amounts_for_market(user, base_market, is_leaving_drift)?
+                    .cast::<u64>()?,
                 base_market.order_step_size,
             )?;
             Ok((Some(max_base), None))
@@ -704,58 +742,14 @@ pub fn get_max_fill_amounts(
     }
 }
 
-fn get_max_fill_amounts_for_market(user: &User, market: &SpotMarket) -> DriftResult<u128> {
+fn get_max_fill_amounts_for_market(
+    user: &User,
+    market: &SpotMarket,
+    is_leaving_drift: bool,
+) -> DriftResult<u128> {
     let position_index = user.get_spot_position_index(market.market_index)?;
     let token_amount = user.spot_positions[position_index].get_signed_token_amount(market)?;
-    get_max_withdraw_for_market_with_token_amount(market, token_amount, false)
-}
-
-pub fn find_fallback_maker_order(
-    user: &User,
-    direction: &PositionDirection,
-    market_type: &MarketType,
-    market_index: u16,
-    valid_oracle_price: Option<i64>,
-    slot: u64,
-    tick_size: u64,
-) -> DriftResult<Option<usize>> {
-    let mut best_limit_price = match direction {
-        PositionDirection::Long => 0,
-        PositionDirection::Short => u64::MAX,
-    };
-    let mut fallback_maker_order_index = None;
-
-    for (order_index, order) in user.orders.iter().enumerate() {
-        if order.status != OrderStatus::Open {
-            continue;
-        }
-
-        // if order direction is not same or market type is not same or market index is the same, skip
-        if order.direction != *direction
-            || order.market_type != *market_type
-            || order.market_index != market_index
-        {
-            continue;
-        }
-
-        // if order is not limit order or must be triggered and not triggered, skip
-        if !order.is_limit_order() || (order.must_be_triggered() && !order.triggered()) {
-            continue;
-        }
-
-        let limit_price = order.force_get_limit_price(valid_oracle_price, None, slot, tick_size)?;
-
-        // if fallback maker order is not set, set it else check if this order is better
-        if fallback_maker_order_index.is_none()
-            || *direction == PositionDirection::Long && limit_price > best_limit_price
-            || *direction == PositionDirection::Short && limit_price < best_limit_price
-        {
-            best_limit_price = limit_price;
-            fallback_maker_order_index = Some(order_index);
-        }
-    }
-
-    Ok(fallback_maker_order_index)
+    get_max_withdraw_for_market_with_token_amount(market, token_amount, is_leaving_drift)
 }
 
 pub fn find_maker_orders(
@@ -766,6 +760,7 @@ pub fn find_maker_orders(
     valid_oracle_price: Option<i64>,
     slot: u64,
     tick_size: u64,
+    is_prediction_market: bool,
 ) -> DriftResult<Vec<(usize, u64)>> {
     let mut orders: Vec<(usize, u64)> = Vec::with_capacity(32);
 
@@ -787,7 +782,13 @@ pub fn find_maker_orders(
             continue;
         }
 
-        let limit_price = order.force_get_limit_price(valid_oracle_price, None, slot, tick_size)?;
+        let limit_price = order.force_get_limit_price(
+            valid_oracle_price,
+            None,
+            slot,
+            tick_size,
+            is_prediction_market,
+        )?;
 
         orders.push((order_index, limit_price));
     }
@@ -805,18 +806,22 @@ pub fn calculate_max_perp_order_size(
     oracle_map: &mut OracleMap,
 ) -> DriftResult<u64> {
     // calculate initial margin requirement
-    let (margin_requirement, total_collateral, _, _, _, _) =
-        calculate_margin_requirement_and_total_collateral_and_liability_info(
-            user,
-            perp_market_map,
-            MarginRequirementType::Initial,
-            spot_market_map,
-            oracle_map,
-            None,
-            true,
-        )?;
+    let MarginCalculation {
+        margin_requirement,
+        total_collateral,
+        ..
+    } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+        user,
+        perp_market_map,
+        spot_market_map,
+        oracle_map,
+        MarginContext::standard(MarginRequirementType::Initial).strict(true),
+    )?;
 
-    let free_collateral = total_collateral.safe_sub(margin_requirement.cast()?)?;
+    let user_custom_margin_ratio = user.max_margin_ratio;
+    let user_high_leverage_mode = user.is_high_leverage_mode();
+
+    let free_collateral_before = total_collateral.safe_sub(margin_requirement.cast()?)?;
 
     let perp_market = perp_market_map.get_ref(&market_index)?;
 
@@ -834,78 +839,108 @@ pub fn calculate_max_perp_order_size(
     drop(quote_spot_market);
 
     let perp_position: &PerpPosition = &user.perp_positions[position_index];
-    let base_asset_amount = perp_position.base_asset_amount;
-    let worst_case_base_asset_amount = perp_position.worst_case_base_asset_amount()?;
+    let (worst_case_base_asset_amount, worst_case_liability_value) = perp_position
+        .worst_case_liability_value(oracle_price_data_price, perp_market.contract_type)?;
 
-    let margin_ratio = perp_market.get_margin_ratio(
-        worst_case_base_asset_amount.unsigned_abs(),
-        MarginRequirementType::Initial,
-    )?;
+    let margin_ratio = perp_market
+        .get_margin_ratio(
+            worst_case_base_asset_amount.unsigned_abs(),
+            MarginRequirementType::Initial,
+            user_high_leverage_mode,
+        )?
+        .max(user_custom_margin_ratio);
 
-    let mut order_size_to_flip = 0_u64;
+    let mut order_size_to_reduce_position = 0_u64;
+    let mut free_collateral_released = 0_i128;
     // account for order flipping worst case base asset amount
     if worst_case_base_asset_amount < 0 && direction == PositionDirection::Long {
-        order_size_to_flip = worst_case_base_asset_amount
+        order_size_to_reduce_position = worst_case_base_asset_amount
             .abs()
             .cast::<i64>()?
-            .safe_sub(base_asset_amount.safe_add(perp_position.open_bids)?)?
+            .safe_sub(perp_position.open_bids)?
+            .max(0)
             .unsigned_abs();
+
+        let existing_position_margin_requirement = worst_case_liability_value
+            .safe_mul(margin_ratio.cast()?)?
+            .safe_div(MARGIN_PRECISION_U128)?;
+
+        free_collateral_released = existing_position_margin_requirement.cast()?;
     } else if worst_case_base_asset_amount > 0 && direction == PositionDirection::Short {
-        order_size_to_flip = worst_case_base_asset_amount
-            .neg()
+        order_size_to_reduce_position = worst_case_base_asset_amount
             .cast::<i64>()?
-            .safe_sub(base_asset_amount.safe_add(perp_position.open_asks)?)?
+            .safe_add(perp_position.open_asks)?
+            .max(0)
             .unsigned_abs();
+
+        let existing_position_margin_requirement = worst_case_liability_value
+            .safe_mul(margin_ratio.cast()?)?
+            .safe_div(MARGIN_PRECISION_U128)?;
+
+        free_collateral_released = existing_position_margin_requirement.cast()?;
     }
 
-    if free_collateral <= 0 {
-        let max_risk_reducing_order_size = base_asset_amount
-            .safe_mul(2)?
-            .unsigned_abs()
-            .saturating_sub(1);
+    // if user has no free collateral, just return the order size to reduce position
+    if free_collateral_before <= 0 {
         return standardize_base_asset_amount(
-            order_size_to_flip.min(max_risk_reducing_order_size),
+            order_size_to_reduce_position,
             perp_market.amm.order_step_size,
         );
     }
 
-    let mut order_size = free_collateral
-        .safe_sub(OPEN_ORDER_MARGIN_REQUIREMENT.cast()?)?
-        .safe_mul(BASE_PRECISION_I128 / QUOTE_PRECISION_I128)?
-        .safe_mul(MARGIN_PRECISION_U128.cast()?)?
-        .safe_div(margin_ratio.cast()?)?
-        .safe_mul(PRICE_PRECISION_I128)?
-        .safe_div(oracle_price_data_price.cast()?)?
-        .safe_mul(PRICE_PRECISION_I128)?
-        .safe_div(quote_oracle_price.cast()?)?
-        .cast::<u64>()?;
+    let oracle_price =
+        if !perp_market.is_prediction_market() || direction == PositionDirection::Long {
+            oracle_price_data_price
+        } else {
+            MAX_PREDICTION_MARKET_PRICE_I64.safe_sub(oracle_price_data_price)?
+        };
 
-    let updated_margin_ratio = perp_market.get_margin_ratio(
-        worst_case_base_asset_amount
-            .unsigned_abs()
-            .safe_add(order_size.cast()?)?,
-        MarginRequirementType::Initial,
-    )?;
-
-    if updated_margin_ratio != margin_ratio {
-        order_size = free_collateral
+    let calculate_order_size_and_margin_ratio = |margin_ratio: u32| {
+        let new_order_size = free_collateral_before
+            .safe_add(free_collateral_released)?
             .safe_sub(OPEN_ORDER_MARGIN_REQUIREMENT.cast()?)?
             .safe_mul(BASE_PRECISION_I128 / QUOTE_PRECISION_I128)?
             .safe_mul(MARGIN_PRECISION_U128.cast()?)?
-            .safe_div(updated_margin_ratio.cast()?)?
+            .safe_div(margin_ratio.cast()?)?
             .safe_mul(PRICE_PRECISION_I128)?
-            .safe_div(oracle_price_data_price.cast()?)?
+            .safe_div(oracle_price.cast()?)?
             .safe_mul(PRICE_PRECISION_I128)?
             .safe_div(quote_oracle_price.cast()?)?
             .cast::<u64>()?;
+
+        let new_margin_ratio = perp_market
+            .get_margin_ratio(
+                worst_case_base_asset_amount
+                    .unsigned_abs()
+                    .safe_add(new_order_size.cast()?)?,
+                MarginRequirementType::Initial,
+                user_high_leverage_mode,
+            )?
+            .max(user_custom_margin_ratio);
+
+        Ok((new_order_size, new_margin_ratio))
+    };
+
+    let mut order_size = 0_u64;
+    let mut updated_margin_ratio = margin_ratio;
+    for _ in 0..6 {
+        let (new_order_size, new_margin_ratio) =
+            calculate_order_size_and_margin_ratio(updated_margin_ratio)?;
+        order_size = new_order_size;
+        updated_margin_ratio = new_margin_ratio;
+
+        if new_margin_ratio == margin_ratio {
+            break;
+        }
     }
 
     standardize_base_asset_amount(
-        order_size.safe_add(order_size_to_flip)?,
+        order_size.safe_add(order_size_to_reduce_position)?,
         perp_market.amm.order_step_size,
     )
 }
 
+#[allow(clippy::unwrap_used)]
 pub fn calculate_max_spot_order_size(
     user: &User,
     market_index: u16,
@@ -915,19 +950,24 @@ pub fn calculate_max_spot_order_size(
     oracle_map: &mut OracleMap,
 ) -> DriftResult<u64> {
     // calculate initial margin requirement
-    let (margin_requirement, total_collateral, _, _, _, _) =
-        calculate_margin_requirement_and_total_collateral_and_liability_info(
-            user,
-            perp_market_map,
-            MarginRequirementType::Initial,
-            spot_market_map,
-            oracle_map,
-            None,
-            true,
-        )?;
+    let MarginCalculation {
+        margin_requirement,
+        total_collateral,
+        ..
+    } = calculate_margin_requirement_and_total_collateral_and_liability_info(
+        user,
+        perp_market_map,
+        spot_market_map,
+        oracle_map,
+        MarginContext::standard(MarginRequirementType::Initial).strict(true),
+    )?;
+
+    let user_custom_margin_ratio = user.max_margin_ratio;
+    let user_custom_liability_weight = user.max_margin_ratio.saturating_add(SPOT_WEIGHT_PRECISION);
+    let user_custom_asset_weight = SPOT_WEIGHT_PRECISION.saturating_sub(user_custom_margin_ratio);
 
     let mut order_size_to_flip = 0_u64;
-    let mut free_collateral = total_collateral.safe_sub(margin_requirement.cast()?)?;
+    let free_collateral = total_collateral.safe_sub(margin_requirement.cast()?)?;
 
     let spot_market = spot_market_map.get_ref(&market_index)?;
 
@@ -935,170 +975,200 @@ pub fn calculate_max_spot_order_size(
     let twap = spot_market
         .historical_oracle_data
         .last_oracle_price_twap_5min;
-    let max_oracle_price = oracle_price_data.price.max(twap);
+    let strict_oracle_price = StrictOraclePrice::new(oracle_price_data.price, twap, true);
+    let max_oracle_price = strict_oracle_price.max();
 
     let spot_position = user.get_spot_position(market_index)?;
     let signed_token_amount = spot_position.get_signed_token_amount(&spot_market)?;
-    let (worst_case_token_amount, worst_case_orders_value) = spot_position
-        .get_worst_case_token_amount(
+
+    let [bid_simulation, ask_simulation] = spot_position
+        .simulate_fills_both_sides(
             &spot_market,
-            oracle_price_data,
-            Some(twap),
+            &strict_oracle_price,
             Some(signed_token_amount),
-        )?;
+            MarginRequirementType::Initial,
+        )?
+        .map(|simulation| {
+            simulation
+                .apply_user_custom_margin_ratio(
+                    &spot_market,
+                    strict_oracle_price.current,
+                    user_custom_margin_ratio,
+                )
+                .unwrap()
+        });
 
-    let token_value_before = get_strict_token_value(
-        signed_token_amount,
-        spot_market.decimals,
-        oracle_price_data,
-        twap,
-    )?;
+    let OrderFillSimulation {
+        token_amount: mut worst_case_token_amount,
+        ..
+    } = OrderFillSimulation::riskier_side(ask_simulation, bid_simulation);
 
-    let worst_case_token_value_before =
-        token_value_before.safe_add(worst_case_orders_value.neg())?;
-
-    // account for order flipping worst case base asset amount
+    // account for order flipping worst case
     if worst_case_token_amount < 0 && direction == PositionDirection::Long {
-        // first figure out how much free collateral existing positions/orders consumed
-        let liability_weight = spot_market.get_liability_weight(
-            worst_case_token_amount.unsigned_abs(),
-            &MarginRequirementType::Initial,
-        )?;
+        // to determine order size to flip direction, need to know diff in free collateral
+        let mut free_collateral_difference = bid_simulation
+            .free_collateral_contribution
+            .safe_sub(ask_simulation.free_collateral_contribution)?
+            .max(0)
+            .abs();
 
-        let free_collateral_consumption_before = worst_case_orders_value.safe_add(
-            worst_case_token_value_before
-                .safe_mul(liability_weight.cast()?)?
-                .safe_div(SPOT_WEIGHT_PRECISION.cast()?)?,
-        )?;
+        let mut token_amount = bid_simulation.token_amount;
 
-        // then calculate the free collateral consumed by placing order to flip worst case token amount
+        // the free collateral delta is positive until the worst case hits 0
+        if token_amount < 0 {
+            let token_value =
+                get_strict_token_value(token_amount, spot_market.decimals, &strict_oracle_price)?;
 
-        // e.g. worst case: -15, signed token amount: 2, open bids: 5
-        // then bids_to_flip = 15 - (2 + 5) = 8
-        let bids_to_flip = worst_case_token_amount
+            let liability_weight = spot_market
+                .get_liability_weight(token_amount.unsigned_abs(), &MarginRequirementType::Initial)?
+                .max(user_custom_liability_weight);
+
+            let free_collateral_regained = token_value
+                .abs()
+                .safe_mul(liability_weight.safe_sub(SPOT_WEIGHT_PRECISION)?.cast()?)?
+                .safe_div(SPOT_WEIGHT_PRECISION_I128)?;
+
+            free_collateral_difference =
+                free_collateral_difference.safe_add(free_collateral_regained)?;
+
+            order_size_to_flip = token_amount.abs().cast()?;
+            token_amount = 0;
+        }
+
+        // free collateral delta is negative as the worst case goes above 0
+        let weight = spot_market
+            .get_asset_weight(
+                token_amount.unsigned_abs(),
+                strict_oracle_price.current,
+                &MarginRequirementType::Initial,
+            )?
+            .min(user_custom_asset_weight);
+
+        let free_collateral_delta_per_order = weight
+            .cast::<i128>()?
+            .safe_sub(SPOT_WEIGHT_PRECISION_I128)?
             .abs()
-            .safe_sub(signed_token_amount.safe_add(spot_position.open_bids.cast()?)?)?;
+            .safe_mul(max_oracle_price.cast()?)?
+            .safe_div(PRICE_PRECISION_I128)?
+            .safe_mul(QUOTE_PRECISION_I128)?
+            .safe_div(SPOT_WEIGHT_PRECISION_I128)?;
 
-        let worst_case_quote_amount_after = -get_token_value(
-            spot_position
-                .open_bids
-                .cast::<i128>()?
-                .safe_add(bids_to_flip)?,
-            spot_market.decimals,
-            max_oracle_price,
+        order_size_to_flip = order_size_to_flip.safe_add(
+            free_collateral_difference
+                .safe_mul(spot_market.get_precision().cast()?)?
+                .safe_div(free_collateral_delta_per_order)?
+                .cast::<u64>()?,
         )?;
 
-        let worst_case_token_value_after =
-            token_value_before.safe_add(worst_case_quote_amount_after.neg())?;
-
-        let asset_weight = spot_market.get_asset_weight(
-            worst_case_token_amount.unsigned_abs(),
-            &MarginRequirementType::Initial,
-        )?;
-
-        let free_collateral_consumption_after = worst_case_token_value_after
-            .safe_mul(asset_weight.cast()?)?
-            .safe_div(SPOT_WEIGHT_PRECISION.cast()?)?
-            .safe_add(worst_case_quote_amount_after)?;
-
-        free_collateral = free_collateral.safe_add(
-            free_collateral_consumption_after.safe_sub(free_collateral_consumption_before)?,
-        )?;
-
-        order_size_to_flip = bids_to_flip.cast()?;
+        worst_case_token_amount = token_amount.safe_sub(order_size_to_flip.cast()?)?;
     } else if worst_case_token_amount > 0 && direction == PositionDirection::Short {
-        let asset_weight = spot_market.get_asset_weight(
-            worst_case_token_amount.unsigned_abs(),
-            &MarginRequirementType::Initial,
+        let mut free_collateral_difference = ask_simulation
+            .free_collateral_contribution
+            .safe_sub(bid_simulation.free_collateral_contribution)?
+            .max(0)
+            .abs();
+
+        let mut token_amount = ask_simulation.token_amount;
+
+        if token_amount > 0 {
+            let token_value =
+                get_strict_token_value(token_amount, spot_market.decimals, &strict_oracle_price)?;
+
+            let asset_weight = spot_market
+                .get_asset_weight(
+                    token_amount.unsigned_abs(),
+                    strict_oracle_price.current,
+                    &MarginRequirementType::Initial,
+                )?
+                .min(user_custom_asset_weight);
+
+            let free_collateral_regained = token_value
+                .abs()
+                .safe_mul(SPOT_WEIGHT_PRECISION.safe_sub(asset_weight)?.cast()?)?
+                .safe_div(SPOT_WEIGHT_PRECISION_I128)?;
+
+            free_collateral_difference =
+                free_collateral_difference.safe_add(free_collateral_regained)?;
+
+            order_size_to_flip = token_amount.abs().cast()?;
+            token_amount = 0;
+        }
+
+        let weight = spot_market
+            .get_liability_weight(token_amount.unsigned_abs(), &MarginRequirementType::Initial)?
+            .max(user_custom_liability_weight);
+
+        let free_collateral_delta_per_order = weight
+            .cast::<i128>()?
+            .safe_sub(SPOT_WEIGHT_PRECISION_I128)?
+            .abs()
+            .safe_mul(max_oracle_price.cast()?)?
+            .safe_div(PRICE_PRECISION_I128)?
+            .safe_mul(QUOTE_PRECISION_I128)?
+            .safe_div(SPOT_WEIGHT_PRECISION_I128)?;
+
+        order_size_to_flip = order_size_to_flip.safe_add(
+            free_collateral_difference
+                .safe_mul(spot_market.get_precision().cast()?)?
+                .safe_div(free_collateral_delta_per_order)?
+                .cast::<u64>()?,
         )?;
 
-        let free_collateral_contribution_before = worst_case_token_value_before
-            .safe_mul(asset_weight.cast()?)?
-            .safe_div(SPOT_WEIGHT_PRECISION.cast()?)?
-            .safe_add(worst_case_orders_value)?;
-
-        let asks_to_flip = worst_case_token_amount
-            .neg()
-            .safe_sub(signed_token_amount.safe_add(spot_position.open_asks.cast()?)?)?;
-
-        let worst_case_quote_amount_after = -get_token_value(
-            spot_position
-                .open_asks
-                .cast::<i128>()?
-                .safe_add(asks_to_flip)?,
-            spot_market.decimals,
-            max_oracle_price,
-        )?;
-
-        let worst_case_token_value_after =
-            token_value_before.safe_add(worst_case_quote_amount_after.neg())?;
-
-        let liability_weight = spot_market.get_liability_weight(
-            worst_case_token_amount.unsigned_abs(),
-            &MarginRequirementType::Initial,
-        )?;
-
-        let free_collateral_contribution_after = worst_case_quote_amount_after.safe_add(
-            worst_case_token_value_after
-                .safe_mul(liability_weight.cast()?)?
-                .safe_div(SPOT_WEIGHT_PRECISION.cast()?)?,
-        )?;
-
-        free_collateral = free_collateral.safe_add(
-            free_collateral_contribution_after.safe_sub(free_collateral_contribution_before)?,
-        )?;
-
-        order_size_to_flip = asks_to_flip.abs().cast()?;
+        worst_case_token_amount = token_amount.safe_sub(order_size_to_flip.cast()?)?;
     }
 
     if free_collateral <= 0 {
-        let max_risk_reducing_order_size = signed_token_amount
-            .safe_mul(2)?
-            .abs()
-            .cast::<u64>()?
-            .saturating_sub(1);
-        return standardize_base_asset_amount(
-            order_size_to_flip.min(max_risk_reducing_order_size),
-            spot_market.order_step_size,
-        );
+        return standardize_base_asset_amount(order_size_to_flip, spot_market.order_step_size);
     }
 
     let free_collateral_delta = calculate_free_collateral_delta_for_spot(
         &spot_market,
         worst_case_token_amount.unsigned_abs(),
+        &strict_oracle_price,
         direction,
+        user_custom_liability_weight,
+        user_custom_asset_weight,
     )?;
 
     let precision_increase = 10i128.pow(spot_market.decimals - 6);
 
-    let mut order_size = free_collateral
-        .safe_sub(OPEN_ORDER_MARGIN_REQUIREMENT.cast()?)?
-        .safe_mul(precision_increase)?
-        .safe_mul(SPOT_WEIGHT_PRECISION.cast()?)?
-        .safe_div(free_collateral_delta.cast()?)?
-        .safe_mul(PRICE_PRECISION_I128)?
-        .safe_div(max_oracle_price.cast()?)?
-        .cast::<u64>()?;
-
-    // increasing the worst case token amount with new order size may increase margin ration,
-    // so need to recalculate free collateral delta with updated margin ratio
-    let updated_free_collateral_delta = calculate_free_collateral_delta_for_spot(
-        &spot_market,
-        worst_case_token_amount
-            .unsigned_abs()
-            .safe_add(order_size.cast()?)?,
-        direction,
-    )?;
-
-    if updated_free_collateral_delta != free_collateral_delta {
-        order_size = free_collateral
+    let calculate_order_size_and_free_collateral_delta = |free_collateral_delta: u32| {
+        let new_order_size = free_collateral
             .safe_sub(OPEN_ORDER_MARGIN_REQUIREMENT.cast()?)?
             .safe_mul(precision_increase)?
             .safe_mul(SPOT_WEIGHT_PRECISION.cast()?)?
-            .safe_div(updated_free_collateral_delta.cast()?)?
+            .safe_div(free_collateral_delta.cast()?)?
             .safe_mul(PRICE_PRECISION_I128)?
             .safe_div(max_oracle_price.cast()?)?
             .cast::<u64>()?;
+
+        // increasing the worst case token amount with new order size may increase margin ratio,
+        // so need to recalculate free collateral delta with updated margin ratio
+        let new_free_collateral_delta = calculate_free_collateral_delta_for_spot(
+            &spot_market,
+            worst_case_token_amount
+                .unsigned_abs()
+                .safe_add(new_order_size.cast()?)?,
+            &strict_oracle_price,
+            direction,
+            user_custom_liability_weight,
+            user_custom_asset_weight,
+        )?;
+
+        Ok((new_order_size, new_free_collateral_delta))
+    };
+
+    let mut order_size = 0_u64;
+    let mut updated_free_collateral_delta = free_collateral_delta;
+    for _ in 0..6 {
+        let (new_order_size, new_free_collateral_delta) =
+            calculate_order_size_and_free_collateral_delta(updated_free_collateral_delta)?;
+        order_size = new_order_size;
+        updated_free_collateral_delta = new_free_collateral_delta;
+
+        if updated_free_collateral_delta == free_collateral_delta {
+            break;
+        }
     }
 
     standardize_base_asset_amount(
@@ -1110,16 +1180,169 @@ pub fn calculate_max_spot_order_size(
 fn calculate_free_collateral_delta_for_spot(
     spot_market: &SpotMarket,
     worst_case_token_amount: u128,
+    strict_oracle_price: &StrictOraclePrice,
     order_direction: PositionDirection,
+    user_custom_liability_weight: u32,
+    user_custom_asset_weight: u32,
 ) -> DriftResult<u32> {
     Ok(if order_direction == PositionDirection::Long {
         SPOT_WEIGHT_PRECISION.sub(
             spot_market
-                .get_asset_weight(worst_case_token_amount, &MarginRequirementType::Initial)?,
+                .get_asset_weight(
+                    worst_case_token_amount,
+                    strict_oracle_price.current,
+                    &MarginRequirementType::Initial,
+                )?
+                .min(user_custom_asset_weight),
         )
     } else {
         spot_market
             .get_liability_weight(worst_case_token_amount, &MarginRequirementType::Initial)?
+            .max(user_custom_liability_weight)
             .sub(SPOT_WEIGHT_PRECISION)
     })
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub struct Level {
+    pub price: u64,
+    pub base_asset_amount: u64,
+}
+
+pub fn find_bids_and_asks_from_users(
+    perp_market: &PerpMarket,
+    oracle_price_date: &OraclePriceData,
+    users: &UserMap,
+    slot: u64,
+    now: i64,
+) -> DriftResult<(Vec<Level>, Vec<Level>)> {
+    let mut bids: Vec<Level> = Vec::with_capacity(32);
+    let mut asks: Vec<Level> = Vec::with_capacity(32);
+
+    let market_index = perp_market.market_index;
+    let tick_size = perp_market.amm.order_tick_size;
+    let oracle_price = Some(oracle_price_date.price);
+
+    let mut insert_order = |base_asset_amount: u64, price: u64, direction: PositionDirection| {
+        let orders = match direction {
+            PositionDirection::Long => &mut bids,
+            PositionDirection::Short => &mut asks,
+        };
+        let index = match orders.binary_search_by(|level| match direction {
+            PositionDirection::Long => price.cmp(&level.price),
+            PositionDirection::Short => level.price.cmp(&price),
+        }) {
+            Ok(index) => index,
+            Err(index) => index,
+        };
+
+        if index < orders.capacity() {
+            if orders.len() == orders.capacity() {
+                orders.pop();
+            }
+
+            orders.insert(
+                index,
+                Level {
+                    price,
+                    base_asset_amount,
+                },
+            );
+        }
+    };
+
+    for account_loader in users.0.values() {
+        let user = load!(account_loader)?;
+
+        for (_, order) in user.orders.iter().enumerate() {
+            if order.status != OrderStatus::Open {
+                continue;
+            }
+
+            if order.market_type != MarketType::Perp || order.market_index != market_index {
+                continue;
+            }
+
+            // if order is not limit order or must be triggered and not triggered, skip
+            if !order.is_limit_order() || (order.must_be_triggered() && !order.triggered()) {
+                continue;
+            }
+
+            if !order.is_resting_limit_order(slot)? {
+                continue;
+            }
+
+            if now > order.max_ts && order.max_ts != 0 {
+                continue;
+            }
+
+            let existing_position = user.get_perp_position(market_index)?.base_asset_amount;
+            let base_amount = order.get_base_asset_amount_unfilled(Some(existing_position))?;
+            let limit_price = order.force_get_limit_price(
+                oracle_price,
+                None,
+                slot,
+                tick_size,
+                perp_market.is_prediction_market(),
+            )?;
+
+            insert_order(base_amount, limit_price, order.direction);
+        }
+    }
+
+    Ok((bids, asks))
+}
+
+pub fn estimate_price_from_side(side: &Vec<Level>, depth: u64) -> DriftResult<Option<u64>> {
+    let mut depth_remaining = depth;
+    let mut cumulative_base = 0_u64;
+    let mut cumulative_quote = 0_u128;
+
+    for level in side {
+        let base_delta = level.base_asset_amount.min(depth_remaining);
+        let quote_delta = level.price.cast::<u128>()?.safe_mul(base_delta.cast()?)?;
+
+        cumulative_base = cumulative_base.safe_add(base_delta)?;
+        depth_remaining = depth_remaining.safe_sub(base_delta)?;
+        cumulative_quote = cumulative_quote.safe_add(quote_delta)?;
+
+        if depth_remaining == 0 {
+            break;
+        }
+    }
+
+    let price = if depth_remaining == 0 {
+        Some(
+            cumulative_quote
+                .safe_div(cumulative_base.cast()?)?
+                .cast::<u64>()?,
+        )
+    } else {
+        None
+    };
+
+    Ok(price)
+}
+
+pub fn select_margin_type_for_perp_maker(
+    maker: &User,
+    base_asset_amount_filled: i64,
+    market_index: u16,
+) -> DriftResult<MarginRequirementType> {
+    let position_after_fill = maker
+        .get_perp_position(market_index)
+        .map_or(0, |p| p.base_asset_amount);
+    let position_before = position_after_fill.safe_sub(base_asset_amount_filled)?;
+
+    if position_after_fill == 0 {
+        return Ok(MarginRequirementType::Maintenance);
+    }
+
+    if position_after_fill.signum() == position_before.signum()
+        && position_after_fill.abs() < position_before.abs()
+    {
+        return Ok(MarginRequirementType::Maintenance);
+    }
+
+    Ok(MarginRequirementType::Fill)
 }

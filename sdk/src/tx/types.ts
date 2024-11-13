@@ -1,5 +1,6 @@
 import {
 	AddressLookupTableAccount,
+	BlockhashWithExpiryBlockHeight,
 	ConfirmOptions,
 	Signer,
 	Transaction,
@@ -8,6 +9,12 @@ import {
 	VersionedTransaction,
 } from '@solana/web3.js';
 import { IWallet } from '../types';
+
+export enum ConfirmationStrategy {
+	WebSocket = 'websocket',
+	Polling = 'polling',
+	Combo = 'combo',
+}
 
 export type TxSigAndSlot = {
 	txSig: TransactionSignature;
@@ -35,7 +42,8 @@ export interface TxSender {
 		ixs: TransactionInstruction[],
 		lookupTableAccounts: AddressLookupTableAccount[],
 		additionalSigners?: Array<Signer>,
-		opts?: ConfirmOptions
+		opts?: ConfirmOptions,
+		blockhash?: BlockhashWithExpiryBlockHeight
 	): Promise<VersionedTransaction>;
 
 	sendRawTransaction(
@@ -43,5 +51,21 @@ export interface TxSender {
 		opts: ConfirmOptions
 	): Promise<TxSigAndSlot>;
 
+	simulateTransaction(tx: VersionedTransaction): Promise<boolean>;
+
 	getTimeoutCount(): number;
+	getSuggestedPriorityFeeMultiplier(): number;
+	getTxLandRate(): number;
+}
+
+export class TxSendError extends Error {
+	constructor(
+		public message: string,
+		public code: number
+	) {
+		super(message);
+		if (Error.captureStackTrace) {
+			Error.captureStackTrace(this, TxSendError);
+		}
+	}
 }

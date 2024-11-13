@@ -8,7 +8,7 @@ use crate::error::{DriftResult, ErrorCode};
 use crate::math::bn::U192;
 use crate::math::casting::Cast;
 use crate::math::constants::{
-    BID_ASK_SPREAD_PRECISION, BID_ASK_SPREAD_PRECISION_I128, CONCENTRATION_PRECISION,
+    BID_ASK_SPREAD_PRECISION_I128, CONCENTRATION_PRECISION,
     DEFAULT_MAX_TWAP_UPDATE_PRICE_BAND_DENOMINATOR, FIVE_MINUTE, ONE_HOUR, ONE_MINUTE,
     PRICE_TIMES_AMM_TO_QUOTE_PRECISION_RATIO, PRICE_TIMES_AMM_TO_QUOTE_PRECISION_RATIO_I128,
     PRICE_TO_PEG_PRECISION_RATIO, QUOTE_PRECISION_I64,
@@ -62,26 +62,6 @@ pub fn calculate_bid_ask_bounds(
     Ok((bid_bounded_base, ask_bounded_base))
 }
 
-pub fn calculate_terminal_price(amm: &mut AMM) -> DriftResult<u64> {
-    let swap_direction = if amm.base_asset_amount_with_amm > 0 {
-        SwapDirection::Add
-    } else {
-        SwapDirection::Remove
-    };
-    let (new_quote_asset_amount, new_base_asset_amount) = calculate_swap_output(
-        amm.base_asset_amount_with_amm.unsigned_abs(),
-        amm.base_asset_reserve,
-        swap_direction,
-        amm.sqrt_k,
-    )?;
-
-    calculate_price(
-        new_quote_asset_amount,
-        new_base_asset_amount,
-        amm.peg_multiplier,
-    )
-}
-
 pub fn calculate_market_open_bids_asks(amm: &AMM) -> DriftResult<(i128, i128)> {
     let base_asset_reserve = amm.base_asset_reserve;
     let min_base_asset_reserve = amm.min_base_asset_reserve;
@@ -122,13 +102,53 @@ pub fn _calculate_market_open_bids_asks(
     Ok((max_bids, max_asks))
 }
 
-pub fn update_mark_twap(
+pub fn update_mark_twap_crank(
     amm: &mut AMM,
     now: i64,
+    oracle_price_data: &OraclePriceData,
+    best_dlob_bid_price: Option<u64>,
+    best_dlob_ask_price: Option<u64>,
+    sanitize_clamp: Option<i64>,
+) -> DriftResult {
+    let amm_reserve_price = amm.reserve_price()?;
+    let (amm_bid_price, amm_ask_price) = amm.bid_ask_price(amm_reserve_price)?;
+
+    let mut best_bid_price = match best_dlob_bid_price {
+        Some(best_dlob_bid_price) => best_dlob_bid_price.max(amm_bid_price),
+        None => amm_bid_price,
+    };
+
+    let mut best_ask_price = match best_dlob_ask_price {
+        Some(best_dlob_ask_price) => best_dlob_ask_price.min(amm_ask_price),
+        None => amm_ask_price,
+    };
+
+    // handle crossing bid/ask
+    if best_bid_price > best_ask_price {
+        if best_bid_price >= oracle_price_data.price.cast()? {
+            best_bid_price = best_ask_price;
+        } else {
+            best_ask_price = best_bid_price;
+        }
+    }
+
+    update_mark_twap(
+        amm,
+        now,
+        best_bid_price,
+        best_ask_price,
+        None,
+        sanitize_clamp,
+    )?;
+
+    Ok(())
+}
+
+pub fn estimate_best_bid_ask_price(
+    amm: &mut AMM,
     precomputed_trade_price: Option<u64>,
     direction: Option<PositionDirection>,
-    sanitize_clamp: Option<i64>,
-) -> DriftResult<u64> {
+) -> DriftResult<(u64, u64)> {
     let base_spread_u64 = amm.base_spread.cast::<u64>()?;
     let last_oracle_price_u64 = amm.historical_oracle_data.last_oracle_price.cast::<u64>()?;
 
@@ -153,7 +173,9 @@ pub fn update_mark_twap(
     // trade is a long
     let best_bid_estimate = if trade_premium > 0 {
         let discount = min(base_spread_u64, amm.short_spread.cast::<u64>()? / 2);
-        last_oracle_price_u64.safe_sub(discount.min(trade_premium.unsigned_abs()))?
+        last_oracle_price_u64
+            .saturating_sub(discount.min(trade_premium.unsigned_abs()))
+            .max(amm.order_tick_size)
     } else {
         trade_price
     }
@@ -161,7 +183,7 @@ pub fn update_mark_twap(
 
     // trade is a short
     let best_ask_estimate = if trade_premium < 0 {
-        let premium = min(base_spread_u64, amm.long_spread.cast::<u64>()? / 2);
+        let premium: u64 = min(base_spread_u64, amm.long_spread.cast::<u64>()? / 2);
         last_oracle_price_u64.safe_add(premium.min(trade_premium.unsigned_abs()))?
     } else {
         trade_price
@@ -189,7 +211,18 @@ pub fn update_mark_twap(
         best_ask_estimate,
     )?;
 
-    let (mut bid_price_capped_update, mut ask_price_capped_update) = (
+    Ok((bid_price, ask_price))
+}
+
+pub fn update_mark_twap(
+    amm: &mut AMM,
+    now: i64,
+    bid_price: u64,
+    ask_price: u64,
+    precomputed_trade_price: Option<u64>,
+    sanitize_clamp: Option<i64>,
+) -> DriftResult<u64> {
+    let (bid_price_capped_update, ask_price_capped_update) = (
         sanitize_new_price(
             bid_price.cast()?,
             amm.last_bid_price_twap.cast()?,
@@ -212,48 +245,50 @@ pub fn update_mark_twap(
         .last_oracle_price_twap_ts
         .safe_sub(amm.last_mark_price_twap_ts)?;
 
-    // if an delayed more than 10th of funding period, shrink toward oracle_twap
-    (bid_price_capped_update, ask_price_capped_update) =
-        if last_valid_trade_since_oracle_twap_update
-            > amm.funding_period.safe_div(60)?.max(ONE_MINUTE.cast()?)
-        {
-            msg!(
-                "correcting mark twap update (oracle previously invalid for {:?} seconds)",
-                last_valid_trade_since_oracle_twap_update
-            );
+    // if an delayed more than ONE_MINUTE or 60th of funding period, shrink toward oracle_twap
+    let (last_bid_price_twap, last_ask_price_twap) = if last_valid_trade_since_oracle_twap_update
+        > amm.funding_period.safe_div(60)?.max(ONE_MINUTE.cast()?)
+    {
+        msg!(
+            "correcting mark twap update (oracle previously invalid for {:?} seconds)",
+            last_valid_trade_since_oracle_twap_update
+        );
 
-            let from_start_valid = max(
-                0,
-                amm.funding_period
-                    .safe_sub(last_valid_trade_since_oracle_twap_update)?,
-            );
-            (
-                calculate_weighted_average(
-                    amm.historical_oracle_data
-                        .last_oracle_price_twap
-                        .cast::<i64>()?,
-                    bid_price_capped_update,
-                    last_valid_trade_since_oracle_twap_update,
-                    from_start_valid,
-                )?,
-                calculate_weighted_average(
-                    amm.historical_oracle_data
-                        .last_oracle_price_twap
-                        .cast::<i64>()?,
-                    ask_price_capped_update,
-                    last_valid_trade_since_oracle_twap_update,
-                    from_start_valid,
-                )?,
-            )
-        } else {
-            (bid_price_capped_update, ask_price_capped_update)
-        };
+        let from_start_valid = max(
+            0,
+            amm.funding_period
+                .safe_sub(last_valid_trade_since_oracle_twap_update)?,
+        );
+        (
+            calculate_weighted_average(
+                amm.historical_oracle_data
+                    .last_oracle_price_twap
+                    .cast::<i64>()?,
+                amm.last_bid_price_twap.cast()?,
+                last_valid_trade_since_oracle_twap_update,
+                from_start_valid,
+            )?,
+            calculate_weighted_average(
+                amm.historical_oracle_data
+                    .last_oracle_price_twap
+                    .cast::<i64>()?,
+                amm.last_ask_price_twap.cast()?,
+                last_valid_trade_since_oracle_twap_update,
+                from_start_valid,
+            )?,
+        )
+    } else {
+        (
+            amm.last_bid_price_twap.cast()?,
+            amm.last_ask_price_twap.cast()?,
+        )
+    };
 
     // update bid and ask twaps
     let bid_twap = calculate_new_twap(
         bid_price_capped_update,
         now,
-        amm.last_bid_price_twap.cast()?,
+        last_bid_price_twap,
         amm.last_mark_price_twap_ts,
         amm.funding_period,
     )?;
@@ -262,7 +297,7 @@ pub fn update_mark_twap(
     let ask_twap = calculate_new_twap(
         ask_price_capped_update,
         now,
-        amm.last_ask_price_twap.cast()?,
+        last_ask_price_twap,
         amm.last_mark_price_twap_ts,
         amm.funding_period,
     )?;
@@ -272,6 +307,10 @@ pub fn update_mark_twap(
     let mid_twap = bid_twap.safe_add(ask_twap)? / 2;
 
     // update std stat
+    let trade_price: u64 = match precomputed_trade_price {
+        Some(trade_price) => trade_price,
+        None => bid_price.safe_add(ask_price)?.safe_div(2)?,
+    };
     update_amm_mark_std(amm, now, trade_price, amm.last_mark_price_twap)?;
 
     amm.last_mark_price_twap = mid_twap.cast()?;
@@ -290,6 +329,25 @@ pub fn update_mark_twap(
     amm.last_mark_price_twap_ts = now;
 
     mid_twap.cast()
+}
+
+pub fn update_mark_twap_from_estimates(
+    amm: &mut AMM,
+    now: i64,
+    precomputed_trade_price: Option<u64>,
+    direction: Option<PositionDirection>,
+    sanitize_clamp: Option<i64>,
+) -> DriftResult<u64> {
+    let (bid_price, ask_price) =
+        estimate_best_bid_ask_price(amm, precomputed_trade_price, direction)?;
+    update_mark_twap(
+        amm,
+        now,
+        bid_price,
+        ask_price,
+        precomputed_trade_price,
+        sanitize_clamp,
+    )
 }
 
 pub fn sanitize_new_price(
@@ -372,10 +430,11 @@ pub fn update_oracle_price_twap(
 
         amm.last_oracle_normalised_price = capped_oracle_update_price;
         amm.historical_oracle_data.last_oracle_price = oracle_price_data.price;
-        amm.last_oracle_conf_pct = oracle_price_data
-            .confidence
-            .safe_mul(BID_ASK_SPREAD_PRECISION)?
-            .safe_div(reserve_price)? as u64;
+
+        // use decayed last_oracle_conf_pct as lower bound
+        amm.last_oracle_conf_pct =
+            amm.get_new_oracle_conf_pct(oracle_price_data.confidence, reserve_price, now)?;
+
         amm.historical_oracle_data.last_oracle_delay = oracle_price_data.delay;
         amm.last_oracle_reserve_price_spread_pct =
             calculate_oracle_reserve_price_spread_pct(amm, oracle_price_data, Some(reserve_price))?;
@@ -577,7 +636,6 @@ pub fn calculate_quote_asset_amount_swapped(
 ) -> DriftResult<u128> {
     let mut quote_asset_reserve_change = match swap_direction {
         SwapDirection::Add => quote_asset_reserve_before.safe_sub(quote_asset_reserve_after)?,
-
         SwapDirection::Remove => quote_asset_reserve_after.safe_sub(quote_asset_reserve_before)?,
     };
 
@@ -706,15 +764,11 @@ pub fn calculate_oracle_reserve_price_spread_pct(
         .cast()
 }
 
-pub fn calculate_oracle_twap_5min_mark_spread_pct(
+pub fn calculate_oracle_twap_5min_price_spread_pct(
     amm: &AMM,
-    precomputed_reserve_price: Option<u64>,
+    other_price: u64,
 ) -> DriftResult<i64> {
-    let reserve_price = match precomputed_reserve_price {
-        Some(reserve_price) => reserve_price,
-        None => amm.reserve_price()?,
-    };
-    let price_spread = reserve_price
+    let price_spread = other_price
         .cast::<i64>()?
         .safe_sub(amm.historical_oracle_data.last_oracle_price_twap_5min)?;
 
@@ -722,7 +776,7 @@ pub fn calculate_oracle_twap_5min_mark_spread_pct(
     price_spread
         .cast::<i128>()?
         .safe_mul(BID_ASK_SPREAD_PRECISION_I128)?
-        .safe_div(reserve_price.cast::<i128>()?)? // todo? better for spread logic
+        .safe_div(other_price.cast::<i128>()?)? // todo? better for spread logic
         .cast()
 }
 
@@ -766,7 +820,9 @@ pub fn calculate_amm_available_liquidity(
 }
 
 pub fn calculate_net_user_cost_basis(amm: &AMM) -> DriftResult<i128> {
-    Ok(amm.quote_asset_amount)
+    amm.quote_asset_amount
+        .safe_add(amm.quote_asset_amount_with_unsettled_lp.cast()?)?
+        .safe_add(amm.net_unsettled_funding_pnl.cast()?)
 }
 
 pub fn calculate_net_user_pnl(amm: &AMM, oracle_price: i64) -> DriftResult<i128> {
@@ -778,6 +834,7 @@ pub fn calculate_net_user_pnl(amm: &AMM, oracle_price: i64) -> DriftResult<i128>
 
     let net_user_base_asset_value = amm
         .base_asset_amount_with_amm
+        .safe_add(amm.base_asset_amount_with_unsettled_lp)?
         .safe_mul(oracle_price.cast()?)?
         .safe_div(PRICE_TIMES_AMM_TO_QUOTE_PRECISION_RATIO.cast()?)?;
 
@@ -787,12 +844,11 @@ pub fn calculate_net_user_pnl(amm: &AMM, oracle_price: i64) -> DriftResult<i128>
 pub fn calculate_expiry_price(
     amm: &AMM,
     target_price: i64,
-    pnl_pool_amount: u128,
+    total_excess_balance: i128,
 ) -> DriftResult<i64> {
-    if amm.base_asset_amount_with_amm == 0 {
+    if amm.base_asset_amount_with_amm.abs() < amm.order_step_size.cast::<i128>()? {
         return Ok(target_price);
     }
-
     // net_baa * price + net_quote <= 0
     // net_quote/net_baa <= -price
 
@@ -800,17 +856,17 @@ pub fn calculate_expiry_price(
     // net_user_unrealized_pnl positive = expiry price needs to differ from oracle
     let best_expiry_price = -(amm
         .quote_asset_amount
-        .safe_sub(pnl_pool_amount.cast::<i128>()?)?
+        .safe_sub(total_excess_balance.cast::<i128>()?)?
         .safe_mul(PRICE_TIMES_AMM_TO_QUOTE_PRECISION_RATIO_I128)?
         .safe_div(amm.base_asset_amount_with_amm)?)
     .cast::<i64>()?;
 
-    let expiry_price = if amm.base_asset_amount_with_amm > 0 {
+    let expiry_price = if amm.base_asset_amount_with_amm >= 0 {
         // net longs only get as high as oracle_price
-        best_expiry_price.min(target_price).safe_sub(1)?
+        best_expiry_price.min(target_price).saturating_sub(1)
     } else {
         // net shorts only get as low as oracle price
-        best_expiry_price.max(target_price).safe_add(1)?
+        best_expiry_price.max(target_price).saturating_add(1)
     };
 
     Ok(expiry_price)

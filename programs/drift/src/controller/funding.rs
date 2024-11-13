@@ -1,4 +1,4 @@
-use std::cmp::{max, min};
+use std::cmp::max;
 
 use anchor_lang::prelude::*;
 use solana_program::clock::UnixTimestamp;
@@ -11,7 +11,9 @@ use crate::error::DriftResult;
 use crate::get_then_update_id;
 use crate::math::amm;
 use crate::math::casting::Cast;
-use crate::math::constants::{FUNDING_RATE_BUFFER, ONE_HOUR_I128, TWENTY_FOUR_HOUR};
+use crate::math::constants::{
+    FUNDING_RATE_BUFFER, FUNDING_RATE_OFFSET_DENOMINATOR, ONE_HOUR_I128, TWENTY_FOUR_HOUR,
+};
 use crate::math::funding::{calculate_funding_payment, calculate_funding_rate_long_short};
 use crate::math::helpers::on_the_hour_update;
 use crate::math::safe_math::SafeMath;
@@ -77,6 +79,10 @@ pub fn settle_funding_payment(
 
         market_position.last_cumulative_funding_rate = amm_cumulative_funding_rate.cast()?;
         update_quote_asset_and_break_even_amount(market_position, market, market_funding_payment)?;
+        market.amm.net_unsettled_funding_pnl = market
+            .amm
+            .net_unsettled_funding_pnl
+            .safe_sub(market_funding_payment)?;
     }
 
     Ok(())
@@ -136,6 +142,10 @@ pub fn settle_funding_payments(
                 market,
                 market_funding_payment,
             )?;
+            market.amm.net_unsettled_funding_pnl = market
+                .amm
+                .net_unsettled_funding_pnl
+                .safe_sub(market_funding_payment)?;
         }
     }
 
@@ -148,6 +158,7 @@ pub fn update_funding_rate(
     market: &mut PerpMarket,
     oracle_map: &mut OracleMap,
     now: UnixTimestamp,
+    slot: u64,
     guard_rails: &OracleGuardRails,
     funding_paused: bool,
     precomputed_reserve_price: Option<u64>,
@@ -161,7 +172,8 @@ pub fn update_funding_rate(
         market,
         oracle_map.get_price_data(&market.amm.oracle)?,
         guard_rails,
-        Some(reserve_price),
+        reserve_price,
+        slot,
     )?;
 
     let time_until_next_update = on_the_hour_update(
@@ -202,7 +214,7 @@ pub fn update_funding_rate(
             };
 
         let sanitize_clamp_denominator = market.get_sanitize_clamp_denominator()?;
-        let mid_price_twap = amm::update_mark_twap(
+        let mid_price_twap = amm::update_mark_twap_from_estimates(
             &mut market.amm,
             now,
             Some(execution_premium_price),
@@ -217,9 +229,18 @@ pub fn update_funding_rate(
         // low periodicity => quickly updating/settled funding rates => lower funding rate payment per interval
         let price_spread = mid_price_twap.cast::<i64>()?.safe_sub(oracle_price_twap)?;
 
-        // clamp price divergence to 3% for funding rate calculation
-        let max_price_spread = oracle_price_twap.safe_div(33)?; // 3%
-        let clamped_price_spread = max(-max_price_spread, min(price_spread, max_price_spread));
+        // add offset 1/FUNDING_RATE_OFFSET_DENOMINATOR*365. if FUNDING_RATE_OFFSET_DENOMINATOR = 5000 => 7.3% annualized rate
+        let price_spread_with_offset = price_spread.safe_add(
+            oracle_price_twap
+                .abs()
+                .safe_div(FUNDING_RATE_OFFSET_DENOMINATOR)?,
+        )?;
+
+        // clamp price divergence based on contract tier for funding rate calculation
+        let max_price_spread =
+            market.get_max_price_divergence_for_funding_rate(oracle_price_twap)?;
+        let clamped_price_spread =
+            price_spread_with_offset.clamp(-max_price_spread, max_price_spread);
 
         let funding_rate = clamped_price_spread
             .cast::<i128>()?
@@ -257,6 +278,12 @@ pub fn update_funding_rate(
             market.amm.last_funding_rate_ts,
             TWENTY_FOUR_HOUR,
         )?;
+
+        market.amm.net_unsettled_funding_pnl = market
+            .amm
+            .net_unsettled_funding_pnl
+            .safe_sub(funding_imbalance_revenue.cast()?)?;
+
         market.amm.last_funding_rate_ts = now;
 
         emit!(FundingRateRecord {

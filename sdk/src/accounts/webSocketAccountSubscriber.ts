@@ -1,6 +1,11 @@
-import { DataAndSlot, BufferAndSlot, AccountSubscriber } from './types';
+import {
+	DataAndSlot,
+	BufferAndSlot,
+	AccountSubscriber,
+	ResubOpts,
+} from './types';
 import { AnchorProvider, Program } from '@coral-xyz/anchor';
-import { AccountInfo, Context, PublicKey } from '@solana/web3.js';
+import { AccountInfo, Commitment, Context, PublicKey } from '@solana/web3.js';
 import { capitalize } from './utils';
 import * as Buffer from 'buffer';
 
@@ -14,20 +19,40 @@ export class WebSocketAccountSubscriber<T> implements AccountSubscriber<T> {
 	onChange: (data: T) => void;
 	listenerId?: number;
 
+	resubOpts?: ResubOpts;
+
+	commitment?: Commitment;
+	isUnsubscribing = false;
+
+	timeoutId?: NodeJS.Timeout;
+
+	receivingData: boolean;
+
 	public constructor(
 		accountName: string,
 		program: Program,
 		accountPublicKey: PublicKey,
-		decodeBuffer?: (buffer: Buffer) => T
+		decodeBuffer?: (buffer: Buffer) => T,
+		resubOpts?: ResubOpts,
+		commitment?: Commitment
 	) {
 		this.accountName = accountName;
 		this.program = program;
 		this.accountPublicKey = accountPublicKey;
 		this.decodeBufferFn = decodeBuffer;
+		this.resubOpts = resubOpts;
+		if (this.resubOpts?.resubTimeoutMs < 1000) {
+			console.log(
+				'resubTimeoutMs should be at least 1000ms to avoid spamming resub'
+			);
+		}
+		this.receivingData = false;
+		this.commitment =
+			commitment ?? (this.program.provider as AnchorProvider).opts.commitment;
 	}
 
 	async subscribe(onChange: (data: T) => void): Promise<void> {
-		if (this.listenerId) {
+		if (this.listenerId != null || this.isUnsubscribing) {
 			return;
 		}
 
@@ -39,10 +64,22 @@ export class WebSocketAccountSubscriber<T> implements AccountSubscriber<T> {
 		this.listenerId = this.program.provider.connection.onAccountChange(
 			this.accountPublicKey,
 			(accountInfo, context) => {
-				this.handleRpcResponse(context, accountInfo);
+				if (this.resubOpts?.resubTimeoutMs) {
+					this.receivingData = true;
+					clearTimeout(this.timeoutId);
+					this.handleRpcResponse(context, accountInfo);
+					this.setTimeout();
+				} else {
+					this.handleRpcResponse(context, accountInfo);
+				}
 			},
-			(this.program.provider as AnchorProvider).opts.commitment
+			this.commitment
 		);
+
+		if (this.resubOpts?.resubTimeoutMs) {
+			this.receivingData = true;
+			this.setTimeout();
+		}
 	}
 
 	setData(data: T, slot?: number): void {
@@ -55,6 +92,32 @@ export class WebSocketAccountSubscriber<T> implements AccountSubscriber<T> {
 			data,
 			slot,
 		};
+	}
+
+	protected setTimeout(): void {
+		if (!this.onChange) {
+			throw new Error('onChange callback function must be set');
+		}
+		this.timeoutId = setTimeout(
+			async () => {
+				if (this.isUnsubscribing) {
+					// If we are in the process of unsubscribing, do not attempt to resubscribe
+					return;
+				}
+
+				if (this.receivingData) {
+					if (this.resubOpts?.logResubMessages) {
+						console.log(
+							`No ws data from ${this.accountName} in ${this.resubOpts.resubTimeoutMs}ms, resubscribing`
+						);
+					}
+					await this.unsubscribe(true);
+					this.receivingData = false;
+					await this.subscribe(this.onChange);
+				}
+			},
+			this.resubOpts?.resubTimeoutMs
+		);
 	}
 
 	async fetch(): Promise<void> {
@@ -89,7 +152,7 @@ export class WebSocketAccountSubscriber<T> implements AccountSubscriber<T> {
 			return;
 		}
 
-		if (newSlot <= this.bufferAndSlot.slot) {
+		if (newSlot < this.bufferAndSlot.slot) {
 			return;
 		}
 
@@ -119,14 +182,24 @@ export class WebSocketAccountSubscriber<T> implements AccountSubscriber<T> {
 		}
 	}
 
-	unsubscribe(): Promise<void> {
-		if (this.listenerId) {
-			const promise =
-				this.program.provider.connection.removeAccountChangeListener(
-					this.listenerId
-				);
-			this.listenerId = undefined;
+	unsubscribe(onResub = false): Promise<void> {
+		if (!onResub && this.resubOpts) {
+			this.resubOpts.resubTimeoutMs = undefined;
+		}
+		this.isUnsubscribing = true;
+		clearTimeout(this.timeoutId);
+		this.timeoutId = undefined;
+
+		if (this.listenerId != null) {
+			const promise = this.program.provider.connection
+				.removeAccountChangeListener(this.listenerId)
+				.then(() => {
+					this.listenerId = undefined;
+					this.isUnsubscribing = false;
+				});
 			return promise;
+		} else {
+			this.isUnsubscribing = false;
 		}
 	}
 }

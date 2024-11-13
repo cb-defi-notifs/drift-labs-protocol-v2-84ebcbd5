@@ -1,4 +1,5 @@
-import { PerpMarketAccount, SpotMarketAccount } from '.';
+import { ConfirmOptions } from '@solana/web3.js';
+import { PerpMarketAccount, PublicKey, SpotMarketAccount } from '.';
 import {
 	DevnetPerpMarkets,
 	MainnetPerpMarkets,
@@ -13,50 +14,79 @@ import {
 } from './constants/spotMarkets';
 import { OracleInfo } from './oracles/types';
 import { Program, ProgramAccount } from '@coral-xyz/anchor';
+import {
+	ON_DEMAND_DEVNET_PID,
+	ON_DEMAND_MAINNET_PID,
+} from '@switchboard-xyz/on-demand';
 
 type DriftConfig = {
 	ENV: DriftEnv;
 	PYTH_ORACLE_MAPPING_ADDRESS: string;
 	DRIFT_PROGRAM_ID: string;
+	JIT_PROXY_PROGRAM_ID?: string;
+	DRIFT_ORACLE_RECEIVER_ID: string;
 	USDC_MINT_ADDRESS: string;
 	SERUM_V3: string;
 	PHOENIX: string;
+	OPENBOOK: string;
 	V2_ALPHA_TICKET_MINT_ADDRESS: string;
 	PERP_MARKETS: PerpMarketConfig[];
 	SPOT_MARKETS: SpotMarketConfig[];
 	MARKET_LOOKUP_TABLE: string;
+	SERUM_LOOKUP_TABLE?: string;
+	PYTH_PULL_ORACLE_LOOKUP_TABLE?: string;
+	SB_ON_DEMAND_PID: PublicKey;
 };
 
 export type DriftEnv = 'devnet' | 'mainnet-beta';
 
 export const DRIFT_PROGRAM_ID = 'dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH';
+export const DRIFT_ORACLE_RECEIVER_ID =
+	'G6EoTTTgpkNBtVXo96EQp2m6uwwVh2Kt6YidjkmQqoha';
+export const SWIFT_ID = 'SW1fThqrxLzVprnCMpiybiqYQfoNCdduC5uWsSUKChS';
+export const ANCHOR_TEST_SWIFT_ID =
+	'DpaEdAPW3ZX67fnczT14AoX12Lx9VMkxvtT81nCHy3Nv';
+
+export const DEFAULT_CONFIRMATION_OPTS: ConfirmOptions = {
+	preflightCommitment: 'confirmed',
+	commitment: 'confirmed',
+};
 
 export const configs: { [key in DriftEnv]: DriftConfig } = {
 	devnet: {
 		ENV: 'devnet',
 		PYTH_ORACLE_MAPPING_ADDRESS: 'BmA9Z6FjioHJPpjT39QazZyhDRUdZy2ezwx4GiDdE2u2',
 		DRIFT_PROGRAM_ID,
+		JIT_PROXY_PROGRAM_ID: 'J1TnP8zvVxbtF5KFp5xRmWuvG9McnhzmBd9XGfCyuxFP',
 		USDC_MINT_ADDRESS: '8zGuJQqwhZafTah7Uc7Z4tXRnguqkn5KLFAP8oV6PHe2',
 		SERUM_V3: 'DESVgJVGajEgKGXhb6XmqDHGz3VjdgP7rEVESBgxmroY',
 		PHOENIX: 'PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY',
+		OPENBOOK: 'opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb',
 		V2_ALPHA_TICKET_MINT_ADDRESS:
 			'DeEiGWfCMP9psnLGkxGrBBMEAW5Jv8bBGMN8DCtFRCyB',
 		PERP_MARKETS: DevnetPerpMarkets,
 		SPOT_MARKETS: DevnetSpotMarkets,
 		MARKET_LOOKUP_TABLE: 'FaMS3U4uBojvGn5FSDEPimddcXsCfwkKsFgMVVnDdxGb',
+		DRIFT_ORACLE_RECEIVER_ID,
+		SB_ON_DEMAND_PID: ON_DEMAND_DEVNET_PID,
 	},
 	'mainnet-beta': {
 		ENV: 'mainnet-beta',
 		PYTH_ORACLE_MAPPING_ADDRESS: 'AHtgzX45WTKfkPG53L6WYhGEXwQkN1BVknET3sVsLL8J',
 		DRIFT_PROGRAM_ID,
+		JIT_PROXY_PROGRAM_ID: 'J1TnP8zvVxbtF5KFp5xRmWuvG9McnhzmBd9XGfCyuxFP',
 		USDC_MINT_ADDRESS: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 		SERUM_V3: 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX',
 		PHOENIX: 'PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY',
+		OPENBOOK: 'opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb',
 		V2_ALPHA_TICKET_MINT_ADDRESS:
 			'Cmvhycb6LQvvzaShGw4iDHRLzeSSryioAsU98DSSkMNa',
 		PERP_MARKETS: MainnetPerpMarkets,
 		SPOT_MARKETS: MainnetSpotMarkets,
-		MARKET_LOOKUP_TABLE: 'D9cnvzswDikQDf53k4HpQ3KJ9y1Fv3HGGDFYMXnK5T6c',
+		MARKET_LOOKUP_TABLE: 'Fpys8GRa5RBWfyeN7AaDUwFGD1zkDCA4z3t4CJLV8dfL',
+		SERUM_LOOKUP_TABLE: 'GPZkp76cJtNL2mphCvT6FXkJCVPpouidnacckR6rzKDN',
+		DRIFT_ORACLE_RECEIVER_ID,
+		SB_ON_DEMAND_PID: ON_DEMAND_MAINNET_PID,
 	},
 };
 
@@ -84,16 +114,25 @@ export const initialize = (props: {
 	return currentConfig;
 };
 
-export function getMarketsAndOraclesForSubscription(env: DriftEnv): {
+export function getMarketsAndOraclesForSubscription(
+	env: DriftEnv,
+	perpMarkets?: PerpMarketConfig[],
+	spotMarkets?: SpotMarketConfig[]
+): {
 	perpMarketIndexes: number[];
 	spotMarketIndexes: number[];
 	oracleInfos: OracleInfo[];
 } {
+	const perpMarketsToUse =
+		perpMarkets?.length > 0 ? perpMarkets : PerpMarkets[env];
+	const spotMarketsToUse =
+		spotMarkets?.length > 0 ? spotMarkets : SpotMarkets[env];
+
 	const perpMarketIndexes = [];
 	const spotMarketIndexes = [];
 	const oracleInfos = new Map<string, OracleInfo>();
 
-	for (const market of PerpMarkets[env]) {
+	for (const market of perpMarketsToUse) {
 		perpMarketIndexes.push(market.marketIndex);
 		oracleInfos.set(market.oracle.toString(), {
 			publicKey: market.oracle,
@@ -101,7 +140,7 @@ export function getMarketsAndOraclesForSubscription(env: DriftEnv): {
 		});
 	}
 
-	for (const spotMarket of SpotMarkets[env]) {
+	for (const spotMarket of spotMarketsToUse) {
 		spotMarketIndexes.push(spotMarket.marketIndex);
 		oracleInfos.set(spotMarket.oracle.toString(), {
 			publicKey: spotMarket.oracle,
@@ -118,8 +157,10 @@ export function getMarketsAndOraclesForSubscription(env: DriftEnv): {
 
 export async function findAllMarketAndOracles(program: Program): Promise<{
 	perpMarketIndexes: number[];
+	perpMarketAccounts: PerpMarketAccount[];
 	spotMarketIndexes: number[];
 	oracleInfos: OracleInfo[];
+	spotMarketAccounts: SpotMarketAccount[];
 }> {
 	const perpMarketIndexes = [];
 	const spotMarketIndexes = [];
@@ -150,7 +191,13 @@ export async function findAllMarketAndOracles(program: Program): Promise<{
 
 	return {
 		perpMarketIndexes,
+		perpMarketAccounts: perpMarketProgramAccounts.map(
+			(account) => account.account
+		),
 		spotMarketIndexes,
+		spotMarketAccounts: spotMarketProgramAccounts.map(
+			(account) => account.account
+		),
 		oracleInfos: Array.from(oracleInfos.values()),
 	};
 }

@@ -3,6 +3,7 @@ import {
 	PerpMarketAccount,
 	PositionDirection,
 	SpotMarketAccount,
+	UserStatsAccount,
 } from '../types';
 import { BN } from '@coral-xyz/anchor';
 import { assert } from '../assert/assert';
@@ -411,16 +412,8 @@ export function calculateEstimatedPerpEntryPrice(
 
 	const takerIsLong = isVariant(direction, 'long');
 	const limitOrders = dlob[
-		takerIsLong ? 'getMakerLimitAsks' : 'getMakerLimitBids'
-	](
-		market.marketIndex,
-		slot,
-		MarketType.PERP,
-		oraclePriceData,
-		takerIsLong
-			? calculateBidPrice(market, oraclePriceData)
-			: calculateAskPrice(market, oraclePriceData)
-	);
+		takerIsLong ? 'getRestingLimitAsks' : 'getRestingLimitBids'
+	](market.marketIndex, slot, MarketType.PERP, oraclePriceData);
 
 	const swapDirection = getSwapDirection(assetType, direction);
 
@@ -657,15 +650,15 @@ export function calculateEstimatedPerpEntryPrice(
 		}
 	}
 
-	const entryPrice = cumulativeQuoteFilled
-		.mul(BASE_PRECISION)
-		.div(cumulativeBaseFilled);
+	const entryPrice =
+		cumulativeBaseFilled && cumulativeBaseFilled.gt(ZERO)
+			? cumulativeQuoteFilled.mul(BASE_PRECISION).div(cumulativeBaseFilled)
+			: ZERO;
 
-	const priceImpact = entryPrice
-		.sub(bestPrice)
-		.mul(PRICE_PRECISION)
-		.div(bestPrice)
-		.abs();
+	const priceImpact =
+		bestPrice && bestPrice.gt(ZERO)
+			? entryPrice.sub(bestPrice).mul(PRICE_PRECISION).div(bestPrice).abs()
+			: ZERO;
 
 	return {
 		entryPrice,
@@ -726,7 +719,7 @@ export function calculateEstimatedSpotEntryPrice(
 
 	const takerIsLong = isVariant(direction, 'long');
 	const dlobLimitOrders = dlob[
-		takerIsLong ? 'getMakerLimitAsks' : 'getMakerLimitBids'
+		takerIsLong ? 'getRestingLimitAsks' : 'getRestingLimitBids'
 	](market.marketIndex, slot, MarketType.SPOT, oraclePriceData);
 	const serumLimitOrders = takerIsLong
 		? serumAsks.getL2(100)
@@ -866,15 +859,15 @@ export function calculateEstimatedSpotEntryPrice(
 		}
 	}
 
-	const entryPrice = cumulativeQuoteFilled
-		.mul(basePrecision)
-		.div(cumulativeBaseFilled);
+	const entryPrice =
+		cumulativeBaseFilled && cumulativeBaseFilled.gt(ZERO)
+			? cumulativeQuoteFilled.mul(basePrecision).div(cumulativeBaseFilled)
+			: ZERO;
 
-	const priceImpact = entryPrice
-		.sub(bestPrice)
-		.mul(PRICE_PRECISION)
-		.div(bestPrice)
-		.abs();
+	const priceImpact =
+		bestPrice && bestPrice.gt(ZERO)
+			? entryPrice.sub(bestPrice).mul(PRICE_PRECISION).div(bestPrice).abs()
+			: ZERO;
 
 	return {
 		entryPrice,
@@ -908,8 +901,8 @@ export function calculateEstimatedEntryPriceWithL2(
 	const levels = [...(takerIsLong ? l2.asks : l2.bids)];
 	let nextLevel = levels.shift();
 
-	let bestPrice;
-	let worstPrice;
+	let bestPrice: BN;
+	let worstPrice: BN;
 	if (nextLevel) {
 		bestPrice = nextLevel.price;
 		worstPrice = nextLevel.price;
@@ -953,15 +946,15 @@ export function calculateEstimatedEntryPriceWithL2(
 		}
 	}
 
-	const entryPrice = cumulativeQuoteFilled
-		.mul(basePrecision)
-		.div(cumulativeBaseFilled);
+	const entryPrice =
+		cumulativeBaseFilled && cumulativeBaseFilled.gt(ZERO)
+			? cumulativeQuoteFilled.mul(basePrecision).div(cumulativeBaseFilled)
+			: ZERO;
 
-	const priceImpact = entryPrice
-		.sub(bestPrice)
-		.mul(PRICE_PRECISION)
-		.div(bestPrice)
-		.abs();
+	const priceImpact =
+		bestPrice && bestPrice.gt(ZERO)
+			? entryPrice.sub(bestPrice).mul(PRICE_PRECISION).div(bestPrice).abs()
+			: ZERO;
 
 	return {
 		entryPrice,
@@ -971,4 +964,30 @@ export function calculateEstimatedEntryPriceWithL2(
 		baseFilled: cumulativeBaseFilled,
 		quoteFilled: cumulativeQuoteFilled,
 	};
+}
+
+export function getUser30dRollingVolumeEstimate(
+	userStatsAccount: UserStatsAccount,
+	now?: BN
+) {
+	now = now || new BN(new Date().getTime() / 1000);
+	const sinceLastTaker = BN.max(
+		now.sub(userStatsAccount.lastTakerVolume30DTs),
+		ZERO
+	);
+	const sinceLastMaker = BN.max(
+		now.sub(userStatsAccount.lastMakerVolume30DTs),
+		ZERO
+	);
+	const thirtyDaysInSeconds = new BN(60 * 60 * 24 * 30);
+	const last30dVolume = userStatsAccount.takerVolume30D
+		.mul(BN.max(thirtyDaysInSeconds.sub(sinceLastTaker), ZERO))
+		.div(thirtyDaysInSeconds)
+		.add(
+			userStatsAccount.makerVolume30D
+				.mul(BN.max(thirtyDaysInSeconds.sub(sinceLastMaker), ZERO))
+				.div(thirtyDaysInSeconds)
+		);
+
+	return last30dVolume;
 }

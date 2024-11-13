@@ -6,11 +6,13 @@ use crate::error::{DriftResult, ErrorCode};
 use crate::math::casting::Cast;
 use crate::math::orders::{
     calculate_base_asset_amount_to_fill_up_to_limit_price, is_multiple_of_step_size,
-    order_breaches_oracle_price_bands,
 };
 use crate::state::perp_market::PerpMarket;
 use crate::state::user::{Order, OrderTriggerCondition, OrderType};
-use crate::validate;
+use crate::{validate, MAX_PREDICTION_MARKET_PRICE};
+
+#[cfg(test)]
+mod test;
 
 pub fn validate_order(
     order: &Order,
@@ -36,6 +38,32 @@ pub fn validate_order(
         OrderType::Oracle => {
             validate_oracle_order(order, market.amm.order_step_size, market.amm.min_order_size)?
         }
+    }
+
+    if market.is_prediction_market() {
+        validate!(
+            order.price <= MAX_PREDICTION_MARKET_PRICE,
+            ErrorCode::InvalidPredictionMarketOrder,
+            "prediction market price must be <= 1"
+        )?;
+
+        validate!(
+            order.auction_start_price.unsigned_abs() <= MAX_PREDICTION_MARKET_PRICE,
+            ErrorCode::InvalidPredictionMarketOrder,
+            "prediction market auction start price abs must be <= 1"
+        )?;
+
+        validate!(
+            order.auction_end_price.unsigned_abs() <= MAX_PREDICTION_MARKET_PRICE,
+            ErrorCode::InvalidPredictionMarketOrder,
+            "prediction market auction end price abs must be <= 1"
+        )?;
+
+        validate!(
+            order.oracle_price_offset.unsigned_abs() <= MAX_PREDICTION_MARKET_PRICE as u32,
+            ErrorCode::InvalidPredictionMarketOrder,
+            "prediction market auction end price abs must be <= 1"
+        )?;
     }
 
     Ok(())
@@ -78,50 +106,7 @@ fn validate_market_order(order: &Order, step_size: u64, min_order_size: u64) -> 
 fn validate_oracle_order(order: &Order, step_size: u64, min_order_size: u64) -> DriftResult {
     validate_base_asset_amount(order, step_size, min_order_size, order.reduce_only)?;
 
-    match order.direction {
-        PositionDirection::Long => {
-            if order.auction_start_price >= order.auction_end_price {
-                msg!(
-                    "Auction start price offset ({}) was greater than auction end price offset ({})",
-                    order.auction_start_price,
-                    order.auction_end_price
-                );
-                return Err(ErrorCode::InvalidOrderAuction);
-            }
-
-            if order.has_oracle_price_offset()
-                && order.auction_end_price > order.oracle_price_offset.cast()?
-            {
-                msg!(
-                    "Auction end price offset ({}) was greater than oracle price offset ({})",
-                    order.auction_end_price,
-                    order.oracle_price_offset
-                );
-                return Err(ErrorCode::InvalidOrderAuction);
-            }
-        }
-        PositionDirection::Short => {
-            if order.auction_start_price <= order.auction_end_price {
-                msg!(
-                    "Auction start price ({}) was less than auction end price ({})",
-                    order.auction_start_price,
-                    order.auction_end_price
-                );
-                return Err(ErrorCode::InvalidOrderAuction);
-            }
-
-            if order.has_oracle_price_offset()
-                && order.auction_end_price < order.oracle_price_offset.cast()?
-            {
-                msg!(
-                    "Auction end price offset ({}) was less than oracle price offset ({})",
-                    order.auction_end_price,
-                    order.oracle_price_offset
-                );
-                return Err(ErrorCode::InvalidOrderAuction);
-            }
-        }
-    }
+    validate_oracle_auction_params(order)?;
 
     if order.trigger_price > 0 {
         msg!("Oracle order should not have trigger price");
@@ -182,19 +167,6 @@ fn validate_limit_order(
         )?;
 
         validate_post_only_order(order, market, valid_oracle_price, slot)?;
-
-        let order_breaches_oracle_price_limits = order_breaches_oracle_price_bands(
-            order,
-            valid_oracle_price.ok_or(ErrorCode::InvalidOracle)?,
-            slot,
-            market.amm.order_tick_size,
-            market.margin_ratio_initial,
-            market.margin_ratio_maintenance,
-        )?;
-
-        if order_breaches_oracle_price_limits {
-            return Err(ErrorCode::OrderBreachesOraclePriceLimits);
-        }
     }
 
     validate_limit_order_auction_params(order)?;
@@ -204,13 +176,11 @@ fn validate_limit_order(
 
 fn validate_limit_order_auction_params(order: &Order) -> DriftResult {
     if order.has_auction() {
-        validate!(
-            !order.has_oracle_price_offset(),
-            ErrorCode::InvalidOrder,
-            "limit order with auction can not have an oracle price offset"
-        )?;
-
-        validate_auction_params(order)?;
+        if order.has_oracle_price_offset() {
+            validate_oracle_auction_params(order)?;
+        } else {
+            validate_auction_params(order)?;
+        }
     } else {
         validate!(
             order.auction_start_price == 0,
@@ -234,8 +204,18 @@ fn validate_post_only_order(
     valid_oracle_price: Option<i64>,
     slot: u64,
 ) -> DriftResult {
-    let limit_price =
-        order.force_get_limit_price(valid_oracle_price, None, slot, market.amm.order_tick_size)?;
+    // jit maker can fill against amm
+    if order.is_jit_maker() {
+        return Ok(());
+    }
+
+    let limit_price = order.force_get_limit_price(
+        valid_oracle_price,
+        None,
+        slot,
+        market.amm.order_tick_size,
+        market.is_prediction_market(),
+    )?;
 
     let base_asset_amount_market_can_fill = calculate_base_asset_amount_to_fill_up_to_limit_price(
         order,
@@ -394,7 +374,7 @@ fn validate_auction_params(order: &Order) -> DriftResult {
 
     match order.direction {
         PositionDirection::Long => {
-            if order.auction_start_price >= order.auction_end_price {
+            if order.auction_start_price > order.auction_end_price {
                 msg!(
                     "Auction start price ({}) was greater than auction end price ({})",
                     order.auction_start_price,
@@ -413,7 +393,7 @@ fn validate_auction_params(order: &Order) -> DriftResult {
             }
         }
         PositionDirection::Short => {
-            if order.auction_start_price <= order.auction_end_price {
+            if order.auction_start_price < order.auction_end_price {
                 msg!(
                     "Auction start price ({}) was less than auction end price ({})",
                     order.auction_start_price,
@@ -436,28 +416,59 @@ fn validate_auction_params(order: &Order) -> DriftResult {
     Ok(())
 }
 
-pub fn validate_spot_order(
-    order: &Order,
-    valid_oracle_price: Option<i64>,
-    slot: u64,
-    step_size: u64,
-    tick_size: u64,
-    margin_ratio_initial: u32,
-    margin_ratio_maintenance: u32,
-    min_order_size: u64,
-) -> DriftResult {
+fn validate_oracle_auction_params(order: &Order) -> DriftResult {
+    match order.direction {
+        PositionDirection::Long => {
+            if order.auction_start_price > order.auction_end_price {
+                msg!(
+                    "Auction start price offset ({}) was greater than auction end price offset ({})",
+                    order.auction_start_price,
+                    order.auction_end_price
+                );
+                return Err(ErrorCode::InvalidOrderAuction);
+            }
+
+            if order.has_oracle_price_offset()
+                && order.auction_end_price > order.oracle_price_offset.cast()?
+            {
+                msg!(
+                    "Auction end price offset ({}) was greater than oracle price offset ({})",
+                    order.auction_end_price,
+                    order.oracle_price_offset
+                );
+                return Err(ErrorCode::InvalidOrderAuction);
+            }
+        }
+        PositionDirection::Short => {
+            if order.auction_start_price < order.auction_end_price {
+                msg!(
+                    "Auction start price ({}) was less than auction end price ({})",
+                    order.auction_start_price,
+                    order.auction_end_price
+                );
+                return Err(ErrorCode::InvalidOrderAuction);
+            }
+
+            if order.has_oracle_price_offset()
+                && order.auction_end_price < order.oracle_price_offset.cast()?
+            {
+                msg!(
+                    "Auction end price offset ({}) was less than oracle price offset ({})",
+                    order.auction_end_price,
+                    order.oracle_price_offset
+                );
+                return Err(ErrorCode::InvalidOrderAuction);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_spot_order(order: &Order, step_size: u64, min_order_size: u64) -> DriftResult {
     match order.order_type {
         OrderType::Market => validate_market_order(order, step_size, min_order_size)?,
-        OrderType::Limit => validate_spot_limit_order(
-            order,
-            valid_oracle_price,
-            slot,
-            step_size,
-            tick_size,
-            min_order_size,
-            margin_ratio_initial,
-            margin_ratio_maintenance,
-        )?,
+        OrderType::Limit => validate_spot_limit_order(order, step_size, min_order_size)?,
         OrderType::TriggerMarket => {
             validate_trigger_market_order(order, step_size, min_order_size)?
         }
@@ -468,16 +479,7 @@ pub fn validate_spot_order(
     Ok(())
 }
 
-fn validate_spot_limit_order(
-    order: &Order,
-    valid_oracle_price: Option<i64>,
-    slot: u64,
-    step_size: u64,
-    tick_size: u64,
-    min_order_size: u64,
-    margin_ratio_initial: u32,
-    margin_ratio_maintenance: u32,
-) -> DriftResult {
+fn validate_spot_limit_order(order: &Order, step_size: u64, min_order_size: u64) -> DriftResult {
     validate_base_asset_amount(order, step_size, min_order_size, order.reduce_only)?;
 
     if order.price == 0 && !order.has_oracle_price_offset() {
@@ -501,22 +503,37 @@ fn validate_spot_limit_order(
             ErrorCode::InvalidOrder,
             "post only limit order cant have auction"
         )?;
-
-        let order_breaches_oracle_price_limits = order_breaches_oracle_price_bands(
-            order,
-            valid_oracle_price.ok_or(ErrorCode::InvalidOracle)?,
-            slot,
-            tick_size,
-            margin_ratio_initial,
-            margin_ratio_maintenance,
-        )?;
-
-        if order_breaches_oracle_price_limits {
-            return Err(ErrorCode::OrderBreachesOraclePriceLimits);
-        }
     }
 
     validate_limit_order_auction_params(order)?;
+
+    Ok(())
+}
+
+pub fn validate_order_for_force_reduce_only(order: &Order, existing_position: i64) -> DriftResult {
+    validate!(
+        order.reduce_only,
+        ErrorCode::InvalidOrderNotRiskReducing,
+        "order must be reduce only",
+    )?;
+
+    validate!(
+        existing_position != 0,
+        ErrorCode::InvalidOrderNotRiskReducing,
+        "user must have position to submit order",
+    )?;
+
+    let existing_position_direction = if existing_position > 0 {
+        PositionDirection::Long
+    } else {
+        PositionDirection::Short
+    };
+
+    validate!(
+        order.direction != existing_position_direction,
+        ErrorCode::InvalidOrderNotRiskReducing,
+        "order direction must be opposite of existing position in reduce only mode",
+    )?;
 
     Ok(())
 }

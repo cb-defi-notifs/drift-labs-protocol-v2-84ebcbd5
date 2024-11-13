@@ -10,6 +10,7 @@ import {
 import { PRICE_PRECISION } from '../constants/numericConstants';
 import { BN } from '@coral-xyz/anchor';
 import { L2Level, L2OrderBookGenerator } from '../dlob/orderBookLevels';
+import { fastDecode } from '../decode/phoenix';
 
 export type PhoenixMarketSubscriberConfig = {
 	connection: Connection;
@@ -24,6 +25,7 @@ export type PhoenixMarketSubscriberConfig = {
 		| {
 				type: 'websocket';
 		  };
+	fastDecode?: boolean;
 };
 
 export class PhoenixSubscriber implements L2OrderBookGenerator {
@@ -36,7 +38,8 @@ export class PhoenixSubscriber implements L2OrderBookGenerator {
 	market: Market;
 	marketCallbackId: string | number;
 	clockCallbackId: string | number;
-
+	// fastDecode omits trader data from the markets for faster decoding process
+	fastDecode: boolean;
 	subscribed: boolean;
 	lastSlot: number;
 	lastUnixTimestamp: number;
@@ -53,6 +56,7 @@ export class PhoenixSubscriber implements L2OrderBookGenerator {
 		}
 		this.lastSlot = 0;
 		this.lastUnixTimestamp = 0;
+		this.fastDecode = config.fastDecode ?? true;
 	}
 
 	public async subscribe(): Promise<void> {
@@ -76,7 +80,11 @@ export class PhoenixSubscriber implements L2OrderBookGenerator {
 				this.marketAddress,
 				(accountInfo, _ctx) => {
 					try {
-						this.market = this.market.reload(accountInfo.data);
+						if (this.fastDecode) {
+							this.market.data = fastDecode(accountInfo.data);
+						} else {
+							this.market = this.market.reload(accountInfo.data);
+						}
 					} catch {
 						console.error('Failed to reload Phoenix market data');
 					}
@@ -101,7 +109,11 @@ export class PhoenixSubscriber implements L2OrderBookGenerator {
 					try {
 						this.lastSlot = slot;
 						if (buffer) {
-							this.market = this.market.reload(buffer);
+							if (this.fastDecode) {
+								this.market.data = fastDecode(buffer);
+							} else {
+								this.market = this.market.reload(buffer);
+							}
 						}
 					} catch {
 						console.error('Failed to reload Phoenix market data');
@@ -167,6 +179,7 @@ export class PhoenixSubscriber implements L2OrderBookGenerator {
 			10,
 			this.market.data.header.baseParams.decimals
 		);
+
 		const pricePrecision = PRICE_PRECISION.toNumber();
 
 		const ladder = getMarketUiLadder(
@@ -178,17 +191,21 @@ export class PhoenixSubscriber implements L2OrderBookGenerator {
 
 		for (let i = 0; i < ladder[side].length; i++) {
 			const { price, quantity } = ladder[side][i];
-			const size = new BN(Math.floor(quantity * basePrecision));
-			yield {
-				price: new BN(Math.floor(price * pricePrecision)),
-				size,
-				sources: {
-					phoenix: size,
-				},
-			};
+			try {
+				const size = new BN(quantity * basePrecision);
+				const updatedPrice = new BN(price * pricePrecision);
+				yield {
+					price: updatedPrice,
+					size,
+					sources: {
+						phoenix: size,
+					},
+				};
+			} catch {
+				continue;
+			}
 		}
 	}
-
 	public async unsubscribe(): Promise<void> {
 		if (!this.subscribed) {
 			return;
